@@ -277,11 +277,13 @@ impl VideoWriter {
     }
 }
 
-const FRAME_QUEUE_CAPACITY: usize = 3;
+// Zero capacity keeps complete high-resolution frames out of an accumulating queue.
+// The recycled channel retains one buffer for the renderer and one for the worker handoff.
+const FRAME_QUEUE_CAPACITY: usize = 0;
 
 /// Sends rendered frames to FFmpeg without making the render thread perform the
-/// blocking pipe write. The queue is intentionally bounded to cap memory use and
-/// preserve backpressure when encoding cannot keep up.
+/// blocking pipe write. The zero-capacity queue preserves backpressure and caps
+/// complete CPU frame ownership during high-resolution renders.
 pub struct AsyncVideoWriter {
     sender: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     recycled: std::sync::mpsc::Receiver<Vec<u8>>,

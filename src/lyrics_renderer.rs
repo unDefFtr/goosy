@@ -149,6 +149,7 @@ pub struct LyricsRenderer {
     // the gaps between main, translation, and background-vocal text.
     base_heights: Vec<f32>,
     translation_heights: Vec<f32>,
+    viewport: Viewport,
     margin_x: f32,
     text_width: f32,
     main_font_size: f32,
@@ -337,6 +338,7 @@ impl LyricsRenderer {
         let background_vocal_blur_paint = make_blur_paint(1.0)?;
         let mut dot_paint = Paint::default();
         dot_paint.set_color(Color::WHITE);
+        dot_paint.set_anti_alias(true);
         Ok(Self {
             base_paragraphs,
             solid_paragraphs,
@@ -349,6 +351,7 @@ impl LyricsRenderer {
             background_translation_paragraphs,
             base_heights,
             translation_heights,
+            viewport,
             margin_x,
             text_width,
             main_font_size,
@@ -407,9 +410,12 @@ impl LyricsRenderer {
                 .unsigned_abs()
                 .min(LYRIC_BLUR_LEVELS);
             if blur_level > 0 {
+                let blur_sigma =
+                    lyric_blur_sigma(blur_level, self.style.lyric_blur_sigma_step as usize) as f32;
                 let mut layer_paint = self.lyric_blur_paints[blur_level - 1].borrow_mut();
                 layer_paint.set_alpha_f(opacity);
-                let layer_rec = SaveLayerRec::default().paint(&*layer_paint);
+                let bounds = self.group_bounds(index, top_y, blur_sigma);
+                let layer_rec = SaveLayerRec::default().bounds(&bounds).paint(&*layer_paint);
                 let layer = canvas.save_layer(&layer_rec);
                 self.draw_group(
                     canvas,
@@ -434,7 +440,8 @@ impl LyricsRenderer {
                     top_y,
                 );
             } else {
-                let layer = canvas.save_layer_alpha_f(None, opacity);
+                let bounds = self.group_bounds(index, top_y, 0.0);
+                let layer = canvas.save_layer_alpha_f(Some(bounds), opacity);
                 self.draw_group(
                     canvas,
                     lines,
@@ -454,6 +461,66 @@ impl LyricsRenderer {
         }
         Ok(())
     }
+    fn group_bounds(&self, index: usize, top_y: f32, expansion: f32) -> Rect {
+        let mut bounds = Rect::from_xywh(
+            self.margin_x,
+            top_y,
+            self.text_width,
+            self.group_heights[index] as f32,
+        );
+        bounds.outset((expansion, expansion));
+        let visible = Rect::from_xywh(
+            self.viewport.x,
+            self.viewport.y,
+            self.viewport.width,
+            self.viewport.height,
+        );
+        bounds.intersect(&visible);
+        bounds
+    }
+
+    fn background_bounds(&self, index: usize, top_y: f32, expansion: f32) -> Rect {
+        let background_height = self.background_paragraphs[index]
+            .as_ref()
+            .map(Paragraph::height)
+            .unwrap_or(0.0);
+        let background_translation_height = self.background_translation_paragraphs[index]
+            .as_ref()
+            .map(Paragraph::height)
+            .unwrap_or(0.0);
+        let translation_height = self.translation_heights[index];
+        let translation_gap = if translation_height > 0.0 {
+            self.main_font_size * TRANSLATION_GAP_EM * self.style.translation_gap_scale
+        } else {
+            0.0
+        };
+        let background_gap = if background_height > 0.0 {
+            self.main_font_size * BACKGROUND_GAP_EM * self.style.background_gap_scale
+        } else {
+            0.0
+        };
+        let background_top = top_y
+            + self.base_heights[index]
+            + translation_height
+            + translation_gap
+            + background_gap;
+        let mut bounds = Rect::from_xywh(
+            self.margin_x,
+            background_top,
+            self.text_width,
+            background_height + background_translation_height,
+        );
+        bounds.outset((expansion, expansion));
+        let visible = Rect::from_xywh(
+            self.viewport.x,
+            self.viewport.y,
+            self.viewport.width,
+            self.viewport.height,
+        );
+        bounds.intersect(&visible);
+        bounds
+    }
+
     fn draw_debug_overlays(
         &self,
         canvas: &Canvas,
@@ -625,7 +692,8 @@ impl LyricsRenderer {
             && (t_ms < background_line.end_ms || background_highlight > 0.0);
         if !background_highlighting && !group_blurred {
             let layer_paint = self.background_vocal_blur_paint.borrow();
-            let layer_rec = SaveLayerRec::default().paint(&*layer_paint);
+            let bounds = self.background_bounds(index, top_y, 1.0);
+            let layer_rec = SaveLayerRec::default().bounds(&bounds).paint(&*layer_paint);
             let layer = canvas.save_layer(&layer_rec);
             self.draw_background_line(
                 canvas,
@@ -1032,7 +1100,9 @@ fn paint_lifted_highlight_mask(
         return;
     }
 
-    let interpolation_layer = canvas.save_layer(&SaveLayerRec::default());
+    let bounds = lifted_bounds(path, lower_lift + 1.0);
+    let interpolation_rec = SaveLayerRec::default().bounds(&bounds);
+    let interpolation_layer = canvas.save_layer(&interpolation_rec);
     paint_weighted_lift_sample(
         canvas,
         path,
@@ -1066,11 +1136,24 @@ fn paint_weighted_lift_sample(
     let mut restore_paint = Paint::default();
     restore_paint.set_alpha_f(weight);
     restore_paint.set_blend_mode(BlendMode::Plus);
-    let sample_rec = SaveLayerRec::default().paint(&restore_paint);
+    let bounds = lifted_bounds(path, lift);
+    let sample_rec = SaveLayerRec::default()
+        .bounds(&bounds)
+        .paint(&restore_paint);
     let sample_layer = canvas.save_layer(&sample_rec);
     canvas.translate((0.0, -lift));
     paint_highlight_mask(canvas, path, paragraph, position, alpha);
     canvas.restore_to_count(sample_layer);
+}
+
+fn lifted_bounds(path: &skia_safe::Path, lift: f32) -> Rect {
+    let path_bounds = path.bounds();
+    Rect::new(
+        path_bounds.left() - 1.0,
+        path_bounds.top() - lift - 1.0,
+        path_bounds.right() + 1.0,
+        path_bounds.bottom() + 1.0,
+    )
 }
 
 fn paint_highlight_mask(
@@ -1088,7 +1171,8 @@ fn paint_highlight_mask(
     if alpha >= 0.999 {
         paragraph.paint(canvas, position);
     } else {
-        let layer = canvas.save_layer_alpha_f(None, alpha);
+        let bounds = lifted_bounds(path, 0.0);
+        let layer = canvas.save_layer_alpha_f(Some(bounds), alpha);
         paragraph.paint(canvas, position);
         canvas.restore_to_count(layer);
     }
@@ -1887,6 +1971,61 @@ mod tests {
              scrolling={scrolling_pixel_count}, sharp={sharp_pixel_count}"
         );
     }
+    #[test]
+    fn bounded_blur_preserves_edge_transition_and_background_translation() {
+        let lines = vec![
+            line_with_background_vocal(0, 2_000, 0, 2_000),
+            LyricLine {
+                start_ms: 2_000,
+                end_ms: 4_000,
+                text: "Second inactive group".to_owned(),
+                translation: Some("第二组翻译".to_owned()),
+                agent_id: None,
+                is_duet: true,
+                is_background: false,
+                background_vocal: None,
+                words: Vec::new(),
+            },
+        ];
+        let viewport = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 300.0,
+        };
+        let renderer = LyricsRenderer::new(&lines, viewport).unwrap();
+        let mut layout = Layout::new(
+            &lines,
+            viewport.height,
+            renderer.group_heights(),
+            renderer.group_gap(),
+            renderer.interlude_slot_height(),
+        );
+        layout.update(&lines, 1_000, 30);
+        let mut surface = skia_safe::surfaces::raster_n32_premul((600, 300)).unwrap();
+        surface.canvas().clear(Color::TRANSPARENT);
+        renderer
+            .draw(surface.canvas(), &lines, &layout, 1_000, 300)
+            .unwrap();
+        let info = skia_safe::ImageInfo::new(
+            (600, 300),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        let mut pixels = vec![0; info.compute_byte_size(600 * 4)];
+        assert!(surface.read_pixels(&info, &mut pixels, 600 * 4, skia_safe::IPoint::new(0, 0)));
+        let alpha_values = pixels
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .collect::<Vec<_>>();
+        assert!(alpha_values.iter().any(|alpha| *alpha > 0));
+        assert!(
+            alpha_values
+                .iter()
+                .any(|alpha| 0 < *alpha && *alpha < u8::MAX)
+        );
+    }
 
     #[test]
     fn interlude_dots_align_at_rest_and_extend_past_the_text_edge_when_enlarged() {
@@ -1901,6 +2040,51 @@ mod tests {
         assert!(left_center - dot_width * 0.75 / 2.0 < margin_x);
         assert!((right_center + resting_half_width - (margin_x + text_width)).abs() < f32::EPSILON);
         assert!(right_center + dot_width * 0.75 / 2.0 > margin_x + text_width);
+    }
+
+    #[test]
+    fn interlude_dots_have_antialiased_edges() {
+        use skia_safe::{AlphaType, ColorType, IPoint, ImageInfo, surfaces};
+
+        let mut line = timed_line();
+        line.start_ms = 6_000;
+        line.end_ms = 7_000;
+        let lines = vec![line];
+        let viewport = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 300.0,
+        };
+        let renderer = LyricsRenderer::new(&lines, viewport).unwrap();
+        let mut layout = Layout::new(
+            &lines,
+            viewport.height,
+            renderer.group_heights(),
+            renderer.group_gap(),
+            renderer.interlude_slot_height(),
+        );
+        layout.update(&lines, 5_000, 30);
+
+        let dimensions = (viewport.width as i32, viewport.height as i32);
+        let mut surface = surfaces::raster_n32_premul(dimensions).unwrap();
+        surface.canvas().clear(Color::TRANSPARENT);
+        renderer.draw_interlude_dots(surface.canvas(), &lines, &layout, 5_000);
+        let info = ImageInfo::new(dimensions, ColorType::RGBA8888, AlphaType::Premul, None);
+        let row_bytes = dimensions.0 as usize * 4;
+        let mut pixels = vec![0; info.compute_byte_size(row_bytes)];
+        assert!(surface.read_pixels(&info, &mut pixels, row_bytes, IPoint::new(0, 0)));
+
+        let first_dot_half = renderer.margin_x
+            + (renderer.dot_size * 3.0 + renderer.dot_gap * 2.0) * INTERLUDE_DOT_BASE_SCALE / 2.0;
+        let first_dot_alphas = pixels
+            .chunks_exact(4)
+            .enumerate()
+            .filter(|(index, _)| ((*index % dimensions.0 as usize) as f32) < first_dot_half)
+            .map(|(_, pixel)| pixel[3]);
+        let alphas = first_dot_alphas.collect::<Vec<_>>();
+        assert!(alphas.iter().any(|alpha| *alpha == u8::MAX));
+        assert!(alphas.iter().any(|alpha| 0 < *alpha && *alpha < u8::MAX));
     }
 
     #[test]

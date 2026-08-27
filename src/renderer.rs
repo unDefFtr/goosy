@@ -218,6 +218,34 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn high_resolution_frames_are_complete_and_stable() -> Result<()> {
+        let lines = vec![LyricLine {
+            start_ms: 0,
+            end_ms: 2_000,
+            text: "High resolution stability".to_owned(),
+            translation: Some("高分辨率稳定性".to_owned()),
+            agent_id: None,
+            is_duet: false,
+            is_background: false,
+            background_vocal: None,
+            words: Vec::new(),
+        }];
+        let width = 3_840;
+        let height = 2_160;
+        let expected_len = width as usize * height as usize * 4;
+        let mut renderer = Renderer::new(width, height, 30, lines)?;
+        let mut pixels = Vec::new();
+        for timestamp in [0, 33, 66] {
+            renderer.render_frame_into(timestamp, &mut pixels)?;
+            assert_eq!(pixels.len(), expected_len);
+        }
+        renderer.render_frame_into(33, &mut pixels)?;
+        let repeated = pixels.clone();
+        renderer.render_frame_into(33, &mut pixels)?;
+        assert_eq!(pixels, repeated);
+        Ok(())
+    }
+    #[test]
     fn excluded_lines_are_removed_without_retiming_remaining_lines() -> Result<()> {
         let lines = vec![
             LyricLine {

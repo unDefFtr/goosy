@@ -18,6 +18,7 @@ enum Backend {
     #[cfg(target_os = "macos")]
     Metal(MetalBackend),
 }
+const GPU_RESOURCE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 impl SurfaceRenderer {
     pub fn new() -> Self {
@@ -273,7 +274,7 @@ impl Direct3DBackend {
         // Bound transient GPU resources during long renders.
         context.set_resource_cache_limits(ResourceCacheLimits {
             max_resources: 4_096,
-            max_resource_bytes: 256 * 1024 * 1024,
+            max_resource_bytes: GPU_RESOURCE_CACHE_BYTES,
         });
         Ok(Self {
             surface: None,
@@ -503,7 +504,11 @@ impl AngleBackend {
                 .map(|proc| proc as *const () as *const c_void)
                 .unwrap_or(std::ptr::null())
         })?;
-        let context = gpu::direct_contexts::make_gl(interface, None)?;
+        let mut context = gpu::direct_contexts::make_gl(interface, None)?;
+        context.set_resource_cache_limits(skia_safe::gpu::ganesh::ResourceCacheLimits {
+            max_resources: 4_096,
+            max_resource_bytes: GPU_RESOURCE_CACHE_BYTES,
+        });
 
         Some(Self {
             surface: None,
@@ -615,7 +620,11 @@ impl MetalBackend {
                 Retained::as_ptr(&queue) as mtl::Handle,
             )
         };
-        let context = gpu::direct_contexts::make_metal(&backend, None)?;
+        let mut context = gpu::direct_contexts::make_metal(&backend, None)?;
+        context.set_resource_cache_limits(skia_safe::gpu::ganesh::ResourceCacheLimits {
+            max_resources: 4_096,
+            max_resource_bytes: GPU_RESOURCE_CACHE_BYTES,
+        });
         let queue: Retained<ProtocolObject<dyn MTLCommandQueue>> = queue;
         Some(Self {
             context,

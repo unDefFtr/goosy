@@ -206,7 +206,7 @@ fn render_style_preview(
             &lines,
             &layout,
             STYLE_PREVIEW_TIME_MS,
-            geometry.lyrics.height as u32,
+            output_height,
         )
         .map_err(|error| error.to_string())?;
     canvas.restore_to_count(saved);
