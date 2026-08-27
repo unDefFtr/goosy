@@ -33,13 +33,13 @@ enum Command {
         fps: u32,
         #[arg(long, default_value_t = 1.0)]
         font_scale: f32,
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 0.65)]
         translation_font_scale: f32,
         #[arg(long, default_value_t = 0.7)]
         background_font_scale: f32,
-        #[arg(long, default_value_t = 1.0)]
+        #[arg(long, default_value_t = 0.65)]
         line_height_scale: f32,
-        #[arg(long, default_value_t = 1.0)]
+        #[arg(long, default_value_t = 0.8)]
         line_spacing_scale: f32,
         #[arg(long, default_value_t = 1.0)]
         translation_gap_scale: f32,

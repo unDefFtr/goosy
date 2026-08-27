@@ -97,10 +97,10 @@ impl Default for LyricsStyle {
     fn default() -> Self {
         Self {
             font_scale: 1.0,
-            translation_font_scale: 0.5,
+            translation_font_scale: 0.65,
             background_font_scale: 0.7,
-            line_height_scale: 1.0,
-            group_gap_scale: 1.0,
+            line_height_scale: 0.65,
+            group_gap_scale: 0.8,
             translation_gap_scale: 1.0,
             background_gap_scale: 1.0,
             horizontal_padding_scale: 1.0,
@@ -1498,7 +1498,9 @@ mod tests {
         assert!(renderer.base_paragraphs[0].line_number() > 1);
         let glyph_height =
             measure_glyph_height(&mut renderer.base_paragraphs, renderer.main_font_size);
-        let expected_gap = glyph_height * DEFAULT_LINE_GAP_MULTIPLIER;
+        let expected_gap = glyph_height
+            * ((1.0 + DEFAULT_LINE_GAP_MULTIPLIER) * LyricsStyle::default().line_height_scale
+                - 1.0);
         let line_metrics = renderer.base_paragraphs[0].get_line_metrics();
         for adjacent in line_metrics.windows(2) {
             let baseline_advance = (adjacent[1].baseline - adjacent[0].baseline) as f32;
@@ -2118,7 +2120,7 @@ mod tests {
     }
 
     #[test]
-    fn default_group_gap_is_sqrt_two_times_main_glyph_height() {
+    fn default_group_gap_applies_configured_scale() {
         let lines = vec![LyricLine {
             start_ms: 0,
             end_ms: 2_000,
@@ -2145,7 +2147,10 @@ mod tests {
             measure_glyph_height(&mut renderer.base_paragraphs, renderer.main_font_size);
         assert!(main_glyph_height > 0.0);
         let ratio = renderer.group_gap as f32 / main_glyph_height;
-        assert!((ratio - DEFAULT_LINE_GAP_MULTIPLIER).abs() < 0.000_01);
+        assert!(
+            (ratio - DEFAULT_LINE_GAP_MULTIPLIER * LyricsStyle::default().group_gap_scale).abs()
+                < 0.000_01
+        );
     }
     #[test]
     fn debug_overlays_are_opt_in() {

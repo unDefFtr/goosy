@@ -109,8 +109,8 @@ pub fn render(options: RenderOptions) -> Result<()> {
     rust.height = options.height.unwrap_or(1080);
     rust.fps = options.fps.unwrap_or(30);
     rust.lyrics_style.font_scale = options.font_scale.unwrap_or(1.0) as f32;
-    rust.lyrics_style.line_height_scale = options.line_height_scale.unwrap_or(1.0) as f32;
-    rust.lyrics_style.group_gap_scale = options.line_spacing_scale.unwrap_or(1.0) as f32;
+    rust.lyrics_style.line_height_scale = options.line_height_scale.unwrap_or(0.65) as f32;
+    rust.lyrics_style.group_gap_scale = options.line_spacing_scale.unwrap_or(0.8) as f32;
     rust.lyrics_style.translation_gap_scale = options.translation_gap_scale.unwrap_or(1.0) as f32;
     rust.lyrics_style.background_gap_scale = options.background_gap_scale.unwrap_or(1.0) as f32;
     rust.lyrics_style.horizontal_padding_scale =
