@@ -159,7 +159,6 @@ pub struct LyricsRenderer {
     group_gap: f64,
     dot_size: f32,
     dot_gap: f32,
-    dot_margin: f32,
     lyric_blur_paints: Vec<RefCell<Paint>>,
     background_vocal_blur_paint: RefCell<Paint>,
     dot_paint: RefCell<Paint>,
@@ -281,7 +280,6 @@ impl LyricsRenderer {
         let group_gap = main_glyph_height * DEFAULT_LINE_GAP_MULTIPLIER * style.group_gap_scale;
         let dot_size = (main_font_size * 0.5).max(6.0);
         let dot_gap = (main_font_size * 0.25).max(2.0);
-        let dot_margin = main_font_size * 0.4;
         let base_heights = base_paragraphs
             .iter()
             .map(Paragraph::height)
@@ -359,7 +357,6 @@ impl LyricsRenderer {
             group_gap: group_gap as f64,
             dot_size,
             dot_gap,
-            dot_margin,
             lyric_blur_paints,
             background_vocal_blur_paint,
             style,
@@ -734,7 +731,7 @@ impl LyricsRenderer {
         let width = self.dot_size * 3.0 + self.dot_gap * 2.0;
         let center = Point::new(
             interlude_dot_center_x(self.margin_x, self.text_width, width, line.is_duet),
-            slot_top + self.dot_margin + self.dot_size / 2.0,
+            slot_top + self.dot_size / 2.0,
         );
         let left = center.x - width / 2.0;
         let transform = canvas.save();
@@ -760,9 +757,8 @@ impl LyricsRenderer {
     }
 
     pub fn interlude_slot_height(&self) -> f64 {
-        (self.dot_size + self.dot_margin * 2.0) as f64
+        self.dot_size as f64 + self.group_gap
     }
-
     pub fn group_heights(&self) -> &[f64] {
         &self.group_heights
     }
@@ -1903,6 +1899,40 @@ mod tests {
         assert!(left_center - dot_width * 0.75 / 2.0 < margin_x);
         assert!((right_center + resting_half_width - (margin_x + text_width)).abs() < f32::EPSILON);
         assert!(right_center + dot_width * 0.75 / 2.0 > margin_x + text_width);
+    }
+
+    #[test]
+    fn interlude_dots_have_group_gap_above_and_below() {
+        let mut first = timed_line();
+        first.start_ms = 0;
+        first.end_ms = 1_000;
+        let mut next = timed_line();
+        next.start_ms = 6_000;
+        next.end_ms = 7_000;
+        let lines = vec![first, next];
+        let viewport = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 300.0,
+        };
+        let renderer = LyricsRenderer::new(&lines, viewport).unwrap();
+        let mut layout = Layout::new(
+            &lines,
+            viewport.height,
+            renderer.group_heights(),
+            renderer.group_gap(),
+            renderer.interlude_slot_height(),
+        );
+        layout.update(&lines, 2_000, 30);
+
+        let slot_top = layout.interlude_top_y(1).unwrap() as f64;
+        let previous_bottom = layout.pos_y[0].current_position() + renderer.group_heights()[0];
+        let next_top = layout.pos_y[1].current_position();
+        assert!((slot_top - previous_bottom - renderer.group_gap()).abs() < 0.001);
+        assert!(
+            (next_top - (slot_top + renderer.dot_size as f64) - renderer.group_gap()).abs() < 0.001
+        );
     }
 
     #[test]
