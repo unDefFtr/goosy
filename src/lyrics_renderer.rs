@@ -468,7 +468,8 @@ impl LyricsRenderer {
             self.text_width,
             self.group_heights[index] as f32,
         );
-        bounds.outset((expansion, expansion));
+        let visual_margin = (self.main_font_size * 0.25).max(4.0);
+        bounds.outset((expansion + visual_margin, expansion + visual_margin));
         let visible = Rect::from_xywh(
             self.viewport.x,
             self.viewport.y,
@@ -510,7 +511,8 @@ impl LyricsRenderer {
             self.text_width,
             background_height + background_translation_height,
         );
-        bounds.outset((expansion, expansion));
+        let visual_margin = (self.background_font_size * 0.25).max(4.0);
+        bounds.outset((expansion + visual_margin, expansion + visual_margin));
         let visible = Rect::from_xywh(
             self.viewport.x,
             self.viewport.y,
@@ -1937,6 +1939,147 @@ mod tests {
             second_complete_center < second_lifting_center,
             "second word should finish after fixed 1200ms: complete={second_complete_center}, \
              lifting={second_lifting_center}"
+        );
+    }
+
+    #[test]
+    fn inactive_background_vocal_preserves_top_glyph_pixels_in_bounded_layer() {
+        use skia_safe::{AlphaType, ColorType, IPoint, ImageInfo, surfaces};
+
+        let lines = vec![
+            line_with_background_vocal(0, 2_000, 2_000, 4_000),
+            blank_line(2_000, 4_000),
+        ];
+        let viewport = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 300.0,
+        };
+        let renderer = LyricsRenderer::new(&lines, viewport).unwrap();
+        let mut layout = Layout::new(
+            &lines,
+            viewport.height,
+            renderer.group_heights(),
+            renderer.group_gap(),
+            renderer.interlude_slot_height(),
+        );
+        let t_ms = 0;
+        layout.update(&lines, t_ms, 30);
+
+        let background_paragraph = renderer.background_paragraphs[0]
+            .as_ref()
+            .expect("background paragraph initialized");
+        let background_line = renderer.background_lines[0]
+            .as_ref()
+            .expect("background line initialized");
+        let text_end = background_line.text.encode_utf16().count();
+        let text_rects = background_paragraph.get_rects_for_range(
+            0..text_end,
+            RectHeightStyle::Tight,
+            RectWidthStyle::Tight,
+        );
+        let visual_top = text_rects
+            .iter()
+            .map(|text_box| text_box.rect.top())
+            .fold(f32::INFINITY, f32::min);
+        let text_left = text_rects
+            .iter()
+            .map(|text_box| text_box.rect.left())
+            .fold(f32::INFINITY, f32::min);
+        let text_right = text_rects
+            .iter()
+            .map(|text_box| text_box.rect.right())
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(visual_top.is_finite());
+        assert!(text_left.is_finite() && text_right.is_finite());
+
+        let background_top_offset = renderer.base_heights[0]
+            + renderer.main_font_size * BACKGROUND_GAP_EM * renderer.style.background_gap_scale;
+        let desired_visual_top = viewport.y + 2.0;
+        let top_y = desired_visual_top - visual_top - background_top_offset;
+        layout.pos_y[0].set_position(top_y as f64);
+        layout.scale[0].set_position(1.0);
+        let background_top = top_y + background_top_offset;
+        let x_start = (renderer.margin_x + text_left).floor().max(viewport.x) as usize;
+        let x_end = (renderer.margin_x + text_right)
+            .ceil()
+            .min(viewport.x + viewport.width) as usize;
+        assert!(x_start < x_end);
+
+        let dimensions = (viewport.width as i32, viewport.height as i32);
+        let info = ImageInfo::new(dimensions, ColorType::RGBA8888, AlphaType::Premul, None);
+        let row_bytes = dimensions.0 as usize * 4;
+
+        let mut bounded_surface = surfaces::raster_n32_premul(dimensions).unwrap();
+        bounded_surface.canvas().clear(Color::TRANSPARENT);
+        renderer
+            .draw(
+                bounded_surface.canvas(),
+                &lines,
+                &layout,
+                t_ms,
+                dimensions.1 as u32,
+            )
+            .unwrap();
+        let mut bounded_pixels = vec![0; info.compute_byte_size(row_bytes)];
+        assert!(bounded_surface.read_pixels(
+            &info,
+            &mut bounded_pixels,
+            row_bytes,
+            IPoint::new(0, 0),
+        ));
+
+        let mut reference_surface = surfaces::raster_n32_premul(dimensions).unwrap();
+        reference_surface.canvas().clear(Color::TRANSPARENT);
+        draw_line(
+            reference_surface.canvas(),
+            background_paragraph,
+            renderer.background_solid_paragraphs[0]
+                .as_ref()
+                .expect("background solid paragraph initialized"),
+            &renderer.background_word_boxes[0],
+            renderer.background_translation_paragraphs[0].as_ref(),
+            background_line,
+            false,
+            0.0,
+            t_ms,
+            renderer.margin_x,
+            renderer.text_width,
+            background_top,
+            renderer.background_font_size,
+            renderer.style.translation_gap_scale,
+        );
+        let mut reference_pixels = vec![0; info.compute_byte_size(row_bytes)];
+        assert!(reference_surface.read_pixels(
+            &info,
+            &mut reference_pixels,
+            row_bytes,
+            IPoint::new(0, 0),
+        ));
+
+        let reference_top = topmost_pixel_in_x_range(
+            &reference_pixels,
+            dimensions.0 as usize,
+            dimensions.1 as usize,
+            x_start,
+            x_end,
+            1,
+        )
+        .expect("reference background vocal should contain visible pixels");
+        let bounded_top = topmost_pixel_in_x_range(
+            &bounded_pixels,
+            dimensions.0 as usize,
+            dimensions.1 as usize,
+            x_start,
+            x_end,
+            1,
+        )
+        .expect("bounded background vocal should contain visible pixels");
+        assert!(
+            bounded_top <= reference_top,
+            "bounded layer clipped the top glyph pixels: bounded_top={bounded_top}, \
+             reference_top={reference_top}"
         );
     }
 
