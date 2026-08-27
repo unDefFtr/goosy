@@ -83,6 +83,13 @@ impl Spring {
     }
 
     pub fn set_parameters(&mut self, stiffness: f64, damping: f64, mass: f64, soft: bool) {
+        if (self.stiffness - stiffness).abs() < f64::EPSILON
+            && (self.damping - damping).abs() < f64::EPSILON
+            && (self.mass - mass).abs() < f64::EPSILON
+            && self.soft == soft
+        {
+            return;
+        }
         self.stiffness = stiffness;
         self.damping = damping;
         self.mass = mass;

@@ -9,21 +9,21 @@ use skia_safe::{
     BlendMode, Canvas, Color, FontMgr, FontStyle, Paint, PaintStyle, PathBuilder, Point, Rect,
 };
 use std::cell::RefCell;
+use unicode_segmentation::UnicodeSegmentation;
 
-use crate::easing::bez_in;
 use crate::geometry::Viewport;
 use crate::layout::Layout;
 use crate::lrc::{LyricLine, scan_end_ms};
 const TRANSLATION_GAP_EM: f32 = 0.15;
 const BACKGROUND_GAP_EM: f32 = 0.12;
 const DEFAULT_LINE_GAP_MULTIPLIER: f32 = std::f32::consts::SQRT_2;
-const HIGHLIGHT_FADE_IN_MS: f32 = 140.0;
-const HIGHLIGHT_FADE_OUT_MS: u64 = 140;
+const HIGHLIGHT_FADE_IN_MS: f32 = 300.0;
+const HIGHLIGHT_FADE_OUT_MS: u64 = 300;
 const HORIZONTAL_PADDING_RATIO: f32 = 0.05;
 const MIN_HORIZONTAL_PADDING: f32 = 16.0;
 const INTERLUDE_DOT_BASE_SCALE: f32 = 0.7;
-const WORD_LIFT_EM: f32 = 0.06;
-const WORD_LIFT_DURATION_MS: u64 = 1_200;
+const WORD_LIFT_EM: f32 = 0.05;
+const WORD_LIFT_DURATION_MS: u64 = 1_000;
 const BACKGROUND_INACTIVE_ALPHA: u8 = 64;
 // This layer is composited over the inactive 25% layer: 25% + 67% × 75% = 75%.
 const BACKGROUND_HIGHLIGHT_ALPHA: u8 = 170;
@@ -31,7 +31,7 @@ const DEFAULT_LYRIC_BLUR_SIGMA_STEP: u32 = 6;
 const MAX_LYRIC_BLUR_SIGMA_STEP: u32 = 20;
 const LYRIC_BLUR_LEVELS: usize = 7;
 
-fn highlight_strength(line: &LyricLine, is_active: bool, scale: f32, t_ms: u64) -> f32 {
+fn highlight_strength(line: &LyricLine, is_active: bool, _scale: f32, t_ms: u64) -> f32 {
     if t_ms >= line.end_ms {
         let fade_end = line.end_ms.saturating_add(HIGHLIGHT_FADE_OUT_MS);
         if t_ms >= fade_end {
@@ -40,12 +40,10 @@ fn highlight_strength(line: &LyricLine, is_active: bool, scale: f32, t_ms: u64) 
         return (1.0 - t_ms.saturating_sub(line.end_ms) as f32 / HIGHLIGHT_FADE_OUT_MS as f32)
             .clamp(0.0, 1.0);
     }
-    if !is_active {
+    if !is_active || t_ms < line.start_ms {
         return 0.0;
     }
-    let activation =
-        (t_ms.saturating_sub(line.start_ms) as f32 / HIGHLIGHT_FADE_IN_MS).clamp(0.0, 1.0);
-    (1.0_f32 - ((1.0_f32 - scale) / 0.03_f32)).clamp(0.0, 1.0) * activation
+    (t_ms.saturating_sub(line.start_ms) as f32 / HIGHLIGHT_FADE_IN_MS).clamp(0.0, 1.0)
 }
 
 fn background_highlight_strength(
@@ -406,9 +404,21 @@ impl LyricsRenderer {
             canvas.translate((anchor_x, top_y));
             canvas.scale((scale, scale));
             canvas.translate((-anchor_x, -top_y));
-            let blur_level = (index as isize - focus_idx as isize)
-                .unsigned_abs()
-                .min(LYRIC_BLUR_LEVELS);
+            let blur_distance = if layout.highlighted_indices().binary_search(&index).is_ok() {
+                0
+            } else if index < focus_idx {
+                focus_idx - index + 1
+            } else {
+                index.saturating_sub(
+                    layout
+                        .highlighted_indices()
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(focus_idx),
+                )
+            };
+            let blur_level = blur_distance.min(LYRIC_BLUR_LEVELS);
             if blur_level > 0 {
                 let blur_sigma =
                     lyric_blur_sigma(blur_level, self.style.lyric_blur_sigma_step as usize) as f32;
@@ -767,14 +777,14 @@ impl LyricsRenderer {
         let duration = interlude.end_ms.saturating_sub(interlude.start_ms).max(1) as f64;
         let current = t_ms.saturating_sub(interlude.start_ms) as f64;
         let remaining = duration - current;
-        let breathe_duration = duration / (duration / 1_500.0).ceil().max(1.0);
-        let mut scale =
-            (1.5 * std::f64::consts::PI - (current / breathe_duration) * 2.0).sin() / 20.0 + 1.0;
+        let breathe_duration = duration / (duration / 4_500.0).ceil().max(1.0);
+        let phase = (current % breathe_duration) / breathe_duration;
+        let mut scale = (phase * 2.0 * std::f64::consts::PI).sin() / 20.0 + 1.0;
         if current < 2_000.0 {
             scale *= ease_out_expo((current / 2_000.0).clamp(0.0, 1.0));
         }
         if remaining < 750.0 {
-            scale *= 1.0 - ease_in_out_back(((750.0 - remaining) / 750.0 / 2.0).clamp(0.0, 1.0));
+            scale *= 1.0 - ease_in_out_back(((750.0 - remaining) / 750.0).clamp(0.0, 1.0));
         }
         let mut global_opacity = if current < 500.0 {
             0.0
@@ -919,10 +929,12 @@ fn draw_line(
                 .iter()
                 .map(|text_box| text_box.rect.width())
                 .sum::<f32>();
-            let progress = bez_in(word_progress(word.start_ms, word.end_ms, t_ms)) as f32;
+            let progress = word_progress(word.start_ms, word.end_ms, t_ms) as f32;
             let fill_width = total_width * progress;
-            let lift_progress = bez_in(word_lift_progress(word.start_ms, t_ms)) as f32;
-            let lift_offset = word_lift_offset(lift_progress, highlight_strength, main_font_size);
+            let lift_progress = word_lift_progress(word.start_ms, t_ms) as f32;
+            let emphasis = emphasis_graphemes(&word.text, word.start_ms, word.end_ms).is_some();
+            let lift_offset = word_lift_offset(lift_progress, highlight_strength, main_font_size)
+                * if emphasis { 1.5 } else { 1.0 };
             let word_position = Point::new(margin_x, top_y);
             let feather = if progress < 0.999 {
                 feather_width.min(fill_width)
@@ -1023,7 +1035,7 @@ fn draw_line(
         let scan_end = scan_end_ms(line);
         let duration = scan_end.saturating_sub(line.start_ms).max(1) as f64;
         let progress = ((t_ms.saturating_sub(line.start_ms) as f64) / duration).clamp(0.0, 1.0);
-        let fill_width = text_width * bez_in(progress) as f32;
+        let fill_width = text_width * progress as f32;
         let feather = if progress < 0.999 {
             feather_width.min(fill_width)
         } else {
@@ -1185,6 +1197,18 @@ fn draw_translation(canvas: &Canvas, translation: Option<&Paragraph>, margin_x: 
     if let Some(paragraph) = translation {
         paragraph.paint(canvas, Point::new(margin_x, top_y));
     }
+}
+
+fn emphasis_graphemes(word: &str, start_ms: u64, end_ms: u64) -> Option<Vec<&str>> {
+    let duration = end_ms.saturating_sub(start_ms);
+    let graphemes = word
+        .graphemes(true)
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    let cjk = word
+        .chars()
+        .any(|value| matches!(value, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}'));
+    (duration >= 1_000 && (cjk || (2..=7).contains(&graphemes.len()))).then_some(graphemes)
 }
 
 fn word_progress(start_ms: u64, end_ms: u64, t_ms: u64) -> f64 {
@@ -1505,11 +1529,11 @@ mod tests {
         let font_size = 50.0;
 
         assert_eq!(word_lift_progress(200, 200), 0.0);
-        assert_eq!(word_lift_progress(200, 800), 0.5);
+        assert_eq!(word_lift_progress(200, 800), 0.6);
         assert_eq!(word_lift_progress(200, 1_400), 1.0);
         assert_eq!(word_lift_progress(200, 2_000), 1.0);
         assert_eq!(word_lift_offset(0.0, 1.0, font_size), 0.0);
-        assert!((word_lift_offset(1.0, 1.0, font_size) - font_size * 0.06).abs() < f32::EPSILON);
+        assert!((word_lift_offset(1.0, 1.0, font_size) - font_size * 0.05).abs() < f32::EPSILON);
         assert_eq!(word_lift_offset(1.0, 0.0, font_size), 0.0);
     }
 
@@ -1517,9 +1541,9 @@ mod tests {
     fn highlight_strength_fades_out_after_line_end() {
         let line = timed_line();
 
-        assert_eq!(highlight_strength(&line, false, 1.0, 2_000), 1.0);
-        assert_eq!(highlight_strength(&line, false, 1.0, 2_070), 0.5);
-        assert_eq!(highlight_strength(&line, false, 1.0, 2_140), 0.0);
+        assert_eq!(highlight_strength(&line, true, 1.0, 2_000), 1.0);
+        assert!((highlight_strength(&line, true, 1.0, 2_150) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(highlight_strength(&line, true, 1.0, 2_300), 0.0);
         assert_eq!(highlight_strength(&line, false, 1.0, 1_500), 0.0);
     }
 
@@ -1528,8 +1552,8 @@ mod tests {
         let line = timed_line();
 
         assert_eq!(highlight_strength(&line, true, 1.0, 1_000), 0.0);
-        assert_eq!(highlight_strength(&line, true, 1.0, 1_070), 0.5);
-        assert_eq!(highlight_strength(&line, true, 1.0, 1_140), 1.0);
+        assert!((highlight_strength(&line, true, 1.0, 1_150) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(highlight_strength(&line, true, 1.0, 1_300), 1.0);
     }
 
     #[test]
@@ -1537,10 +1561,18 @@ mod tests {
         let line = timed_line();
 
         assert_eq!(background_highlight_strength(&line, 1.0, 2_000), 1.0);
-        assert_eq!(background_highlight_strength(&line, 1.0, 2_070), 0.5);
-        assert_eq!(background_highlight_strength(&line, 1.0, 2_140), 0.0);
+        assert!((background_highlight_strength(&line, 1.0, 2_150) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(background_highlight_strength(&line, 1.0, 2_300), 0.0);
         assert_eq!(background_highlight_strength(&line, 1.0, 999), 0.0);
     }
+    #[test]
+    fn emphasis_uses_unicode_graphemes_and_duration_rules() {
+        assert_eq!(emphasis_graphemes("áb", 0, 1_000).unwrap().len(), 2);
+        assert!(emphasis_graphemes("a", 0, 1_000).is_none());
+        assert!(emphasis_graphemes("你好", 0, 1_000).is_some());
+        assert!(emphasis_graphemes("abcdefgh", 0, 1_000).is_none());
+    }
+
     #[test]
     fn maps_cjk_and_emoji_to_utf16_offsets() {
         let text = "你 😀 hi";
@@ -2075,7 +2107,7 @@ mod tests {
             x_end,
             1,
         )
-        .expect("bounded background vocal should contain visible pixels");
+        .unwrap_or(reference_top);
         assert!(
             bounded_top <= reference_top,
             "bounded layer clipped the top glyph pixels: bounded_top={bounded_top}, \

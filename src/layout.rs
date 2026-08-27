@@ -1,12 +1,11 @@
 use crate::lrc::{LyricLine, scan_end_ms};
 use crate::spring::Spring;
 
-const POS_STIFFNESS: f64 = 40.0;
-const POS_DAMPING: f64 = 10.0;
+const POS_STIFFNESS: f64 = 90.0;
+const POS_DAMPING: f64 = 15.0;
 const MIN_ANTICIPATION_MS: u64 = 180;
 const MAX_ANTICIPATION_MS: u64 = 700;
 const MIN_INTERLUDE_MS: u64 = 4_000;
-const INTERLUDE_END_LEAD_MS: u64 = 250;
 const INTERLUDE_FLOAT_DELAY_MS: u64 = 70;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +21,7 @@ fn interlude_between(lines: &[LyricLine], next_idx: usize) -> Option<Interlude> 
         .checked_sub(1)
         .and_then(|index| lines.get(index).map(|line| line.end_ms))
         .unwrap_or(0);
-    let end_ms = next.start_ms.saturating_sub(INTERLUDE_END_LEAD_MS);
+    let end_ms = next.start_ms;
     (end_ms.saturating_sub(start_ms) >= MIN_INTERLUDE_MS).then_some(Interlude {
         next_idx,
         start_ms,
@@ -43,6 +42,11 @@ pub struct Layout {
     pub scale: Vec<Spring>,
     active_idx: usize,
     focus_idx: usize,
+    playing_indices: Vec<usize>,
+    highlighted_indices: Vec<usize>,
+    previous_t_ms: Option<u64>,
+    transition_ms: u64,
+    stagger_delays_ms: Vec<u64>,
     height: f64,
     initialized: bool,
     // Total height occupied by each lyric group, including its text.
@@ -62,7 +66,7 @@ impl Layout {
         interlude_slot_height: f64,
     ) -> Self {
         let active_idx = 0;
-        let center = height as f64 / 2.0;
+        let center = height as f64 * 0.35;
         let group_heights = lines
             .iter()
             .enumerate()
@@ -77,19 +81,24 @@ impl Layout {
                     POS_STIFFNESS,
                     POS_DAMPING,
                     1.0,
-                    true,
+                    false,
                 )
             })
             .collect();
         let scale = lines
             .iter()
-            .map(|_| Spring::with_parameters(1.0, 100.0, 10.0, 1.0, true))
+            .map(|_| Spring::with_parameters(0.97, 100.0, 25.0, 2.0, false))
             .collect();
         Self {
             pos_y,
             scale,
             active_idx,
             focus_idx: active_idx,
+            playing_indices: Vec::new(),
+            highlighted_indices: Vec::new(),
+            previous_t_ms: None,
+            transition_ms: 0,
+            stagger_delays_ms: vec![0; lines.len()],
             height: height as f64,
             initialized: false,
             group_heights,
@@ -103,9 +112,40 @@ impl Layout {
         if lines.is_empty() || fps == 0 {
             return;
         }
-        let next_active = active_index(lines, t_ms);
+        let previous_t_ms = self.previous_t_ms;
+        let seeking = previous_t_ms.is_some_and(|previous| t_ms < previous);
+        let playing = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                (line.start_ms < line.end_ms && line.start_ms <= t_ms && t_ms < line.end_ms)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let next_active = playing
+            .first()
+            .copied()
+            .unwrap_or_else(|| active_index(lines, t_ms));
         let next_focus = anticipatory_index(lines, t_ms, next_active);
         let next_interlude = interlude_for(lines, t_ms);
+        let started = playing
+            .iter()
+            .any(|index| !self.playing_indices.contains(index));
+        if seeking || !self.initialized {
+            self.highlighted_indices = playing.clone();
+        } else if next_interlude.is_some() && playing.is_empty() {
+            self.highlighted_indices.clear();
+        } else if started {
+            self.highlighted_indices
+                .retain(|index| lines[*index].end_ms > t_ms);
+            for index in &playing {
+                if !self.highlighted_indices.contains(index) {
+                    self.highlighted_indices.push(*index);
+                }
+            }
+        }
+        self.playing_indices = playing;
+        self.highlighted_indices.sort_unstable();
         if !self.initialized {
             self.active_idx = next_active;
             self.focus_idx = next_focus;
@@ -119,9 +159,21 @@ impl Layout {
             self.focus_idx = next_focus;
             self.interlude = next_interlude;
             if focus_changed || interlude_changed {
+                let (stiffness, damping) =
+                    position_policy(lines, next_focus, next_interlude.is_some());
+                self.transition_ms = t_ms;
                 for index in 0..lines.len() {
+                    let delay = if next_interlude.is_some() || index <= next_focus {
+                        0
+                    } else {
+                        ((index - next_focus) as f64 * 50.0 / 1.05) as u64
+                    };
+                    self.stagger_delays_ms[index] = delay;
+                    self.pos_y[index].set_parameters(stiffness, damping, 1.0, false);
                     let target_y = self.target_y(index);
-                    self.pos_y[index].set_target_position(target_y);
+                    if delay == 0 {
+                        self.pos_y[index].set_target_position(target_y);
+                    }
                     self.scale[index].set_target_position(if index == self.focus_idx {
                         1.0
                     } else {
@@ -130,20 +182,49 @@ impl Layout {
                 }
             }
         }
-        let dt = 1.0 / fps as f64;
+        let elapsed = t_ms.saturating_sub(self.transition_ms);
+        for index in 0..lines.len() {
+            if elapsed >= self.stagger_delays_ms[index] {
+                let target_y = self.target_y(index);
+                self.pos_y[index].set_target_position(target_y);
+            }
+        }
+        let dt = if seeking {
+            0.0
+        } else {
+            previous_t_ms.map_or(1.0 / fps as f64, |previous| {
+                let delta = t_ms.saturating_sub(previous) as f64 / 1000.0;
+                if delta > 0.1 { 1.0 / fps as f64 } else { delta }
+            })
+        };
         for spring in &mut self.pos_y {
             spring.update(dt);
         }
         for spring in &mut self.scale {
             spring.update(dt);
         }
+        self.previous_t_ms = Some(t_ms);
     }
-
     pub fn active_idx(&self) -> usize {
         self.active_idx
     }
     pub fn is_active(&self, index: usize) -> bool {
-        self.interlude.is_none() && index == self.active_idx
+        self.interlude.is_none() && self.highlighted_indices.binary_search(&index).is_ok()
+    }
+    pub fn playing_indices(&self) -> &[usize] {
+        &self.playing_indices
+    }
+    pub fn highlighted_indices(&self) -> &[usize] {
+        &self.highlighted_indices
+    }
+    pub fn is_playing(&self, index: usize) -> bool {
+        self.playing_indices.binary_search(&index).is_ok()
+    }
+    pub fn scroll_to_idx(&self) -> usize {
+        self.focus_idx
+    }
+    pub fn latest_highlighted_idx(&self) -> Option<usize> {
+        self.highlighted_indices.iter().copied().max()
     }
 
     pub fn focus_idx(&self) -> usize {
@@ -175,7 +256,7 @@ impl Layout {
 
     fn target_y(&self, index: usize) -> f64 {
         let focus_height = self.group_height(self.focus_idx);
-        let focus_top = self.height / 2.0 - focus_height / 2.0;
+        let focus_top = self.height * 0.35 - focus_height / 2.0;
         if index < self.focus_idx {
             let preceding = (index..self.focus_idx)
                 .map(|item| {
@@ -353,7 +434,7 @@ mod tests {
         ];
         let interlude = interlude_for(&lines, 2_000).unwrap();
         assert_eq!(interlude.start_ms, 1_000);
-        assert_eq!(interlude.end_ms, 5_750);
+        assert_eq!(interlude.end_ms, 6_000);
         let mut layout = Layout::new(&lines, 1_080.0, &[70.0, 70.0], 0.0, 40.0);
         layout.update(&lines, 2_000, 30);
         assert!(
@@ -364,8 +445,21 @@ mod tests {
         assert!(!layout.is_active(1));
         layout.update(&lines, 5_800, 30);
         assert_eq!(layout.focus_idx, 0);
-        layout.update(&lines, 5_820, 30);
+        layout.update(&lines, 6_000, 30);
         assert_eq!(layout.focus_idx, 1);
-        assert_eq!(layout.active_idx(), 0);
+        assert_eq!(layout.active_idx(), 1);
     }
+}
+
+fn position_policy(lines: &[LyricLine], focus_idx: usize, interlude: bool) -> (f64, f64) {
+    if interlude || focus_idx == 0 {
+        return (90.0, 15.0);
+    }
+    let interval = lines[focus_idx]
+        .start_ms
+        .saturating_sub(lines[focus_idx - 1].start_ms)
+        .clamp(100, 800) as f64;
+    let ratio = (1.0 - (interval - 100.0) / 700.0).powf(0.2);
+    let stiffness = 170.0 + ratio * 50.0;
+    (stiffness, stiffness.sqrt() * 2.2)
 }
