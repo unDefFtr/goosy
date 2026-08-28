@@ -1,7 +1,8 @@
 use eframe::egui;
 use libgoosy::{
     LyricFormat, LyricsStyle, RenderControl, RenderOptions, background, cover_renderer,
-    geometry::FrameGeometry, layout::Layout, lrc, lyrics_renderer::LyricsRenderer, video,
+    geometry::FrameGeometry, image_asset::ImageAsset, layout::Layout, lrc,
+    lyrics_renderer::LyricsRenderer, video,
 };
 use rfd::FileDialog;
 use std::collections::VecDeque;
@@ -131,22 +132,27 @@ fn style_preview_lines() -> Vec<lrc::LyricLine> {
     ]
 }
 
-fn load_style_preview_cover(scene: &StylePreviewScene) -> Result<Option<Vec<u8>>, String> {
+fn load_style_preview_cover(scene: &StylePreviewScene) -> Result<Option<ImageAsset>, String> {
     if let Some(path) = scene.cover_path.as_deref() {
-        return std::fs::read(path)
+        return ImageAsset::from_path(path)
             .map(Some)
-            .map_err(|error| format!("读取预览封面 {} 失败：{error}", path.display()));
+            .map_err(|error| format!("读取预览封面 {} 失败：{error:#}", path.display()));
     }
     let Some(audio) = scene.embedded_cover_audio.as_deref() else {
         return Ok(None);
     };
-    video::embedded_cover_image(audio).map_err(|error| error.to_string())
+    video::embedded_cover_image(audio)
+        .map_err(|error| error.to_string())?
+        .as_deref()
+        .map(ImageAsset::from_bytes)
+        .transpose()
+        .map_err(|error| error.to_string())
 }
 
 fn render_style_preview(
     style: LyricsStyle,
     scene: &StylePreviewScene,
-    cover_bytes: Option<&[u8]>,
+    cover_asset: Option<&ImageAsset>,
 ) -> Result<egui::ColorImage, String> {
     use skia_safe::{AlphaType, ColorType, IPoint, ImageInfo, surfaces};
 
@@ -172,14 +178,16 @@ fn render_style_preview(
         renderer.interlude_slot_height(),
     );
     layout.update(&lines, STYLE_PREVIEW_TIME_MS, 30);
-    let mut background = if let Some(bytes) = cover_bytes {
-        background::BackgroundRenderer::from_image_bytes(bytes)
+    let mut background = if let Some(asset) = cover_asset {
+        background::BackgroundRenderer::from_image_asset(asset)
             .map_err(|error| error.to_string())?
     } else {
         background::BackgroundRenderer::dynamic()
     };
-    let mut cover = cover_bytes
-        .map(|bytes| cover_renderer::CoverRenderer::from_bytes(bytes, Some(scene.title.clone())))
+    let mut cover = cover_asset
+        .map(|asset| {
+            cover_renderer::CoverRenderer::from_image_asset(asset, Some(scene.title.clone()))
+        })
         .transpose()
         .map_err(|error| error.to_string())?;
 
@@ -243,7 +251,7 @@ fn spawn_style_preview_worker() -> (
     thread::spawn(move || {
         let mut cached_cover: Option<(
             (Option<PathBuf>, Option<PathBuf>),
-            Result<Option<Vec<u8>>, String>,
+            Result<Option<ImageAsset>, String>,
         )> = None;
         while let Ok(mut request) = request_receiver.recv() {
             while let Ok(newer) = request_receiver.try_recv() {
@@ -263,7 +271,7 @@ fn spawn_style_preview_worker() -> (
                 .as_ref()
             {
                 Ok(cover) => {
-                    render_style_preview(request.style, &request.key.scene, cover.as_deref())
+                    render_style_preview(request.style, &request.key.scene, cover.as_ref())
                 }
                 Err(error) => Err(error.clone()),
             };
@@ -2020,8 +2028,7 @@ mod tests {
         new_preview_directory, parse_preview_event, render_page_uses_columns, render_style_preview,
         spawn_style_preview_worker, style_preview_dimensions, terminate_render_child,
     };
-    use libgoosy::LyricsStyle;
-    use libgoosy::lrc::LyricLine;
+    use libgoosy::{LyricsStyle, image_asset::ImageAsset, lrc::LyricLine};
 
     fn line(text: &str) -> LyricLine {
         LyricLine {
@@ -2305,9 +2312,9 @@ mod tests {
         assert_eq!(style_preview_dimensions(1_080, 1_920), (203, 360));
         let landscape = preview_scene(1_920, 1_080);
         let without_cover = render_style_preview(LyricsStyle::default(), &landscape, None).unwrap();
-        let cover_png = test_cover_png();
+        let cover_asset = ImageAsset::from_bytes(&test_cover_png()).unwrap();
         let with_cover =
-            render_style_preview(LyricsStyle::default(), &landscape, Some(&cover_png)).unwrap();
+            render_style_preview(LyricsStyle::default(), &landscape, Some(&cover_asset)).unwrap();
         let split_x = (with_cover.size[0] as f32 * 0.381_966_011_25) as usize;
         let cover_center = split_x / 2 + with_cover.size[1] / 2 * with_cover.size[0];
 

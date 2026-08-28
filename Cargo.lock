@@ -1493,6 +1493,7 @@ name = "goosy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "clap",
  "eframe",
  "indicatif",

@@ -11,6 +11,8 @@ pub struct SurfaceRenderer {
 
 enum Backend {
     Raster,
+    #[cfg(target_os = "linux")]
+    Vulkan(VulkanBackend),
     #[cfg(target_os = "windows")]
     Direct3D(Direct3DBackend),
     #[cfg(target_os = "windows")]
@@ -36,6 +38,22 @@ impl SurfaceRenderer {
             return Ok(Self {
                 backend: Backend::Raster,
             });
+        }
+        #[cfg(target_os = "linux")]
+        if requested.allows_vulkan() {
+            match VulkanBackend::new() {
+                Ok(vulkan) => {
+                    return Ok(Self {
+                        backend: Backend::Vulkan(vulkan),
+                    });
+                }
+                Err(error) if requested == BackendRequest::Vulkan => {
+                    return Err(error.context("initialize Vulkan backend"));
+                }
+                Err(error) => {
+                    eprintln!("goosy: Vulkan unavailable; using raster: {error:#}");
+                }
+            }
         }
         #[cfg(target_os = "windows")]
         {
@@ -89,6 +107,8 @@ impl SurfaceRenderer {
     pub fn backend_name(&self) -> &'static str {
         match &self.backend {
             Backend::Raster => "raster",
+            #[cfg(target_os = "linux")]
+            Backend::Vulkan(_) => "vulkan",
             #[cfg(target_os = "windows")]
             Backend::Direct3D(_) => "d3d12",
             #[cfg(target_os = "windows")]
@@ -101,6 +121,8 @@ impl SurfaceRenderer {
     pub fn backend_details(&self) -> String {
         match &self.backend {
             Backend::Raster => "CPU raster (RGBA_8888 premultiplied sRGB)".to_owned(),
+            #[cfg(target_os = "linux")]
+            Backend::Vulkan(vulkan) => vulkan.details(),
             #[cfg(target_os = "windows")]
             Backend::Direct3D(direct3d) => direct3d.details(),
             #[cfg(target_os = "windows")]
@@ -122,6 +144,8 @@ impl SurfaceRenderer {
     {
         match &mut self.backend {
             Backend::Raster => render_raster_into(info, row_bytes, pixels, draw),
+            #[cfg(target_os = "linux")]
+            Backend::Vulkan(vulkan) => vulkan.render_into(info, row_bytes, pixels, draw),
             #[cfg(target_os = "windows")]
             Backend::Direct3D(direct3d) => direct3d.render_into(info, row_bytes, pixels, draw),
             #[cfg(target_os = "windows")]
@@ -136,6 +160,8 @@ impl SurfaceRenderer {
 enum BackendRequest {
     Auto,
     Raster,
+    #[cfg(target_os = "linux")]
+    Vulkan,
     #[cfg(target_os = "windows")]
     D3d12,
     #[cfg(target_os = "windows")]
@@ -145,13 +171,21 @@ enum BackendRequest {
 }
 
 fn requested_backend() -> Result<BackendRequest> {
-    let Some(value) = std::env::var_os("GOOSY_RENDER_BACKEND") else {
-        return Ok(BackendRequest::Auto);
-    };
-    let value = value.to_string_lossy().trim().to_ascii_lowercase();
+    let value = std::env::var_os("GOOSY_RENDER_BACKEND");
+    parse_backend_request(value.as_deref())
+}
+
+fn parse_backend_request(value: Option<&std::ffi::OsStr>) -> Result<BackendRequest> {
+    let value = value
+        .unwrap_or_default()
+        .to_string_lossy()
+        .trim()
+        .to_ascii_lowercase();
     match value.as_str() {
         "" | "auto" => Ok(BackendRequest::Auto),
         "raster" | "cpu" => Ok(BackendRequest::Raster),
+        #[cfg(target_os = "linux")]
+        "vulkan" | "vk" => Ok(BackendRequest::Vulkan),
         #[cfg(target_os = "windows")]
         "d3d12" | "direct3d" | "direct3d12" => Ok(BackendRequest::D3d12),
         #[cfg(target_os = "windows")]
@@ -165,6 +199,11 @@ fn requested_backend() -> Result<BackendRequest> {
 }
 
 impl BackendRequest {
+    #[cfg(target_os = "linux")]
+    fn allows_vulkan(self) -> bool {
+        matches!(self, Self::Auto | Self::Vulkan)
+    }
+
     #[cfg(target_os = "windows")]
     fn allows_d3d12(self) -> bool {
         matches!(self, Self::Auto | Self::D3d12)
@@ -232,6 +271,229 @@ fn read_pixels_into(
         bail!("read RGBA pixels from surface");
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct VulkanNative {
+    device: Option<ash::Device>,
+    instance: Option<ash::Instance>,
+    entry: ash::Entry,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VulkanNative {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(device) = self.device.take() {
+                let _ = device.device_wait_idle();
+                device.destroy_device(None);
+            }
+            if let Some(instance) = self.instance.take() {
+                instance.destroy_instance(None);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VulkanBackend {
+    surface: Option<Surface>,
+    context: Option<skia_safe::gpu::DirectContext>,
+    #[allow(dead_code)]
+    native: VulkanNative,
+    device_name: String,
+    vendor_id: u32,
+    device_type: ash::vk::PhysicalDeviceType,
+}
+
+#[cfg(target_os = "linux")]
+impl VulkanBackend {
+    fn new() -> Result<Self> {
+        use ash::vk::{self, Handle};
+        use skia_safe::gpu::ganesh::ResourceCacheLimits;
+        use skia_safe::gpu::{self, vk as skia_vk};
+        use std::ffi::{CStr, CString};
+
+        let entry = unsafe { ash::Entry::load() }.context("load Vulkan loader")?;
+        let loader_version = unsafe { entry.try_enumerate_instance_version() }
+            .context("query Vulkan loader API version")?
+            .unwrap_or(vk::API_VERSION_1_0);
+        if loader_version < vk::API_VERSION_1_1 {
+            bail!(
+                "Vulkan loader API {}.{} is below required 1.1",
+                vk::api_version_major(loader_version),
+                vk::api_version_minor(loader_version)
+            );
+        }
+        let api_version = loader_version.min(vk::API_VERSION_1_3);
+        let application_name = CString::new("Goosy").expect("static application name");
+        let application_info = vk::ApplicationInfo::default()
+            .application_name(&application_name)
+            .application_version(0)
+            .engine_name(&application_name)
+            .engine_version(0)
+            .api_version(api_version);
+        let instance_info = vk::InstanceCreateInfo::default().application_info(&application_info);
+        let instance = unsafe { entry.create_instance(&instance_info, None) }
+            .context("create Vulkan instance")?;
+        let mut native = VulkanNative {
+            device: None,
+            instance: Some(instance),
+            entry,
+        };
+
+        let instance = native
+            .instance
+            .as_ref()
+            .expect("Vulkan instance initialized");
+        let physical_devices = unsafe { instance.enumerate_physical_devices() }
+            .context("enumerate Vulkan physical devices")?;
+        let mut candidates = Vec::new();
+        for physical_device in physical_devices {
+            let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+            if properties.api_version < vk::API_VERSION_1_1 {
+                continue;
+            }
+            let queue_family_index =
+                unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+                    .iter()
+                    .position(|family| family.queue_flags.contains(vk::QueueFlags::GRAPHICS));
+            let Some(queue_family_index) = queue_family_index else {
+                continue;
+            };
+            let preference = match properties.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+                vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+                vk::PhysicalDeviceType::CPU => 3,
+                _ => 4,
+            };
+            candidates.push((
+                preference,
+                physical_device,
+                queue_family_index as u32,
+                properties,
+            ));
+        }
+        candidates.sort_by_key(|candidate| candidate.0);
+        let Some((_, physical_device, queue_family_index, properties)) =
+            candidates.into_iter().next()
+        else {
+            bail!("no graphics-capable Vulkan 1.1 device");
+        };
+
+        let priorities = [1.0_f32];
+        let queue_info = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .queue_priorities(&priorities);
+        let queue_infos = [queue_info];
+        let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_infos);
+        let device = unsafe { instance.create_device(physical_device, &device_info, None) }
+            .context("create Vulkan graphics device")?;
+        native.device = Some(device);
+        let device = native.device.as_ref().expect("Vulkan device initialized");
+        let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+
+        let mut context = {
+            let get_proc = |request: skia_vk::GetProcOf| unsafe {
+                match request {
+                    skia_vk::GetProcOf::Instance(raw_instance, name) => native
+                        .entry
+                        .get_instance_proc_addr(vk::Instance::from_raw(raw_instance as _), name),
+                    skia_vk::GetProcOf::Device(raw_device, name) => {
+                        instance.get_device_proc_addr(vk::Device::from_raw(raw_device as _), name)
+                    }
+                }
+                .map(|function| function as *const () as *const std::ffi::c_void)
+                .unwrap_or(std::ptr::null())
+            };
+            let backend = unsafe {
+                skia_vk::BackendContext::new_builder(
+                    instance.handle().as_raw() as _,
+                    physical_device.as_raw() as _,
+                    device.handle().as_raw() as _,
+                    (queue.as_raw() as _, queue_family_index as usize),
+                    &get_proc,
+                    Some(api_version.into()),
+                )
+                .build()
+            };
+            gpu::direct_contexts::make_vulkan(&backend, None)
+                .context("create Skia Ganesh Vulkan context")?
+        };
+        context.set_resource_cache_limits(ResourceCacheLimits {
+            max_resources: 4_096,
+            max_resource_bytes: GPU_RESOURCE_CACHE_BYTES,
+        });
+        let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+
+        Ok(Self {
+            surface: None,
+            context: Some(context),
+            native,
+            device_name,
+            vendor_id: properties.vendor_id,
+            device_type: properties.device_type,
+        })
+    }
+
+    fn details(&self) -> String {
+        format!(
+            "Skia Ganesh Vulkan / {} (vendor 0x{:04X}, {:?})",
+            self.device_name, self.vendor_id, self.device_type
+        )
+    }
+
+    fn render_into<F>(
+        &mut self,
+        info: &ImageInfo,
+        row_bytes: usize,
+        pixels: &mut Vec<u8>,
+        draw: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Canvas) -> Result<()>,
+    {
+        use skia_safe::gpu::{self, Budgeted, SurfaceOrigin};
+
+        let context = self.context.as_mut().expect("Vulkan context initialized");
+        if self.surface.is_none() {
+            self.surface = Some(
+                gpu::surfaces::render_target(
+                    context,
+                    Budgeted::Yes,
+                    info,
+                    0,
+                    SurfaceOrigin::TopLeft,
+                    None,
+                    false,
+                    false,
+                )
+                .context("create Vulkan render target")?,
+            );
+        }
+        let surface = self.surface.as_mut().expect("Vulkan surface initialized");
+        draw(surface.canvas())?;
+        context.flush_submit_and_sync_cpu();
+        if context.is_device_lost() {
+            bail!("Vulkan GPU submission failed: device lost");
+        }
+        if context.oomed() {
+            bail!("Vulkan GPU submission failed: out of memory");
+        }
+        read_pixels_into(surface, info, row_bytes, pixels)
+            .context("read RGBA pixels from Vulkan surface")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VulkanBackend {
+    fn drop(&mut self) {
+        self.surface.take();
+        self.context.take();
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -687,5 +949,34 @@ mod tests {
         })?;
         assert_eq!(pixels, [12, 34, 56, 255, 12, 34, 56, 255]);
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_backend_requests_without_initializing_vulkan() {
+        use std::ffi::OsStr;
+
+        assert_eq!(parse_backend_request(None).unwrap(), BackendRequest::Auto);
+        assert_eq!(
+            parse_backend_request(Some(OsStr::new("auto"))).unwrap(),
+            BackendRequest::Auto
+        );
+        assert_eq!(
+            parse_backend_request(Some(OsStr::new("vulkan"))).unwrap(),
+            BackendRequest::Vulkan
+        );
+        assert_eq!(
+            parse_backend_request(Some(OsStr::new(" VK "))).unwrap(),
+            BackendRequest::Vulkan
+        );
+        assert_eq!(
+            parse_backend_request(Some(OsStr::new("raster"))).unwrap(),
+            BackendRequest::Raster
+        );
+        assert_eq!(
+            parse_backend_request(Some(OsStr::new("cpu"))).unwrap(),
+            BackendRequest::Raster
+        );
+        assert!(parse_backend_request(Some(OsStr::new("metal"))).is_err());
     }
 }

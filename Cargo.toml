@@ -24,6 +24,10 @@ skia-safe = { version = "0.99", features = ["metal"] }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 eframe = { version = "0.36.1", default-features = true }
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = "0.38"
+skia-safe = { version = "0.99", features = ["vulkan"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 skia-safe = { version = "0.99", features = ["d3d", "gl"] }
 khronos-egl = { version = "6", default-features = false, features = ["dynamic", "1_5"] }

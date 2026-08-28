@@ -1,4 +1,5 @@
 use crate::geometry::FrameGeometry;
+use crate::image_asset::ImageAsset;
 use anyhow::{Context, Result};
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::gradient::shaders::linear_gradient;
@@ -6,8 +7,8 @@ use skia_safe::gradient::{Colors, Gradient};
 use skia_safe::image::CachingHint;
 use skia_safe::image_filters;
 use skia_safe::{
-    AlphaType, Canvas, Color, ColorSpace, ColorType, Data, IPoint, ISize, Image, ImageFilter,
-    ImageInfo, Paint, Point, Rect, TileMode,
+    AlphaType, Canvas, Color, ColorSpace, ColorType, IPoint, ISize, Image, ImageFilter, ImageInfo,
+    Paint, Point, Rect, TileMode,
 };
 const BACKGROUND_ZOOM: f32 = 1.45;
 const BACKGROUND_BLUR_SIGMA: f32 = 96.0;
@@ -34,15 +35,17 @@ impl BackgroundRenderer {
     }
 
     pub fn from_image_path(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("read background image {}", path.display()))?;
-        Self::from_image_bytes(&bytes).context("decode background image")
+        let asset = ImageAsset::from_path(path).context("load background image")?;
+        Self::from_image_asset(&asset)
     }
 
     pub fn from_image_bytes(bytes: &[u8]) -> Result<Self> {
-        let image =
-            Image::from_encoded(Data::new_copy(bytes)).context("decode background image")?;
-        Self::from_image(image)
+        let asset = ImageAsset::from_bytes(bytes).context("load background image")?;
+        Self::from_image_asset(&asset)
+    }
+
+    pub fn from_image_asset(asset: &ImageAsset) -> Result<Self> {
+        Self::from_image(asset.image().clone())
     }
 
     pub(crate) fn from_image(image: Image) -> Result<Self> {

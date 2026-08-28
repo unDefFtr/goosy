@@ -11,6 +11,11 @@ use skia_safe::{
 use std::path::Path;
 
 use crate::geometry::FrameGeometry;
+use crate::image_asset::ImageAsset;
+struct CoverCache {
+    geometry: FrameGeometry,
+    image: Image,
+}
 
 pub struct CoverRenderer {
     image: Image,
@@ -24,18 +29,23 @@ pub struct CoverRenderer {
     image_paint: Paint,
     border_paint: Paint,
     scaled_image: Option<Image>,
+    cached_layer: Option<CoverCache>,
     scaled_side: u32,
 }
 
 impl CoverRenderer {
     pub fn from_path(path: &Path, title: Option<String>) -> Result<Self> {
-        let bytes =
-            std::fs::read(path).with_context(|| format!("read cover image {}", path.display()))?;
-        Self::from_bytes(&bytes, title).context("decode cover image")
+        let asset = ImageAsset::from_path(path).context("load cover image")?;
+        Self::from_image_asset(&asset, title)
     }
 
     pub fn from_bytes(bytes: &[u8], title: Option<String>) -> Result<Self> {
-        let image = Image::from_encoded(Data::new_copy(bytes)).context("decode cover image")?;
+        let asset = ImageAsset::from_bytes(bytes).context("load cover image")?;
+        Self::from_image_asset(&asset, title)
+    }
+
+    pub fn from_image_asset(asset: &ImageAsset, title: Option<String>) -> Result<Self> {
+        let image = asset.image().clone();
         let image_width = image.width() as f32;
         let image_height = image.height() as f32;
         let crop_side = image_width.min(image_height);
@@ -69,6 +79,7 @@ impl CoverRenderer {
             border_paint,
             scaled_image: None,
             scaled_side: 0,
+            cached_layer: None,
         })
     }
     fn ensure_scaled_image(&mut self, side: f32) -> Result<()> {
@@ -102,6 +113,36 @@ impl CoverRenderer {
     }
 
     pub fn draw(&mut self, canvas: &Canvas, geometry: &FrameGeometry) -> Result<()> {
+        if geometry.cover.is_none() {
+            return Ok(());
+        }
+        if let Some(cache) = &self.cached_layer
+            && cache.geometry == *geometry
+        {
+            canvas.draw_image(&cache.image, (0.0, 0.0), None);
+            return Ok(());
+        }
+
+        let dimensions = (
+            geometry.frame.width.ceil().max(1.0) as i32,
+            geometry.frame.height.ceil().max(1.0) as i32,
+        );
+        let info = canvas.image_info().with_dimensions(dimensions);
+        let mut cache_surface = canvas
+            .new_surface(&info, None)
+            .context("create cover cache surface")?;
+        cache_surface.canvas().clear(Color::TRANSPARENT);
+        self.draw_contents(cache_surface.canvas(), geometry)?;
+        let image = cache_surface.image_snapshot();
+        canvas.draw_image(&image, (0.0, 0.0), None);
+        self.cached_layer = Some(CoverCache {
+            geometry: *geometry,
+            image,
+        });
+        Ok(())
+    }
+
+    fn draw_contents(&mut self, canvas: &Canvas, geometry: &FrameGeometry) -> Result<()> {
         let Some(viewport) = geometry.cover else {
             return Ok(());
         };
@@ -216,5 +257,76 @@ impl CoverRenderer {
         self.shadow_filter = Some(filter);
         self.shadow_sigma = sigma;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skia_safe::{AlphaType, ColorType, EncodedImageFormat, IPoint, Pixmap, Surface, surfaces};
+
+    fn test_asset() -> ImageAsset {
+        let info = ImageInfo::new_n32_premul((2, 2), None);
+        let mut pixels = [
+            40, 80, 220, 255, 40, 80, 220, 255, 40, 80, 220, 255, 40, 80, 220, 255,
+        ];
+        let pixmap = Pixmap::new(&info, &mut pixels, 8).unwrap();
+        ImageAsset::from_bytes(&pixmap.encode(EncodedImageFormat::PNG, 100).unwrap()).unwrap()
+    }
+
+    fn surface(width: i32, height: i32) -> Surface {
+        let mut surface = surfaces::raster_n32_premul((width, height)).unwrap();
+        surface.canvas().clear(Color::TRANSPARENT);
+        surface
+    }
+
+    fn pixels(surface: &mut Surface) -> Vec<u8> {
+        let dimensions = surface.image_info().dimensions();
+        let info = ImageInfo::new(dimensions, ColorType::RGBA8888, AlphaType::Premul, None);
+        let row_bytes = info.min_row_bytes();
+        let mut pixels = vec![0; info.compute_byte_size(row_bytes)];
+        assert!(surface.read_pixels(&info, &mut pixels, row_bytes, IPoint::new(0, 0)));
+        pixels
+    }
+
+    #[test]
+    fn cached_draw_matches_direct_draw_exactly_and_reuses_snapshot() {
+        let geometry = FrameGeometry::for_frame(320, 180);
+        let mut renderer =
+            CoverRenderer::from_image_asset(&test_asset(), Some("Test cover title".to_owned()))
+                .unwrap();
+        let mut direct = surface(320, 180);
+        renderer.draw_contents(direct.canvas(), &geometry).unwrap();
+        let mut first_cached = surface(320, 180);
+        renderer.draw(first_cached.canvas(), &geometry).unwrap();
+        let cached_id = renderer.cached_layer.as_ref().unwrap().image.unique_id();
+        let mut second_cached = surface(320, 180);
+        renderer.draw(second_cached.canvas(), &geometry).unwrap();
+
+        assert_eq!(
+            renderer.cached_layer.as_ref().unwrap().image.unique_id(),
+            cached_id
+        );
+        assert_eq!(pixels(&mut direct), pixels(&mut first_cached));
+        assert_eq!(pixels(&mut first_cached), pixels(&mut second_cached));
+    }
+
+    #[test]
+    fn geometry_change_rebuilds_full_frame_snapshot() {
+        let first_geometry = FrameGeometry::for_frame(320, 180);
+        let second_geometry = FrameGeometry::for_frame(640, 360);
+        let mut renderer =
+            CoverRenderer::from_image_asset(&test_asset(), Some("Title".to_owned())).unwrap();
+        let mut first = surface(320, 180);
+        renderer.draw(first.canvas(), &first_geometry).unwrap();
+        let first_id = renderer.cached_layer.as_ref().unwrap().image.unique_id();
+        let mut second = surface(640, 360);
+        renderer.draw(second.canvas(), &second_geometry).unwrap();
+        let cache = renderer.cached_layer.as_ref().unwrap();
+
+        assert_ne!(cache.image.unique_id(), first_id);
+        assert_eq!(cache.geometry, second_geometry);
+        assert_eq!(cache.image.dimensions(), (640, 360).into());
+        assert_eq!(pixels(&mut second).len(), 640 * 360 * 4);
     }
 }

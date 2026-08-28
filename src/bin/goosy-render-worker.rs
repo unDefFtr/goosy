@@ -417,7 +417,12 @@ fn main() -> Result<()> {
                 }
             });
             let mut paused = false;
-            libgoosy::render_with_frame_progress_control(
+            #[cfg(target_os = "linux")]
+            eprintln!(
+                "video encoder: {}",
+                libgoosy::video::preferred_video_encoder_name()
+            );
+            let stats = libgoosy::render_with_frame_progress_control_stats(
                 &options,
                 |done, total, elapsed, pixels| {
                     if progress_events {
@@ -473,7 +478,16 @@ fn main() -> Result<()> {
                         }
                     }
                 },
-            )
+            )?;
+            #[cfg(target_os = "linux")]
+            {
+                println!(
+                    "GOOSY_COMPLETE {} {:.3}",
+                    stats.frames, stats.elapsed_seconds
+                );
+                std::io::stdout().flush()?;
+            }
+            Ok(())
         }
     }
 }

@@ -3,6 +3,7 @@ pub mod cover_renderer;
 pub mod easing;
 pub mod ffi;
 pub mod geometry;
+pub mod image_asset;
 pub mod layout;
 pub mod lrc;
 pub mod lyrics_renderer;
@@ -133,11 +134,29 @@ where
     render_with_frame_progress_control(options, on_frame, || RenderControl::Continue)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderStats {
+    pub frames: u64,
+    pub elapsed_seconds: f64,
+}
+
 pub fn render_with_frame_progress_control<F, C>(
+    options: &RenderOptions,
+    on_frame: F,
+    control: C,
+) -> anyhow::Result<()>
+where
+    F: FnMut(u64, u64, f64, &[u8]),
+    C: FnMut() -> RenderControl,
+{
+    render_with_frame_progress_control_stats(options, on_frame, control).map(|_| ())
+}
+
+pub fn render_with_frame_progress_control_stats<F, C>(
     options: &RenderOptions,
     mut on_frame: F,
     mut control: C,
-) -> anyhow::Result<()>
+) -> anyhow::Result<RenderStats>
 where
     F: FnMut(u64, u64, f64, &[u8]),
     C: FnMut() -> RenderControl,
@@ -176,22 +195,20 @@ where
     } else {
         None
     };
-    let background_layer = if let Some(path) = options.background.as_deref() {
-        background::BackgroundRenderer::from_image_path(path)?
-    } else if let Some(path) = options.cover.as_deref() {
-        background::BackgroundRenderer::from_image_path(path)?
-    } else if let Some(bytes) = embedded_cover.as_deref() {
-        background::BackgroundRenderer::from_image_bytes(bytes)?
-    } else {
-        background::BackgroundRenderer::dynamic()
+    let image_assets = image_asset::load_scene_image_assets(
+        options.background.as_deref(),
+        options.cover.as_deref(),
+        embedded_cover.as_deref(),
+    )?;
+    let background_layer = match image_assets.background.as_ref() {
+        Some(asset) => background::BackgroundRenderer::from_image_asset(asset)?,
+        None => background::BackgroundRenderer::dynamic(),
     };
-    let cover_layer = if let Some(path) = options.cover.as_deref() {
-        Some(cover_renderer::CoverRenderer::from_path(path, title)?)
-    } else if let Some(bytes) = embedded_cover.as_deref() {
-        Some(cover_renderer::CoverRenderer::from_bytes(bytes, title)?)
-    } else {
-        None
-    };
+    let cover_layer = image_assets
+        .cover
+        .as_ref()
+        .map(|asset| cover_renderer::CoverRenderer::from_image_asset(asset, title))
+        .transpose()?;
     let mut renderer = Renderer::with_scene_options(
         options.width,
         options.height,
@@ -235,8 +252,12 @@ where
         writer.submit_frame(&mut rgba)?;
     }
     writer.finish()?;
+    let elapsed_seconds = render_started.elapsed().as_secs_f64();
     progress.finish_and_clear();
-    Ok(())
+    Ok(RenderStats {
+        frames: total_frames,
+        elapsed_seconds,
+    })
 }
 
 pub fn read_lyrics_file(

@@ -2,7 +2,8 @@ mod gui;
 
 #[cfg(not(target_os = "windows"))]
 use libgoosy::{
-    LyricsStyle, background, cover_renderer, lrc, pdf_renderer, renderer, ttml, video, yrc,
+    LyricsStyle, background, cover_renderer, image_asset, lrc, pdf_renderer, renderer, ttml, video,
+    yrc,
 };
 
 use anyhow::Result;
@@ -329,24 +330,22 @@ fn render(
     } else {
         None
     };
-    let background_layer = if let Some(path) = background.as_deref() {
-        background::BackgroundRenderer::from_image_path(path)?
-    } else if let Some(path) = cover.as_deref() {
-        background::BackgroundRenderer::from_image_path(path)?
-    } else if let Some(bytes) = embedded_cover.as_deref() {
-        background::BackgroundRenderer::from_image_bytes(bytes)?
-    } else {
-        background::BackgroundRenderer::dynamic()
+    let image_assets = image_asset::load_scene_image_assets(
+        background.as_deref(),
+        cover.as_deref(),
+        embedded_cover.as_deref(),
+    )?;
+    let background_layer = match image_assets.background.as_ref() {
+        Some(asset) => background::BackgroundRenderer::from_image_asset(asset)?,
+        None => background::BackgroundRenderer::dynamic(),
     };
     #[cfg(target_os = "windows")]
     ensure_windows_backend_is_healthy(width, height, progress_events)?;
-    let cover_layer = if let Some(path) = cover.as_deref() {
-        Some(cover_renderer::CoverRenderer::from_path(path, title)?)
-    } else if let Some(bytes) = embedded_cover.as_deref() {
-        Some(cover_renderer::CoverRenderer::from_bytes(bytes, title)?)
-    } else {
-        None
-    };
+    let cover_layer = image_assets
+        .cover
+        .as_ref()
+        .map(|asset| cover_renderer::CoverRenderer::from_image_asset(asset, title))
+        .transpose()?;
     #[cfg(target_os = "windows")]
     ensure_windows_renderer_is_healthy(width, height, fps, progress_events)?;
     emit_render_stage(
@@ -384,6 +383,8 @@ fn render(
         renderer.backend_details()
     );
     emit_render_stage(progress_events, "starting-ffmpeg", "正在启动 FFmpeg")?;
+    #[cfg(target_os = "linux")]
+    eprintln!("video encoder: {}", video::preferred_video_encoder_name());
     let mut writer = video::AsyncVideoWriter::new(
         &output,
         width,
