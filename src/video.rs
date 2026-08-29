@@ -1,3 +1,4 @@
+use crate::frame::{FrameSink, RenderedFrame};
 use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -346,11 +347,10 @@ fn add_video_encoder(command: &mut Command, encoder: &VideoEncoder) {
     };
 }
 
-pub struct VideoWriter {
+struct FfmpegPipe {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     command: String,
-    _output: PathBuf,
 }
 
 fn video_writer_command(
@@ -397,22 +397,11 @@ fn video_writer_command(
     command
 }
 
-impl VideoWriter {
-    pub fn new(
-        output: &Path,
-        width: u32,
-        height: u32,
-        fps: u32,
-        audio: Option<&Path>,
-    ) -> Result<Self> {
+impl FfmpegPipe {
+    fn new(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>) -> Result<Self> {
         let mut command =
             video_writer_command(output, width, height, fps, audio, &PREFERRED_VIDEO_ENCODER);
-        command
-            .stdin(Stdio::piped())
-            // Never pipe FFmpeg stderr without a concurrent drain: on Windows
-            // encoder diagnostics can fill the pipe before the first frame,
-            // making the writer wait forever at GUI 0%.
-            .stderr(Stdio::inherit());
+        command.stdin(Stdio::piped()).stderr(Stdio::inherit());
         let command_display = format!("{command:?}");
         let mut child = command
             .spawn()
@@ -422,16 +411,15 @@ impl VideoWriter {
             child: Some(child),
             stdin: Some(stdin),
             command: command_display,
-            _output: output.to_owned(),
         })
     }
 
-    pub fn write_frame(&mut self, rgba: &[u8]) -> Result<()> {
+    fn write_frame(&mut self, pixels: &[u8]) -> Result<()> {
         if let Err(error) = self
             .stdin
             .as_mut()
             .context("video writer is already finished")?
-            .write_all(rgba)
+            .write_all(pixels)
         {
             self.stdin.take();
             let output = self
@@ -449,7 +437,7 @@ impl VideoWriter {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<()> {
+    fn finish(&mut self) -> Result<()> {
         self.stdin.take();
         let output = self
             .child
@@ -469,21 +457,18 @@ impl VideoWriter {
     }
 }
 
-// One queued frame lets FFmpeg write the previous frame while the renderer fills
-// the recycled buffer. Together with the caller's buffer this caps ownership at
-// two complete RGBA frames.
 const FRAME_QUEUE_CAPACITY: usize = 1;
 
-/// Sends rendered frames to FFmpeg without making the render thread perform the
-/// blocking pipe write. The single queued frame preserves bounded backpressure.
-pub struct AsyncVideoWriter {
-    sender: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
-    recycled: std::sync::mpsc::Receiver<Vec<u8>>,
+pub struct PipeEncoder {
+    sender: Option<std::sync::mpsc::SyncSender<RenderedFrame>>,
+    recycled: std::sync::mpsc::Receiver<RenderedFrame>,
     worker: Option<std::thread::JoinHandle<Result<()>>>,
-    frame_size: usize,
+    width: u32,
+    height: u32,
+    row_bytes: usize,
 }
 
-impl AsyncVideoWriter {
+impl PipeEncoder {
     pub fn new(
         output: &Path,
         width: u32,
@@ -491,22 +476,15 @@ impl AsyncVideoWriter {
         fps: u32,
         audio: Option<&Path>,
     ) -> Result<Self> {
-        let writer = VideoWriter::new(output, width, height, fps, audio)?;
-        let frame_size = width as usize * height as usize * 4;
-        let (sender, frames) = std::sync::mpsc::sync_channel::<Vec<u8>>(FRAME_QUEUE_CAPACITY);
-        let (recycle_sender, recycled) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
-        recycle_sender
-            .send(vec![0; frame_size])
-            .expect("single recycle buffer fits channel");
+        let writer = FfmpegPipe::new(output, width, height, fps, audio)?;
+        let (sender, frames) = std::sync::mpsc::sync_channel::<RenderedFrame>(FRAME_QUEUE_CAPACITY);
+        let (recycle_sender, recycled) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("ffmpeg-writer".to_owned())
             .spawn(move || {
                 let mut writer = writer;
                 for frame in frames {
-                    let write_result = writer.write_frame(&frame);
-                    // The render thread drains this opportunistically while it is
-                    // producing frames. During finish no receiver is active, so
-                    // never let recycling block the encoder worker.
+                    let write_result = writer.write_frame(frame.pixels());
                     let _ = recycle_sender.try_send(frame);
                     write_result?;
                 }
@@ -517,36 +495,58 @@ impl AsyncVideoWriter {
             sender: Some(sender),
             recycled,
             worker: Some(worker),
-            frame_size,
+            width,
+            height,
+            row_bytes: width as usize * 4,
         })
     }
+}
 
-    pub fn submit_frame(&mut self, pixels: &mut Vec<u8>) -> Result<()> {
-        if pixels.len() != self.frame_size {
+impl FrameSink for PipeEncoder {
+    fn submit(&mut self, frame: RenderedFrame) -> Result<RenderedFrame> {
+        if frame.width() != self.width
+            || frame.height() != self.height
+            || frame.row_bytes() != self.row_bytes
+            || frame.pixels().len() != self.height as usize * self.row_bytes
+        {
             bail!(
-                "invalid frame size: expected {}, got {}",
-                self.frame_size,
-                pixels.len()
+                "invalid frame dimensions or pixel buffer: expected {}x{} with {} bytes per row",
+                self.width,
+                self.height,
+                self.row_bytes
             );
         }
-        let frame = std::mem::take(pixels);
         let sender = self
             .sender
             .as_ref()
             .context("video writer is already finished")?;
         if let Err(error) = sender.send(frame) {
-            *pixels = error.0;
             self.sender.take();
-            bail!("send frame to ffmpeg writer: worker stopped")
+            drop(error.0);
+            bail!("send frame to ffmpeg writer: worker stopped");
         }
-        *pixels = self
-            .recycled
-            .recv()
-            .context("ffmpeg writer stopped before recycling a frame")?;
-        Ok(())
+        loop {
+            match self
+                .recycled
+                .recv_timeout(std::time::Duration::from_millis(10))
+            {
+                Ok(frame) => return Ok(frame),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if self
+                        .worker
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                    {
+                        bail!("ffmpeg writer stopped before recycling a frame");
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("ffmpeg writer stopped before recycling a frame");
+                }
+            }
+        }
     }
-
-    pub fn finish(mut self) -> Result<()> {
+    fn finish(&mut self) -> Result<()> {
         self.sender.take();
         let worker = self
             .worker
@@ -557,6 +557,86 @@ impl AsyncVideoWriter {
             Err(_) => bail!("ffmpeg writer thread panicked"),
         }
     }
+}
+
+#[cfg(test)]
+fn test_encoder(width: u32, height: u32) -> PipeEncoder {
+    let (sender, _frames) = std::sync::mpsc::sync_channel::<RenderedFrame>(1);
+    let (_recycle_sender, recycled) = std::sync::mpsc::sync_channel::<RenderedFrame>(1);
+    PipeEncoder {
+        sender: Some(sender),
+        recycled,
+        worker: None,
+        width,
+        height,
+        row_bytes: width as usize * 4,
+    }
+}
+#[test]
+fn pipe_encoder_returns_the_submitted_frame_buffer() {
+    let (sender, frames) = std::sync::mpsc::sync_channel::<RenderedFrame>(1);
+    let (recycle_sender, recycled) = std::sync::mpsc::sync_channel::<RenderedFrame>(1);
+    let worker = std::thread::spawn(move || {
+        for frame in frames {
+            recycle_sender.send(frame).unwrap();
+        }
+        Ok(())
+    });
+    let mut encoder = PipeEncoder {
+        sender: Some(sender),
+        recycled,
+        worker: Some(worker),
+        width: 1,
+        height: 1,
+        row_bytes: 4,
+    };
+    let frame = RenderedFrame::new(1, 1);
+    let pointer = frame.pixels().as_ptr();
+    let returned = encoder.submit(frame).unwrap();
+    assert_eq!(returned.pixels().as_ptr(), pointer);
+    encoder.finish().unwrap();
+}
+
+#[test]
+fn pipe_encoder_rejects_invalid_frame_contract() {
+    let mut encoder = test_encoder(2, 2);
+    let error = encoder.submit(RenderedFrame::new(1, 2)).unwrap_err();
+    assert!(error.to_string().contains("invalid frame dimensions"));
+}
+
+#[test]
+fn pipe_encoder_reports_stopped_worker() {
+    let mut encoder = test_encoder(1, 1);
+    let error = encoder.submit(RenderedFrame::new(1, 1)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "send frame to ffmpeg writer: worker stopped"
+    );
+}
+
+#[test]
+fn pipe_encoder_reports_repeated_finish() {
+    let mut encoder = test_encoder(1, 1);
+    assert_eq!(
+        encoder.finish().unwrap_err().to_string(),
+        "ffmpeg writer already finished"
+    );
+    assert_eq!(
+        encoder.finish().unwrap_err().to_string(),
+        "ffmpeg writer already finished"
+    );
+}
+
+#[test]
+fn pipe_encoder_reports_worker_panic() {
+    let mut encoder = test_encoder(1, 1);
+    encoder.worker = Some(std::thread::spawn(|| -> Result<()> {
+        panic!("test panic")
+    }));
+    assert_eq!(
+        encoder.finish().unwrap_err().to_string(),
+        "ffmpeg writer thread panicked"
+    );
 }
 
 #[cfg(test)]

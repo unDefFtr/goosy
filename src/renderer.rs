@@ -1,3 +1,4 @@
+use crate::frame::RenderedFrame;
 use anyhow::{Result, bail};
 use skia_safe::{AlphaType, Color, ColorSpace, ColorType, ISize, ImageInfo};
 
@@ -129,13 +130,27 @@ impl Renderer {
         self.surface.backend_name()
     }
 
-    pub fn render_frame(&mut self, t_ms: u64) -> Result<Vec<u8>> {
-        let mut pixels = Vec::new();
-        self.render_frame_into(t_ms, &mut pixels)?;
-        Ok(pixels)
+    pub fn render_frame(&mut self, t_ms: u64) -> Result<RenderedFrame> {
+        let mut frame = RenderedFrame::new(self.width, self.height);
+        self.render_frame_into(t_ms, &mut frame)?;
+        Ok(frame)
     }
 
-    pub fn render_frame_into(&mut self, t_ms: u64, pixels: &mut Vec<u8>) -> Result<()> {
+    pub fn render_frame_into(&mut self, t_ms: u64, frame: &mut RenderedFrame) -> Result<()> {
+        if frame.width() != self.width || frame.height() != self.height {
+            bail!(
+                "invalid frame dimensions: expected {}x{}, got {}x{}",
+                self.width,
+                self.height,
+                frame.width(),
+                frame.height()
+            );
+        }
+        if frame.row_bytes() != self.row_bytes
+            || frame.pixels().len() != self.height as usize * self.row_bytes
+        {
+            bail!("invalid frame pixel buffer");
+        }
         self.layout.update(&self.lines, t_ms, self.fps);
         let geometry = self.geometry;
         let lines = &self.lines;
@@ -144,7 +159,7 @@ impl Renderer {
         let cover = &mut self.cover;
         let lyrics = &self.lyrics;
         self.surface
-            .render_into(&self.info, self.row_bytes, pixels, |canvas| {
+            .render_into(&self.info, self.row_bytes, frame.pixels_mut(), |canvas| {
                 canvas.clear(Color::BLACK);
                 background.draw(canvas, &geometry, t_ms)?;
                 if let Some(cover) = cover {
@@ -172,16 +187,15 @@ pub fn probe_renderer_initialization(width: u32, height: u32, fps: u32) -> Resul
         background_vocal: None,
         words: Vec::new(),
     }];
-    let mut renderer = Renderer::new(width, height, fps, lines)?;
-    let mut pixels = Vec::new();
-    renderer.render_frame_into(0, &mut pixels)?;
+    let mut frame = RenderedFrame::new(width, height);
+    renderer.render_frame_into(0, &mut frame)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::frame::FrameSink;
     #[test]
     fn settled_lyrics_render_identical_frames() -> Result<()> {
         let lines = vec![
@@ -212,11 +226,10 @@ mod tests {
         for _ in 0..180 {
             renderer.render_frame(1_000)?;
         }
-        let first = renderer.render_frame(1_000)?;
-        let second = renderer.render_frame(1_000)?;
-        assert_eq!(first, second);
+        assert_eq!(renderer.render_frame(1_000)?, renderer.render_frame(1_000)?);
         Ok(())
     }
+
     #[test]
     fn high_resolution_frames_are_complete_and_stable() -> Result<()> {
         let lines = vec![LyricLine {
@@ -234,17 +247,50 @@ mod tests {
         let height = 2_160;
         let expected_len = width as usize * height as usize * 4;
         let mut renderer = Renderer::new(width, height, 30, lines)?;
-        let mut pixels = Vec::new();
+        let mut frame = RenderedFrame::new(width, height);
         for timestamp in [0, 33, 66] {
-            renderer.render_frame_into(timestamp, &mut pixels)?;
-            assert_eq!(pixels.len(), expected_len);
+            renderer.render_frame_into(timestamp, &mut frame)?;
+            assert_eq!(frame.pixels().len(), expected_len);
         }
-        renderer.render_frame_into(33, &mut pixels)?;
-        let repeated = pixels.clone();
-        renderer.render_frame_into(33, &mut pixels)?;
-        assert_eq!(pixels, repeated);
+        renderer.render_frame_into(33, &mut frame)?;
+        let repeated = frame.pixels().to_owned();
+        renderer.render_frame_into(33, &mut frame)?;
+        assert_eq!(frame.pixels(), repeated.as_slice());
         Ok(())
     }
+
+    #[test]
+    fn frame_sink_receives_complete_rendered_frame() -> Result<()> {
+        struct Sink {
+            received: Option<RenderedFrame>,
+        }
+        impl FrameSink for Sink {
+            fn submit(&mut self, frame: RenderedFrame) -> Result<RenderedFrame> {
+                self.received = Some(frame);
+                Ok(RenderedFrame::new(320, 180))
+            }
+            fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut renderer = Renderer::new(320, 180, 30, Vec::new())?;
+        let frame = renderer.render_frame(0)?;
+        let mut sink = Sink { received: None };
+        let recycled = sink.submit(frame)?;
+        assert_eq!(recycled.width(), 320);
+        let received = sink.received.as_ref().unwrap();
+        assert_eq!(
+            (
+                received.width(),
+                received.height(),
+                received.row_bytes(),
+                received.pixels().len()
+            ),
+            (320, 180, 320 * 4, 320 * 180 * 4)
+        );
+        sink.finish()
+    }
+
     #[test]
     fn excluded_lines_are_removed_without_retiming_remaining_lines() -> Result<()> {
         let lines = vec![

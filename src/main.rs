@@ -2,8 +2,8 @@ mod gui;
 
 #[cfg(not(target_os = "windows"))]
 use libgoosy::{
-    LyricsStyle, background, cover_renderer, image_asset, lrc, pdf_renderer, renderer, ttml, video,
-    yrc,
+    FrameSink, LyricsStyle, RenderedFrame, background, cover_renderer, image_asset, lrc,
+    pdf_renderer, renderer, ttml, video, yrc,
 };
 
 use anyhow::Result;
@@ -385,7 +385,7 @@ fn render(
     emit_render_stage(progress_events, "starting-ffmpeg", "正在启动 FFmpeg")?;
     #[cfg(target_os = "linux")]
     eprintln!("video encoder: {}", video::preferred_video_encoder_name());
-    let mut writer = video::AsyncVideoWriter::new(
+    let mut sink = video::PipeEncoder::new(
         &output,
         width,
         height,
@@ -404,29 +404,31 @@ fn render(
     );
     progress.set_message(format!("Rendering {}", output.display()));
     progress.enable_steady_tick(Duration::from_millis(100));
-    let mut rgba = Vec::new();
+    let mut frame_buffer = RenderedFrame::new(width, height);
     let render_started = Instant::now();
     let progress_interval = (fps as u64 / 10).max(1);
-    for frame in 0..total_frames {
-        let t_ms = frame * 1_000 / fps as u64;
+    for frame_index in 0..total_frames {
+        let t_ms = frame_index * 1_000 / fps as u64;
         renderer
-            .render_frame_into(t_ms, &mut rgba)
-            .with_context(|| format!("渲染第 {} 帧（{} ms）", frame + 1, t_ms))?;
-        writer
-            .submit_frame(&mut rgba)
-            .with_context(|| format!("向 FFmpeg 提交第 {} 帧", frame + 1))?;
+            .render_frame_into(t_ms, &mut frame_buffer)
+            .with_context(|| format!("渲染第 {} 帧（{} ms）", frame_index + 1, t_ms))?;
+        frame_buffer = sink
+            .submit(frame_buffer)
+            .with_context(|| format!("向 FFmpeg 提交第 {} 帧", frame_index + 1))?;
         progress.inc(1);
-        if progress_events && ((frame + 1) % progress_interval == 0 || frame + 1 == total_frames) {
+        if progress_events
+            && ((frame_index + 1) % progress_interval == 0 || frame_index + 1 == total_frames)
+        {
             println!(
                 "GOOSY_PROGRESS {} {} {:.3}",
-                frame + 1,
+                frame_index + 1,
                 total_frames,
                 render_started.elapsed().as_secs_f64()
             );
             std::io::stdout().flush()?;
         }
     }
-    writer.finish()?;
+    sink.finish()?;
     progress.finish_with_message(format!("Rendered {}", output.display()));
     Ok(())
 }

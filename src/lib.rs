@@ -2,6 +2,7 @@ pub mod background;
 pub mod cover_renderer;
 pub mod easing;
 pub mod ffi;
+pub mod frame;
 pub mod geometry;
 pub mod image_asset;
 pub mod layout;
@@ -28,6 +29,7 @@ pub static NvOptimusEnablement: u32 = 1;
 pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 
 pub use anyhow::Result;
+pub use frame::{FrameSink, RenderedFrame};
 use indicatif::{ProgressBar, ProgressStyle};
 pub use lrc::{BackgroundVocal, LyricLine, LyricWord};
 pub use lyrics_renderer::LyricsStyle;
@@ -221,7 +223,7 @@ where
         options.lyrics_style,
         &options.excluded_lines,
     )?;
-    let mut writer = video::AsyncVideoWriter::new(
+    let mut sink = video::PipeEncoder::new(
         &options.output,
         options.width,
         options.height,
@@ -230,9 +232,9 @@ where
     )?;
     let progress = ProgressBar::hidden();
     progress.set_style(ProgressStyle::default_bar());
-    let mut rgba = Vec::new();
+    let mut frame = RenderedFrame::new(options.width, options.height);
     let render_started = Instant::now();
-    for frame in 0..total_frames {
+    for frame_index in 0..total_frames {
         loop {
             match control() {
                 RenderControl::Continue => break,
@@ -240,18 +242,18 @@ where
                 RenderControl::Stop => anyhow::bail!("render stopped by user"),
             }
         }
-        let t_ms = render_start_ms + frame * 1_000 / options.fps as u64;
-        renderer.render_frame_into(t_ms, &mut rgba)?;
+        let t_ms = render_start_ms + frame_index * 1_000 / options.fps as u64;
+        renderer.render_frame_into(t_ms, &mut frame)?;
         progress.inc(1);
         on_frame(
-            frame + 1,
+            frame_index + 1,
             total_frames,
             render_started.elapsed().as_secs_f64(),
-            &rgba,
+            frame.pixels(),
         );
-        writer.submit_frame(&mut rgba)?;
+        frame = sink.submit(frame)?;
     }
-    writer.finish()?;
+    sink.finish()?;
     let elapsed_seconds = render_started.elapsed().as_secs_f64();
     progress.finish_and_clear();
     Ok(RenderStats {
