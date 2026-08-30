@@ -559,6 +559,24 @@ impl FrameSink for PipeEncoder {
     }
 }
 
+pub fn create_encoder(
+    backend: crate::encoder::EncoderBackend,
+    output: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    audio: Option<&Path>,
+) -> Result<Box<dyn FrameSink>> {
+    match backend {
+        crate::encoder::EncoderBackend::Pipe => Ok(Box::new(PipeEncoder::new(
+            output, width, height, fps, audio,
+        )?)),
+        crate::encoder::EncoderBackend::FfmpegNext => Ok(Box::new(
+            crate::encoder::FfmpegNextEncoder::new(output, width, height, fps, audio)?,
+        )),
+    }
+}
+
 #[cfg(test)]
 fn test_encoder(width: u32, height: u32) -> PipeEncoder {
     let (sender, _frames) = std::sync::mpsc::sync_channel::<RenderedFrame>(1);

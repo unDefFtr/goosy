@@ -2,7 +2,7 @@ use anyhow::Result;
 #[cfg(target_os = "windows")]
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use libgoosy::{LyricFormat, LyricsStyle, RenderControl, RenderOptions};
+use libgoosy::{EncoderBackend, LyricFormat, LyricsStyle, RenderControl, RenderOptions};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -82,6 +82,8 @@ enum Command {
             value_parser = clap::value_parser!(u64).range(1..)
         )]
         preview_interval: u64,
+        #[arg(long, hide = true, value_enum, default_value_t = WorkerEncoder::Pipe)]
+        encoder: WorkerEncoder,
         #[arg(long, value_enum, default_value_t = WorkerLyricFormat::Auto)]
         format: WorkerLyricFormat,
     },
@@ -139,6 +141,23 @@ impl From<WorkerLyricFormat> for LyricFormat {
             WorkerLyricFormat::Lrc => Self::Lrc,
             WorkerLyricFormat::Ttml => Self::Ttml,
             WorkerLyricFormat::Yrc => Self::Yrc,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum, Eq, PartialEq)]
+enum WorkerEncoder {
+    #[default]
+    Pipe,
+    #[value(name = "ffmpeg-next")]
+    FfmpegNext,
+}
+
+impl From<WorkerEncoder> for EncoderBackend {
+    fn from(value: WorkerEncoder) -> Self {
+        match value {
+            WorkerEncoder::Pipe => Self::Pipe,
+            WorkerEncoder::FfmpegNext => Self::FfmpegNext,
         }
     }
 }
@@ -369,6 +388,7 @@ fn main() -> Result<()> {
             preview_dir,
             preview_interval,
             format,
+            encoder,
         } => {
             ensure_renderer_backend(width, height, fps, progress_events)?;
             emit_stage(
@@ -406,6 +426,7 @@ fn main() -> Result<()> {
                 format: format.into(),
                 sample_start_ms,
                 sample_duration_ms,
+                encoder: encoder.into(),
             };
             let mut preview_dir = preview_dir;
             let mut preview_pixels = Vec::new();
@@ -494,7 +515,8 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{downscale_rgba_nearest, preview_dimensions};
+    use super::{Cli, Command, WorkerEncoder, downscale_rgba_nearest, preview_dimensions};
+    use clap::Parser;
 
     #[test]
     fn preview_dimensions_fit_within_bounds_and_preserve_aspect_ratio() {
@@ -511,5 +533,26 @@ mod tests {
 
         assert_eq!(dimensions, (2, 2));
         assert_eq!(preview, source);
+    }
+
+    #[test]
+    fn encoder_argument_accepts_both_protocol_values() {
+        for (value, expected) in [
+            ("pipe", WorkerEncoder::Pipe),
+            ("ffmpeg-next", WorkerEncoder::FfmpegNext),
+        ] {
+            let cli = Cli::try_parse_from([
+                "goosy-render-worker",
+                "render",
+                "song.wav",
+                "--encoder",
+                value,
+            ])
+            .unwrap();
+            let Command::Render { encoder, .. } = cli.command else {
+                panic!("expected render command");
+            };
+            assert_eq!(encoder, expected);
+        }
     }
 }

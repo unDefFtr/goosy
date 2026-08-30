@@ -1,6 +1,7 @@
 pub mod background;
 pub mod cover_renderer;
 pub mod easing;
+pub mod encoder;
 pub mod ffi;
 pub mod frame;
 pub mod geometry;
@@ -27,8 +28,8 @@ pub static NvOptimusEnablement: u32 = 1;
 #[allow(non_upper_case_globals)]
 #[unsafe(no_mangle)]
 pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
-
 pub use anyhow::Result;
+pub use encoder::EncoderBackend;
 pub use frame::{FrameSink, RenderedFrame};
 use indicatif::{ProgressBar, ProgressStyle};
 pub use lrc::{BackgroundVocal, LyricLine, LyricWord};
@@ -47,7 +48,6 @@ pub enum LyricFormat {
     Ttml,
     Yrc,
 }
-
 #[derive(Clone, Debug)]
 pub struct RenderOptions {
     pub song: PathBuf,
@@ -68,8 +68,8 @@ pub struct RenderOptions {
     pub format: LyricFormat,
     pub sample_start_ms: Option<u64>,
     pub sample_duration_ms: Option<u64>,
+    pub encoder: encoder::EncoderBackend,
 }
-
 impl RenderOptions {
     pub fn new(song: impl Into<PathBuf>, output: impl Into<PathBuf>) -> Self {
         Self {
@@ -91,6 +91,7 @@ impl RenderOptions {
             format: LyricFormat::Auto,
             sample_start_ms: None,
             sample_duration_ms: None,
+            encoder: encoder::EncoderBackend::Pipe,
         }
     }
 }
@@ -223,7 +224,8 @@ where
         options.lyrics_style,
         &options.excluded_lines,
     )?;
-    let mut sink = video::PipeEncoder::new(
+    let mut sink = video::create_encoder(
+        options.encoder,
         &options.output,
         options.width,
         options.height,

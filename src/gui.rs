@@ -1,7 +1,7 @@
 use eframe::egui;
 use libgoosy::{
-    LyricFormat, LyricsStyle, RenderControl, RenderOptions, background, cover_renderer,
-    geometry::FrameGeometry, image_asset::ImageAsset, layout::Layout, lrc,
+    EncoderBackend, LyricFormat, LyricsStyle, RenderControl, RenderOptions, background,
+    cover_renderer, geometry::FrameGeometry, image_asset::ImageAsset, layout::Layout, lrc,
     lyrics_renderer::LyricsRenderer, video,
 };
 use rfd::FileDialog;
@@ -36,6 +36,11 @@ struct InternalRenderTask {
 const DEFAULT_PREVIEW_INTERVAL: u64 = 15;
 static PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const RENDER_TWO_COLUMN_MIN_WIDTH: f32 = 760.0;
+
+#[cfg(any(target_os = "windows", test))]
+fn encoder_cli_args(backend: EncoderBackend) -> [&'static str; 2] {
+    ["--encoder", backend.cli_value()]
+}
 
 fn render_page_uses_columns(available_width: f32) -> bool {
     available_width >= RENDER_TWO_COLUMN_MIN_WIDTH
@@ -414,6 +419,7 @@ struct GoosyApp {
     height: u32,
     fps: u32,
     font_scale_percent: u32,
+    encoder_backend: EncoderBackend,
     translation_font_scale_percent: u32,
     background_font_scale_percent: u32,
     line_height_percent: u32,
@@ -481,6 +487,7 @@ impl Default for GoosyApp {
             horizontal_padding_percent: 100,
             lyric_blur_sigma_step: 6,
             debug_overlays: false,
+            encoder_backend: EncoderBackend::Pipe,
             use_embedded_cover: true,
             no_audio: false,
             render_child: None,
@@ -1172,7 +1179,10 @@ impl GoosyApp {
             .arg("--preview-dir")
             .arg(&preview_directory)
             .arg("--preview-interval")
-            .arg(self.preview_interval.to_string())
+            .arg(self.preview_interval.to_string());
+        let encoder_args = encoder_cli_args(self.encoder_backend);
+        command.args(encoder_args);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1290,6 +1300,7 @@ impl GoosyApp {
             format: LyricFormat::Auto,
             sample_start_ms: sample.map(|(start, _)| start),
             sample_duration_ms: sample.map(|(start, end)| end.saturating_sub(start)),
+            encoder: self.encoder_backend,
         };
         let preview_interval = self.preview_interval;
         let width = self.width;
@@ -1512,7 +1523,7 @@ impl GoosyApp {
                         "渲染完成".to_owned()
                     };
                 }
-                Err(error) if self.render_lifecycle == RenderLifecycle::EmergencyStopped => {}
+                Err(_error) if self.render_lifecycle == RenderLifecycle::EmergencyStopped => {}
                 Err(error) => {
                     self.render_lifecycle = RenderLifecycle::Idle;
                     self.status = format!("渲染失败：{error}");
@@ -1717,6 +1728,23 @@ impl GoosyApp {
                         .range(1..=120)
                         .suffix(" fps"),
                 );
+            });
+            ui.horizontal(|ui| {
+                ui.label("编码器");
+                let active = self.render_child.is_some() || self.internal_render.is_some();
+                ui.add_enabled_ui(!active, |ui| {
+                    egui::ComboBox::from_id_salt("encoder_combo")
+                        .selected_text(self.encoder_backend.label())
+                        .show_ui(ui, |ui| {
+                            for backend in EncoderBackend::ALL {
+                                ui.selectable_value(
+                                    &mut self.encoder_backend,
+                                    backend,
+                                    backend.label(),
+                                );
+                            }
+                        });
+                });
             });
             egui::CollapsingHeader::new("歌词样式")
                 .default_open(true)
@@ -2024,11 +2052,12 @@ fn detect_credit_lines(lines: &[lrc::LyricLine]) -> Vec<bool> {
 mod tests {
     use super::{
         COVER_EXTENSIONS, GoosyApp, LYRIC_EXTENSIONS, PreviewEvent, StylePreviewKey,
-        StylePreviewRequest, StylePreviewScene, detect_credit_lines, has_extension,
-        new_preview_directory, parse_preview_event, render_page_uses_columns, render_style_preview,
-        spawn_style_preview_worker, style_preview_dimensions, terminate_render_child,
+        StylePreviewRequest, StylePreviewScene, detect_credit_lines, encoder_cli_args,
+        has_extension, new_preview_directory, parse_preview_event, render_page_uses_columns,
+        render_style_preview, spawn_style_preview_worker, style_preview_dimensions,
+        terminate_render_child,
     };
-    use libgoosy::{LyricsStyle, image_asset::ImageAsset, lrc::LyricLine};
+    use libgoosy::{EncoderBackend, LyricsStyle, image_asset::ImageAsset, lrc::LyricLine};
 
     fn line(text: &str) -> LyricLine {
         LyricLine {
@@ -2348,5 +2377,30 @@ mod tests {
 
         assert_eq!(low_resolution.size, full_hd.size);
         assert!(bright_neutral_pixels(&low_resolution) > bright_neutral_pixels(&full_hd));
+    }
+    #[test]
+    fn default_app_uses_pipe_encoder() {
+        assert_eq!(GoosyApp::default().encoder_backend, EncoderBackend::Pipe);
+    }
+
+    #[test]
+    fn encoder_order_labels_and_cli_values_are_stable() {
+        assert_eq!(
+            EncoderBackend::ALL,
+            [EncoderBackend::Pipe, EncoderBackend::FfmpegNext]
+        );
+        assert_eq!(EncoderBackend::ALL[0].label(), "PipeEncoder（外部 FFmpeg）");
+        assert_eq!(
+            EncoderBackend::ALL[1].label(),
+            "ffmpeg-next Encoder（自动选择）"
+        );
+        assert_eq!(
+            encoder_cli_args(EncoderBackend::Pipe),
+            ["--encoder", "pipe"]
+        );
+        assert_eq!(
+            encoder_cli_args(EncoderBackend::FfmpegNext),
+            ["--encoder", "ffmpeg-next"]
+        );
     }
 }

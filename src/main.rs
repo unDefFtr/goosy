@@ -2,8 +2,8 @@ mod gui;
 
 #[cfg(not(target_os = "windows"))]
 use libgoosy::{
-    FrameSink, LyricsStyle, RenderedFrame, background, cover_renderer, image_asset, lrc,
-    pdf_renderer, renderer, ttml, video, yrc,
+    LyricsStyle, RenderedFrame, background, cover_renderer, image_asset, lrc, pdf_renderer,
+    renderer, ttml, video, yrc,
 };
 
 use anyhow::Result;
@@ -385,7 +385,8 @@ fn render(
     emit_render_stage(progress_events, "starting-ffmpeg", "正在启动 FFmpeg")?;
     #[cfg(target_os = "linux")]
     eprintln!("video encoder: {}", video::preferred_video_encoder_name());
-    let mut sink = video::PipeEncoder::new(
+    let mut sink = video::create_encoder(
+        libgoosy::EncoderBackend::Pipe,
         &output,
         width,
         height,
