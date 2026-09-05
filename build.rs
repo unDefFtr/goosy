@@ -21,13 +21,15 @@ fn main() {
             panic!("glslc failed ({status}); GOOSY_REQUIRE_GLSLC requires the zero-copy shader")
         }
         Ok(status) => {
-            println!("cargo:warning=glslc failed ({status}); zero-copy Vulkan mode is unavailable");
+            let _ = std::fs::File::create(&output);
+            println!("cargo:warning=glslc failed ({status}); zero-copy Vulkan mode is unavailable")
         }
         Err(error) if require_shader => {
             panic!("glslc is required to build the Vulkan zero-copy shader: {error}")
         }
-        Err(error) => println!(
-            "cargo:warning=glslc is required to build the Vulkan zero-copy shader ({error})"
-        ),
+        Err(error) => {
+            let _ = std::fs::File::create(&output);
+            println!("cargo:warning=glslc is required to build the Vulkan zero-copy shader ({error})")
+        }
     }
 }

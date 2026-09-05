@@ -1,0 +1,605 @@
+video encoder: h264_nvenc
+zero-copy capabilities negotiated: Vulkan external memory/semaphore, CUDA UUID, h264_nvenc, shader
+zero-copy Vulkan external slots allocated: 8
+[CUDA @ 0x555558b25280] Using current CUDA context.
+ffmpeg-next selected video encoder: h264_nvenc
+zero-copy direct NVENC submission frame=0
+zero-copy CUDA external semaphore wait complete: frame=0 slot=0
+zero-copy direct NVENC submission frame=1
+zero-copy CUDA external semaphore wait complete: frame=1 slot=1
+zero-copy direct NVENC submission frame=2
+zero-copy CUDA external semaphore wait complete: frame=2 slot=2
+zero-copy direct NVENC submission frame=3
+zero-copy CUDA external semaphore wait complete: frame=3 slot=0
+zero-copy direct NVENC submission frame=4
+zero-copy CUDA external semaphore wait complete: frame=4 slot=1
+zero-copy direct NVENC submission frame=5
+zero-copy CUDA external semaphore wait complete: frame=5 slot=2
+zero-copy direct NVENC submission frame=6
+zero-copy CUDA external semaphore wait complete: frame=6 slot=0
+zero-copy direct NVENC submission frame=7
+zero-copy CUDA external semaphore wait complete: frame=7 slot=1
+zero-copy direct NVENC submission frame=8
+zero-copy CUDA external semaphore wait complete: frame=8 slot=2
+zero-copy direct NVENC submission frame=9
+zero-copy CUDA external semaphore wait complete: frame=9 slot=0
+zero-copy direct NVENC submission frame=10
+zero-copy CUDA external semaphore wait complete: frame=10 slot=1
+zero-copy direct NVENC submission frame=11
+zero-copy CUDA external semaphore wait complete: frame=11 slot=2
+zero-copy direct NVENC submission frame=12
+zero-copy CUDA external semaphore wait complete: frame=12 slot=0
+zero-copy direct NVENC submission frame=13
+zero-copy CUDA external semaphore wait complete: frame=13 slot=1
+zero-copy direct NVENC submission frame=14
+zero-copy CUDA external semaphore wait complete: frame=14 slot=2
+zero-copy direct NVENC submission frame=15
+zero-copy CUDA external semaphore wait complete: frame=15 slot=0
+zero-copy direct NVENC submission frame=16
+zero-copy CUDA external semaphore wait complete: frame=16 slot=1
+zero-copy direct NVENC submission frame=17
+zero-copy CUDA external semaphore wait complete: frame=17 slot=2
+zero-copy direct NVENC submission frame=18
+zero-copy CUDA external semaphore wait complete: frame=18 slot=0
+zero-copy direct NVENC submission frame=19
+zero-copy CUDA external semaphore wait complete: frame=19 slot=1
+zero-copy direct NVENC submission frame=20
+zero-copy CUDA external semaphore wait complete: frame=20 slot=2
+zero-copy direct NVENC submission frame=21
+zero-copy CUDA external semaphore wait complete: frame=21 slot=0
+zero-copy direct NVENC submission frame=22
+zero-copy CUDA external semaphore wait complete: frame=22 slot=1
+zero-copy direct NVENC submission frame=23
+zero-copy CUDA external semaphore wait complete: frame=23 slot=2
+zero-copy direct NVENC submission frame=24
+zero-copy CUDA external semaphore wait complete: frame=24 slot=0
+zero-copy direct NVENC submission frame=25
+zero-copy CUDA external semaphore wait complete: frame=25 slot=1
+zero-copy direct NVENC submission frame=26
+zero-copy CUDA external semaphore wait complete: frame=26 slot=2
+zero-copy direct NVENC submission frame=27
+zero-copy CUDA external semaphore wait complete: frame=27 slot=0
+zero-copy direct NVENC submission frame=28
+zero-copy CUDA external semaphore wait complete: frame=28 slot=1
+zero-copy direct NVENC submission frame=29
+zero-copy CUDA external semaphore wait complete: frame=29 slot=2
+zero-copy direct NVENC submission frame=30
+zero-copy CUDA external semaphore wait complete: frame=30 slot=0
+zero-copy direct NVENC submission frame=31
+zero-copy CUDA external semaphore wait complete: frame=31 slot=1
+zero-copy direct NVENC submission frame=32
+zero-copy CUDA external semaphore wait complete: frame=32 slot=2
+zero-copy direct NVENC submission frame=33
+zero-copy CUDA external semaphore wait complete: frame=33 slot=0
+zero-copy direct NVENC submission frame=34
+zero-copy CUDA external semaphore wait complete: frame=34 slot=1
+zero-copy direct NVENC submission frame=35
+zero-copy CUDA external semaphore wait complete: frame=35 slot=2
+zero-copy direct NVENC submission frame=36
+zero-copy CUDA external semaphore wait complete: frame=36 slot=0
+zero-copy direct NVENC submission frame=37
+zero-copy CUDA external semaphore wait complete: frame=37 slot=1
+zero-copy direct NVENC submission frame=38
+zero-copy CUDA external semaphore wait complete: frame=38 slot=2
+zero-copy direct NVENC submission frame=39
+zero-copy CUDA external semaphore wait complete: frame=39 slot=0
+zero-copy direct NVENC submission frame=40
+zero-copy CUDA external semaphore wait complete: frame=40 slot=1
+zero-copy direct NVENC submission frame=41
+zero-copy CUDA external semaphore wait complete: frame=41 slot=2
+zero-copy direct NVENC submission frame=42
+zero-copy CUDA external semaphore wait complete: frame=42 slot=0
+zero-copy direct NVENC submission frame=43
+zero-copy CUDA external semaphore wait complete: frame=43 slot=1
+zero-copy direct NVENC submission frame=44
+zero-copy CUDA external semaphore wait complete: frame=44 slot=2
+zero-copy direct NVENC submission frame=45
+zero-copy CUDA external semaphore wait complete: frame=45 slot=0
+zero-copy direct NVENC submission frame=46
+zero-copy CUDA external semaphore wait complete: frame=46 slot=1
+zero-copy direct NVENC submission frame=47
+zero-copy CUDA external semaphore wait complete: frame=47 slot=2
+zero-copy direct NVENC submission frame=48
+zero-copy CUDA external semaphore wait complete: frame=48 slot=0
+zero-copy direct NVENC submission frame=49
+zero-copy CUDA external semaphore wait complete: frame=49 slot=1
+zero-copy direct NVENC submission frame=50
+zero-copy CUDA external semaphore wait complete: frame=50 slot=2
+zero-copy direct NVENC submission frame=51
+zero-copy CUDA external semaphore wait complete: frame=51 slot=0
+zero-copy direct NVENC submission frame=52
+zero-copy CUDA external semaphore wait complete: frame=52 slot=1
+zero-copy direct NVENC submission frame=53
+zero-copy CUDA external semaphore wait complete: frame=53 slot=2
+zero-copy direct NVENC submission frame=54
+zero-copy CUDA external semaphore wait complete: frame=54 slot=0
+zero-copy direct NVENC submission frame=55
+zero-copy CUDA external semaphore wait complete: frame=55 slot=1
+zero-copy direct NVENC submission frame=56
+zero-copy CUDA external semaphore wait complete: frame=56 slot=2
+zero-copy direct NVENC submission frame=57
+zero-copy CUDA external semaphore wait complete: frame=57 slot=0
+zero-copy direct NVENC submission frame=58
+zero-copy CUDA external semaphore wait complete: frame=58 slot=1
+zero-copy direct NVENC submission frame=59
+zero-copy CUDA external semaphore wait complete: frame=59 slot=2
+zero-copy direct NVENC submission frame=60
+zero-copy CUDA external semaphore wait complete: frame=60 slot=0
+zero-copy direct NVENC submission frame=61
+zero-copy CUDA external semaphore wait complete: frame=61 slot=1
+zero-copy direct NVENC submission frame=62
+zero-copy CUDA external semaphore wait complete: frame=62 slot=2
+zero-copy direct NVENC submission frame=63
+zero-copy CUDA external semaphore wait complete: frame=63 slot=0
+zero-copy direct NVENC submission frame=64
+zero-copy CUDA external semaphore wait complete: frame=64 slot=1
+zero-copy direct NVENC submission frame=65
+zero-copy CUDA external semaphore wait complete: frame=65 slot=2
+zero-copy direct NVENC submission frame=66
+zero-copy CUDA external semaphore wait complete: frame=66 slot=0
+zero-copy direct NVENC submission frame=67
+zero-copy CUDA external semaphore wait complete: frame=67 slot=1
+zero-copy direct NVENC submission frame=68
+zero-copy CUDA external semaphore wait complete: frame=68 slot=2
+zero-copy direct NVENC submission frame=69
+zero-copy CUDA external semaphore wait complete: frame=69 slot=0
+zero-copy direct NVENC submission frame=70
+zero-copy CUDA external semaphore wait complete: frame=70 slot=1
+zero-copy direct NVENC submission frame=71
+zero-copy CUDA external semaphore wait complete: frame=71 slot=2
+zero-copy direct NVENC submission frame=72
+zero-copy CUDA external semaphore wait complete: frame=72 slot=0
+zero-copy direct NVENC submission frame=73
+zero-copy CUDA external semaphore wait complete: frame=73 slot=1
+zero-copy direct NVENC submission frame=74
+zero-copy CUDA external semaphore wait complete: frame=74 slot=2
+zero-copy direct NVENC submission frame=75
+zero-copy CUDA external semaphore wait complete: frame=75 slot=0
+zero-copy direct NVENC submission frame=76
+zero-copy CUDA external semaphore wait complete: frame=76 slot=1
+zero-copy direct NVENC submission frame=77
+zero-copy CUDA external semaphore wait complete: frame=77 slot=2
+zero-copy direct NVENC submission frame=78
+zero-copy CUDA external semaphore wait complete: frame=78 slot=0
+zero-copy direct NVENC submission frame=79
+zero-copy CUDA external semaphore wait complete: frame=79 slot=1
+zero-copy direct NVENC submission frame=80
+zero-copy CUDA external semaphore wait complete: frame=80 slot=2
+zero-copy direct NVENC submission frame=81
+zero-copy CUDA external semaphore wait complete: frame=81 slot=0
+zero-copy direct NVENC submission frame=82
+zero-copy CUDA external semaphore wait complete: frame=82 slot=1
+zero-copy direct NVENC submission frame=83
+zero-copy CUDA external semaphore wait complete: frame=83 slot=2
+zero-copy direct NVENC submission frame=84
+zero-copy CUDA external semaphore wait complete: frame=84 slot=0
+zero-copy direct NVENC submission frame=85
+zero-copy CUDA external semaphore wait complete: frame=85 slot=1
+zero-copy direct NVENC submission frame=86
+zero-copy CUDA external semaphore wait complete: frame=86 slot=2
+zero-copy direct NVENC submission frame=87
+zero-copy CUDA external semaphore wait complete: frame=87 slot=0
+zero-copy direct NVENC submission frame=88
+zero-copy CUDA external semaphore wait complete: frame=88 slot=1
+zero-copy direct NVENC submission frame=89
+zero-copy CUDA external semaphore wait complete: frame=89 slot=2
+zero-copy direct NVENC submission frame=90
+zero-copy CUDA external semaphore wait complete: frame=90 slot=0
+zero-copy direct NVENC submission frame=91
+zero-copy CUDA external semaphore wait complete: frame=91 slot=1
+zero-copy direct NVENC submission frame=92
+zero-copy CUDA external semaphore wait complete: frame=92 slot=2
+zero-copy direct NVENC submission frame=93
+zero-copy CUDA external semaphore wait complete: frame=93 slot=0
+zero-copy direct NVENC submission frame=94
+zero-copy CUDA external semaphore wait complete: frame=94 slot=1
+zero-copy direct NVENC submission frame=95
+zero-copy CUDA external semaphore wait complete: frame=95 slot=2
+zero-copy direct NVENC submission frame=96
+zero-copy CUDA external semaphore wait complete: frame=96 slot=0
+zero-copy direct NVENC submission frame=97
+zero-copy CUDA external semaphore wait complete: frame=97 slot=1
+zero-copy direct NVENC submission frame=98
+zero-copy CUDA external semaphore wait complete: frame=98 slot=2
+zero-copy direct NVENC submission frame=99
+zero-copy CUDA external semaphore wait complete: frame=99 slot=0
+zero-copy direct NVENC submission frame=100
+zero-copy CUDA external semaphore wait complete: frame=100 slot=1
+zero-copy direct NVENC submission frame=101
+zero-copy CUDA external semaphore wait complete: frame=101 slot=2
+zero-copy direct NVENC submission frame=102
+zero-copy CUDA external semaphore wait complete: frame=102 slot=0
+zero-copy direct NVENC submission frame=103
+zero-copy CUDA external semaphore wait complete: frame=103 slot=1
+zero-copy direct NVENC submission frame=104
+zero-copy CUDA external semaphore wait complete: frame=104 slot=2
+zero-copy direct NVENC submission frame=105
+zero-copy CUDA external semaphore wait complete: frame=105 slot=0
+zero-copy direct NVENC submission frame=106
+zero-copy CUDA external semaphore wait complete: frame=106 slot=1
+zero-copy direct NVENC submission frame=107
+zero-copy CUDA external semaphore wait complete: frame=107 slot=2
+zero-copy direct NVENC submission frame=108
+zero-copy CUDA external semaphore wait complete: frame=108 slot=0
+zero-copy direct NVENC submission frame=109
+zero-copy CUDA external semaphore wait complete: frame=109 slot=1
+zero-copy direct NVENC submission frame=110
+zero-copy CUDA external semaphore wait complete: frame=110 slot=2
+zero-copy direct NVENC submission frame=111
+zero-copy CUDA external semaphore wait complete: frame=111 slot=0
+zero-copy direct NVENC submission frame=112
+zero-copy CUDA external semaphore wait complete: frame=112 slot=1
+zero-copy direct NVENC submission frame=113
+zero-copy CUDA external semaphore wait complete: frame=113 slot=2
+zero-copy direct NVENC submission frame=114
+zero-copy CUDA external semaphore wait complete: frame=114 slot=0
+zero-copy direct NVENC submission frame=115
+zero-copy CUDA external semaphore wait complete: frame=115 slot=1
+zero-copy direct NVENC submission frame=116
+zero-copy CUDA external semaphore wait complete: frame=116 slot=2
+zero-copy direct NVENC submission frame=117
+zero-copy CUDA external semaphore wait complete: frame=117 slot=0
+zero-copy direct NVENC submission frame=118
+zero-copy CUDA external semaphore wait complete: frame=118 slot=1
+zero-copy direct NVENC submission frame=119
+zero-copy CUDA external semaphore wait complete: frame=119 slot=2
+zero-copy direct NVENC submission frame=120
+zero-copy CUDA external semaphore wait complete: frame=120 slot=0
+zero-copy direct NVENC submission frame=121
+zero-copy CUDA external semaphore wait complete: frame=121 slot=1
+zero-copy direct NVENC submission frame=122
+zero-copy CUDA external semaphore wait complete: frame=122 slot=2
+zero-copy direct NVENC submission frame=123
+zero-copy CUDA external semaphore wait complete: frame=123 slot=0
+zero-copy direct NVENC submission frame=124
+zero-copy CUDA external semaphore wait complete: frame=124 slot=1
+zero-copy direct NVENC submission frame=125
+zero-copy CUDA external semaphore wait complete: frame=125 slot=2
+zero-copy direct NVENC submission frame=126
+zero-copy CUDA external semaphore wait complete: frame=126 slot=0
+zero-copy direct NVENC submission frame=127
+zero-copy CUDA external semaphore wait complete: frame=127 slot=1
+zero-copy direct NVENC submission frame=128
+zero-copy CUDA external semaphore wait complete: frame=128 slot=2
+zero-copy direct NVENC submission frame=129
+zero-copy CUDA external semaphore wait complete: frame=129 slot=0
+zero-copy direct NVENC submission frame=130
+zero-copy CUDA external semaphore wait complete: frame=130 slot=1
+zero-copy direct NVENC submission frame=131
+zero-copy CUDA external semaphore wait complete: frame=131 slot=2
+zero-copy direct NVENC submission frame=132
+zero-copy CUDA external semaphore wait complete: frame=132 slot=0
+zero-copy direct NVENC submission frame=133
+zero-copy CUDA external semaphore wait complete: frame=133 slot=1
+zero-copy direct NVENC submission frame=134
+zero-copy CUDA external semaphore wait complete: frame=134 slot=2
+zero-copy direct NVENC submission frame=135
+zero-copy CUDA external semaphore wait complete: frame=135 slot=0
+zero-copy direct NVENC submission frame=136
+zero-copy CUDA external semaphore wait complete: frame=136 slot=1
+zero-copy direct NVENC submission frame=137
+zero-copy CUDA external semaphore wait complete: frame=137 slot=2
+zero-copy direct NVENC submission frame=138
+zero-copy CUDA external semaphore wait complete: frame=138 slot=0
+zero-copy direct NVENC submission frame=139
+zero-copy CUDA external semaphore wait complete: frame=139 slot=1
+zero-copy direct NVENC submission frame=140
+zero-copy CUDA external semaphore wait complete: frame=140 slot=2
+zero-copy direct NVENC submission frame=141
+zero-copy CUDA external semaphore wait complete: frame=141 slot=0
+zero-copy direct NVENC submission frame=142
+zero-copy CUDA external semaphore wait complete: frame=142 slot=1
+zero-copy direct NVENC submission frame=143
+zero-copy CUDA external semaphore wait complete: frame=143 slot=2
+zero-copy direct NVENC submission frame=144
+zero-copy CUDA external semaphore wait complete: frame=144 slot=0
+zero-copy direct NVENC submission frame=145
+zero-copy CUDA external semaphore wait complete: frame=145 slot=1
+zero-copy direct NVENC submission frame=146
+zero-copy CUDA external semaphore wait complete: frame=146 slot=2
+zero-copy direct NVENC submission frame=147
+zero-copy CUDA external semaphore wait complete: frame=147 slot=0
+zero-copy direct NVENC submission frame=148
+zero-copy CUDA external semaphore wait complete: frame=148 slot=1
+zero-copy direct NVENC submission frame=149
+zero-copy CUDA external semaphore wait complete: frame=149 slot=2
+zero-copy direct NVENC submission frame=150
+zero-copy CUDA external semaphore wait complete: frame=150 slot=0
+zero-copy direct NVENC submission frame=151
+zero-copy CUDA external semaphore wait complete: frame=151 slot=1
+zero-copy direct NVENC submission frame=152
+zero-copy CUDA external semaphore wait complete: frame=152 slot=2
+zero-copy direct NVENC submission frame=153
+zero-copy CUDA external semaphore wait complete: frame=153 slot=0
+zero-copy direct NVENC submission frame=154
+zero-copy CUDA external semaphore wait complete: frame=154 slot=1
+zero-copy direct NVENC submission frame=155
+zero-copy CUDA external semaphore wait complete: frame=155 slot=2
+zero-copy direct NVENC submission frame=156
+zero-copy CUDA external semaphore wait complete: frame=156 slot=0
+zero-copy direct NVENC submission frame=157
+zero-copy CUDA external semaphore wait complete: frame=157 slot=1
+zero-copy direct NVENC submission frame=158
+zero-copy CUDA external semaphore wait complete: frame=158 slot=2
+zero-copy direct NVENC submission frame=159
+zero-copy CUDA external semaphore wait complete: frame=159 slot=0
+zero-copy direct NVENC submission frame=160
+zero-copy CUDA external semaphore wait complete: frame=160 slot=1
+zero-copy direct NVENC submission frame=161
+zero-copy CUDA external semaphore wait complete: frame=161 slot=2
+zero-copy direct NVENC submission frame=162
+zero-copy CUDA external semaphore wait complete: frame=162 slot=0
+zero-copy direct NVENC submission frame=163
+zero-copy CUDA external semaphore wait complete: frame=163 slot=1
+zero-copy direct NVENC submission frame=164
+zero-copy CUDA external semaphore wait complete: frame=164 slot=2
+zero-copy direct NVENC submission frame=165
+zero-copy CUDA external semaphore wait complete: frame=165 slot=0
+zero-copy direct NVENC submission frame=166
+zero-copy CUDA external semaphore wait complete: frame=166 slot=1
+zero-copy direct NVENC submission frame=167
+zero-copy CUDA external semaphore wait complete: frame=167 slot=2
+zero-copy direct NVENC submission frame=168
+zero-copy CUDA external semaphore wait complete: frame=168 slot=0
+zero-copy direct NVENC submission frame=169
+zero-copy CUDA external semaphore wait complete: frame=169 slot=1
+zero-copy direct NVENC submission frame=170
+zero-copy CUDA external semaphore wait complete: frame=170 slot=2
+zero-copy direct NVENC submission frame=171
+zero-copy CUDA external semaphore wait complete: frame=171 slot=0
+zero-copy direct NVENC submission frame=172
+zero-copy CUDA external semaphore wait complete: frame=172 slot=1
+zero-copy direct NVENC submission frame=173
+zero-copy CUDA external semaphore wait complete: frame=173 slot=2
+zero-copy direct NVENC submission frame=174
+zero-copy CUDA external semaphore wait complete: frame=174 slot=0
+zero-copy direct NVENC submission frame=175
+zero-copy CUDA external semaphore wait complete: frame=175 slot=1
+zero-copy direct NVENC submission frame=176
+zero-copy CUDA external semaphore wait complete: frame=176 slot=2
+zero-copy direct NVENC submission frame=177
+zero-copy CUDA external semaphore wait complete: frame=177 slot=0
+zero-copy direct NVENC submission frame=178
+zero-copy CUDA external semaphore wait complete: frame=178 slot=1
+zero-copy direct NVENC submission frame=179
+zero-copy CUDA external semaphore wait complete: frame=179 slot=2
+zero-copy direct NVENC submission frame=180
+zero-copy CUDA external semaphore wait complete: frame=180 slot=0
+zero-copy direct NVENC submission frame=181
+zero-copy CUDA external semaphore wait complete: frame=181 slot=1
+zero-copy direct NVENC submission frame=182
+zero-copy CUDA external semaphore wait complete: frame=182 slot=2
+zero-copy direct NVENC submission frame=183
+zero-copy CUDA external semaphore wait complete: frame=183 slot=0
+zero-copy direct NVENC submission frame=184
+zero-copy CUDA external semaphore wait complete: frame=184 slot=1
+zero-copy direct NVENC submission frame=185
+zero-copy CUDA external semaphore wait complete: frame=185 slot=2
+zero-copy direct NVENC submission frame=186
+zero-copy CUDA external semaphore wait complete: frame=186 slot=0
+zero-copy direct NVENC submission frame=187
+zero-copy CUDA external semaphore wait complete: frame=187 slot=1
+zero-copy direct NVENC submission frame=188
+zero-copy CUDA external semaphore wait complete: frame=188 slot=2
+zero-copy direct NVENC submission frame=189
+zero-copy CUDA external semaphore wait complete: frame=189 slot=0
+zero-copy direct NVENC submission frame=190
+zero-copy CUDA external semaphore wait complete: frame=190 slot=1
+zero-copy direct NVENC submission frame=191
+zero-copy CUDA external semaphore wait complete: frame=191 slot=2
+zero-copy direct NVENC submission frame=192
+zero-copy CUDA external semaphore wait complete: frame=192 slot=0
+zero-copy direct NVENC submission frame=193
+zero-copy CUDA external semaphore wait complete: frame=193 slot=1
+zero-copy direct NVENC submission frame=194
+zero-copy CUDA external semaphore wait complete: frame=194 slot=2
+zero-copy direct NVENC submission frame=195
+zero-copy CUDA external semaphore wait complete: frame=195 slot=0
+zero-copy direct NVENC submission frame=196
+zero-copy CUDA external semaphore wait complete: frame=196 slot=1
+zero-copy direct NVENC submission frame=197
+zero-copy CUDA external semaphore wait complete: frame=197 slot=2
+zero-copy direct NVENC submission frame=198
+zero-copy CUDA external semaphore wait complete: frame=198 slot=0
+zero-copy direct NVENC submission frame=199
+zero-copy CUDA external semaphore wait complete: frame=199 slot=1
+zero-copy direct NVENC submission frame=200
+zero-copy CUDA external semaphore wait complete: frame=200 slot=2
+zero-copy direct NVENC submission frame=201
+zero-copy CUDA external semaphore wait complete: frame=201 slot=0
+zero-copy direct NVENC submission frame=202
+zero-copy CUDA external semaphore wait complete: frame=202 slot=1
+zero-copy direct NVENC submission frame=203
+zero-copy CUDA external semaphore wait complete: frame=203 slot=2
+zero-copy direct NVENC submission frame=204
+zero-copy CUDA external semaphore wait complete: frame=204 slot=0
+zero-copy direct NVENC submission frame=205
+zero-copy CUDA external semaphore wait complete: frame=205 slot=1
+zero-copy direct NVENC submission frame=206
+zero-copy CUDA external semaphore wait complete: frame=206 slot=2
+zero-copy direct NVENC submission frame=207
+zero-copy CUDA external semaphore wait complete: frame=207 slot=0
+zero-copy direct NVENC submission frame=208
+zero-copy CUDA external semaphore wait complete: frame=208 slot=1
+zero-copy direct NVENC submission frame=209
+zero-copy CUDA external semaphore wait complete: frame=209 slot=2
+zero-copy direct NVENC submission frame=210
+zero-copy CUDA external semaphore wait complete: frame=210 slot=0
+zero-copy direct NVENC submission frame=211
+zero-copy CUDA external semaphore wait complete: frame=211 slot=1
+zero-copy direct NVENC submission frame=212
+zero-copy CUDA external semaphore wait complete: frame=212 slot=2
+zero-copy direct NVENC submission frame=213
+zero-copy CUDA external semaphore wait complete: frame=213 slot=0
+zero-copy direct NVENC submission frame=214
+zero-copy CUDA external semaphore wait complete: frame=214 slot=1
+zero-copy direct NVENC submission frame=215
+zero-copy CUDA external semaphore wait complete: frame=215 slot=2
+zero-copy direct NVENC submission frame=216
+zero-copy CUDA external semaphore wait complete: frame=216 slot=0
+zero-copy direct NVENC submission frame=217
+zero-copy CUDA external semaphore wait complete: frame=217 slot=1
+zero-copy direct NVENC submission frame=218
+zero-copy CUDA external semaphore wait complete: frame=218 slot=2
+zero-copy direct NVENC submission frame=219
+zero-copy CUDA external semaphore wait complete: frame=219 slot=0
+zero-copy direct NVENC submission frame=220
+zero-copy CUDA external semaphore wait complete: frame=220 slot=1
+zero-copy direct NVENC submission frame=221
+zero-copy CUDA external semaphore wait complete: frame=221 slot=2
+zero-copy direct NVENC submission frame=222
+zero-copy CUDA external semaphore wait complete: frame=222 slot=0
+zero-copy direct NVENC submission frame=223
+zero-copy CUDA external semaphore wait complete: frame=223 slot=1
+zero-copy direct NVENC submission frame=224
+zero-copy CUDA external semaphore wait complete: frame=224 slot=2
+zero-copy direct NVENC submission frame=225
+zero-copy CUDA external semaphore wait complete: frame=225 slot=0
+zero-copy direct NVENC submission frame=226
+zero-copy CUDA external semaphore wait complete: frame=226 slot=1
+zero-copy direct NVENC submission frame=227
+zero-copy CUDA external semaphore wait complete: frame=227 slot=2
+zero-copy direct NVENC submission frame=228
+zero-copy CUDA external semaphore wait complete: frame=228 slot=0
+zero-copy direct NVENC submission frame=229
+zero-copy CUDA external semaphore wait complete: frame=229 slot=1
+zero-copy direct NVENC submission frame=230
+zero-copy CUDA external semaphore wait complete: frame=230 slot=2
+zero-copy direct NVENC submission frame=231
+zero-copy CUDA external semaphore wait complete: frame=231 slot=0
+zero-copy direct NVENC submission frame=232
+zero-copy CUDA external semaphore wait complete: frame=232 slot=1
+zero-copy direct NVENC submission frame=233
+zero-copy CUDA external semaphore wait complete: frame=233 slot=2
+zero-copy direct NVENC submission frame=234
+zero-copy CUDA external semaphore wait complete: frame=234 slot=0
+zero-copy direct NVENC submission frame=235
+zero-copy CUDA external semaphore wait complete: frame=235 slot=1
+zero-copy direct NVENC submission frame=236
+zero-copy CUDA external semaphore wait complete: frame=236 slot=2
+zero-copy direct NVENC submission frame=237
+zero-copy CUDA external semaphore wait complete: frame=237 slot=0
+zero-copy direct NVENC submission frame=238
+zero-copy CUDA external semaphore wait complete: frame=238 slot=1
+zero-copy direct NVENC submission frame=239
+zero-copy CUDA external semaphore wait complete: frame=239 slot=2
+zero-copy direct NVENC submission frame=240
+zero-copy CUDA external semaphore wait complete: frame=240 slot=0
+zero-copy direct NVENC submission frame=241
+zero-copy CUDA external semaphore wait complete: frame=241 slot=1
+zero-copy direct NVENC submission frame=242
+zero-copy CUDA external semaphore wait complete: frame=242 slot=2
+zero-copy direct NVENC submission frame=243
+zero-copy CUDA external semaphore wait complete: frame=243 slot=0
+zero-copy direct NVENC submission frame=244
+zero-copy CUDA external semaphore wait complete: frame=244 slot=1
+zero-copy direct NVENC submission frame=245
+zero-copy CUDA external semaphore wait complete: frame=245 slot=2
+zero-copy direct NVENC submission frame=246
+zero-copy CUDA external semaphore wait complete: frame=246 slot=0
+zero-copy direct NVENC submission frame=247
+zero-copy CUDA external semaphore wait complete: frame=247 slot=1
+zero-copy direct NVENC submission frame=248
+zero-copy CUDA external semaphore wait complete: frame=248 slot=2
+zero-copy direct NVENC submission frame=249
+zero-copy CUDA external semaphore wait complete: frame=249 slot=0
+zero-copy direct NVENC submission frame=250
+zero-copy CUDA external semaphore wait complete: frame=250 slot=1
+zero-copy direct NVENC submission frame=251
+zero-copy CUDA external semaphore wait complete: frame=251 slot=2
+zero-copy direct NVENC submission frame=252
+zero-copy CUDA external semaphore wait complete: frame=252 slot=0
+zero-copy direct NVENC submission frame=253
+zero-copy CUDA external semaphore wait complete: frame=253 slot=1
+zero-copy direct NVENC submission frame=254
+zero-copy CUDA external semaphore wait complete: frame=254 slot=2
+zero-copy direct NVENC submission frame=255
+zero-copy CUDA external semaphore wait complete: frame=255 slot=0
+zero-copy direct NVENC submission frame=256
+zero-copy CUDA external semaphore wait complete: frame=256 slot=1
+zero-copy direct NVENC submission frame=257
+zero-copy CUDA external semaphore wait complete: frame=257 slot=2
+zero-copy direct NVENC submission frame=258
+zero-copy CUDA external semaphore wait complete: frame=258 slot=0
+zero-copy direct NVENC submission frame=259
+zero-copy CUDA external semaphore wait complete: frame=259 slot=1
+zero-copy direct NVENC submission frame=260
+zero-copy CUDA external semaphore wait complete: frame=260 slot=2
+zero-copy direct NVENC submission frame=261
+zero-copy CUDA external semaphore wait complete: frame=261 slot=0
+zero-copy direct NVENC submission frame=262
+zero-copy CUDA external semaphore wait complete: frame=262 slot=1
+zero-copy direct NVENC submission frame=263
+zero-copy CUDA external semaphore wait complete: frame=263 slot=2
+zero-copy direct NVENC submission frame=264
+zero-copy CUDA external semaphore wait complete: frame=264 slot=0
+zero-copy direct NVENC submission frame=265
+zero-copy CUDA external semaphore wait complete: frame=265 slot=1
+zero-copy direct NVENC submission frame=266
+zero-copy CUDA external semaphore wait complete: frame=266 slot=2
+zero-copy direct NVENC submission frame=267
+zero-copy CUDA external semaphore wait complete: frame=267 slot=0
+zero-copy direct NVENC submission frame=268
+zero-copy CUDA external semaphore wait complete: frame=268 slot=1
+zero-copy direct NVENC submission frame=269
+zero-copy CUDA external semaphore wait complete: frame=269 slot=2
+zero-copy direct NVENC submission frame=270
+zero-copy CUDA external semaphore wait complete: frame=270 slot=0
+zero-copy direct NVENC submission frame=271
+zero-copy CUDA external semaphore wait complete: frame=271 slot=1
+zero-copy direct NVENC submission frame=272
+zero-copy CUDA external semaphore wait complete: frame=272 slot=2
+zero-copy direct NVENC submission frame=273
+zero-copy CUDA external semaphore wait complete: frame=273 slot=0
+zero-copy direct NVENC submission frame=274
+zero-copy CUDA external semaphore wait complete: frame=274 slot=1
+zero-copy direct NVENC submission frame=275
+zero-copy CUDA external semaphore wait complete: frame=275 slot=2
+zero-copy direct NVENC submission frame=276
+zero-copy CUDA external semaphore wait complete: frame=276 slot=0
+zero-copy direct NVENC submission frame=277
+zero-copy CUDA external semaphore wait complete: frame=277 slot=1
+zero-copy direct NVENC submission frame=278
+zero-copy CUDA external semaphore wait complete: frame=278 slot=2
+zero-copy direct NVENC submission frame=279
+zero-copy CUDA external semaphore wait complete: frame=279 slot=0
+zero-copy direct NVENC submission frame=280
+zero-copy CUDA external semaphore wait complete: frame=280 slot=1
+zero-copy direct NVENC submission frame=281
+zero-copy CUDA external semaphore wait complete: frame=281 slot=2
+zero-copy direct NVENC submission frame=282
+zero-copy CUDA external semaphore wait complete: frame=282 slot=0
+zero-copy direct NVENC submission frame=283
+zero-copy CUDA external semaphore wait complete: frame=283 slot=1
+zero-copy direct NVENC submission frame=284
+zero-copy CUDA external semaphore wait complete: frame=284 slot=2
+zero-copy direct NVENC submission frame=285
+zero-copy CUDA external semaphore wait complete: frame=285 slot=0
+zero-copy direct NVENC submission frame=286
+zero-copy CUDA external semaphore wait complete: frame=286 slot=1
+zero-copy direct NVENC submission frame=287
+zero-copy CUDA external semaphore wait complete: frame=287 slot=2
+zero-copy direct NVENC submission frame=288
+zero-copy CUDA external semaphore wait complete: frame=288 slot=0
+zero-copy direct NVENC submission frame=289
+zero-copy CUDA external semaphore wait complete: frame=289 slot=1
+zero-copy direct NVENC submission frame=290
+zero-copy CUDA external semaphore wait complete: frame=290 slot=2
+zero-copy direct NVENC submission frame=291
+zero-copy CUDA external semaphore wait complete: frame=291 slot=0
+zero-copy direct NVENC submission frame=292
+zero-copy CUDA external semaphore wait complete: frame=292 slot=1
+zero-copy direct NVENC submission frame=293
+zero-copy CUDA external semaphore wait complete: frame=293 slot=2
+zero-copy direct NVENC submission frame=294
+zero-copy CUDA external semaphore wait complete: frame=294 slot=0
+zero-copy direct NVENC submission frame=295
+zero-copy CUDA external semaphore wait complete: frame=295 slot=1
+zero-copy direct NVENC submission frame=296
+zero-copy CUDA external semaphore wait complete: frame=296 slot=2
+zero-copy direct NVENC submission frame=297
+zero-copy CUDA external semaphore wait complete: frame=297 slot=0
+zero-copy direct NVENC submission frame=298
+zero-copy CUDA external semaphore wait complete: frame=298 slot=1
+zero-copy direct NVENC submission frame=299
+zero-copy CUDA external semaphore wait complete: frame=299 slot=2

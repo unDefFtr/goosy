@@ -440,6 +440,7 @@ struct GoosyApp {
     fps: u32,
     font_scale_percent: u32,
     encoder_backend: EncoderBackend,
+    nvenc_preset: String,
     translation_font_scale_percent: u32,
     background_font_scale_percent: u32,
     line_height_percent: u32,
@@ -508,6 +509,7 @@ impl Default for GoosyApp {
             lyric_blur_sigma_step: 6,
             debug_overlays: false,
             encoder_backend: EncoderBackend::Pipe,
+            nvenc_preset: "p5".to_owned(),
             use_embedded_cover: true,
             no_audio: false,
             render_child: None,
@@ -1202,6 +1204,7 @@ impl GoosyApp {
             .arg(self.preview_interval.to_string());
         let encoder_args = encoder_cli_args(self.encoder_backend);
         command.args(encoder_args);
+        command.arg("--nvenc-preset").arg(&self.nvenc_preset);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1321,6 +1324,7 @@ impl GoosyApp {
             sample_start_ms: sample.map(|(start, _)| start),
             sample_duration_ms: sample.map(|(start, end)| end.saturating_sub(start)),
             encoder: self.encoder_backend,
+            nvenc_preset: self.nvenc_preset.clone(),
         };
         let preview_interval = self.preview_interval;
         let width = self.width;
@@ -1767,6 +1771,25 @@ impl GoosyApp {
                         });
                 });
             });
+            let uses_nvenc = match self.encoder_backend {
+                EncoderBackend::Pipe | EncoderBackend::FfmpegNext => {
+                    video::preferred_video_encoder_name() == "h264_nvenc"
+                }
+                #[cfg(target_os = "linux")]
+                EncoderBackend::FfmpegNextNvencZeroCopy => true,
+            };
+            if uses_nvenc {
+                ui.horizontal(|ui| {
+                    ui.label("NVENC Preset");
+                    egui::ComboBox::from_id_salt("nvenc_preset_combo")
+                        .selected_text(&self.nvenc_preset)
+                        .show_ui(ui, |ui| {
+                            for preset in ["p1", "p2", "p3", "p4", "p5", "p6", "p7"] {
+                                ui.selectable_value(&mut self.nvenc_preset, preset.to_owned(), preset);
+                            }
+                        });
+                });
+            }
             egui::CollapsingHeader::new("歌词样式")
                 .default_open(true)
                 .show(ui, |ui| {

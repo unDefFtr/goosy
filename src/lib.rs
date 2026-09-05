@@ -31,7 +31,7 @@ pub static NvOptimusEnablement: u32 = 1;
 #[unsafe(no_mangle)]
 pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 pub use anyhow::Result;
-pub use encoder::EncoderBackend;
+pub use encoder::{EncoderBackend, NvencPreset};
 pub use frame::{FrameSink, RenderedFrame};
 use indicatif::{ProgressBar, ProgressStyle};
 pub use lrc::{BackgroundVocal, LyricLine, LyricWord};
@@ -71,6 +71,7 @@ pub struct RenderOptions {
     pub sample_start_ms: Option<u64>,
     pub sample_duration_ms: Option<u64>,
     pub encoder: encoder::EncoderBackend,
+    pub nvenc_preset: String,
 }
 impl RenderOptions {
     pub fn new(song: impl Into<PathBuf>, output: impl Into<PathBuf>) -> Self {
@@ -94,6 +95,7 @@ impl RenderOptions {
             sample_start_ms: None,
             sample_duration_ms: None,
             encoder: encoder::EncoderBackend::Pipe,
+            nvenc_preset: "p5".to_owned(),
         }
     }
 }
@@ -235,6 +237,10 @@ where
         options.fps,
         (!options.no_audio).then_some(options.song.as_path()),
     )?;
+    let profile = std::env::var_os("GOOSY_PROFILE").is_some();
+    let mut render_seconds = 0.0;
+    let mut submit_seconds = 0.0;
+    let finish_seconds;
     let progress = ProgressBar::hidden();
     progress.set_style(ProgressStyle::default_bar());
     let mut frame = RenderedFrame::new(options.width, options.height);
@@ -247,30 +253,27 @@ where
                 RenderControl::Stop => anyhow::bail!("render stopped by user"),
             }
         }
+        let phase_started = Instant::now();
         renderer.render_frame_into(
             render_start_ms + frame_index * 1_000 / options.fps as u64,
             &mut frame,
         )?;
-        let callback_pixels = if options.encoder.is_zero_copy() {
-            &[]
-        } else {
-            frame.pixels()
-        };
-        on_frame(
-            frame_index + 1,
-            total_frames,
-            render_started.elapsed().as_secs_f64(),
-            callback_pixels,
-        );
+        render_seconds += phase_started.elapsed().as_secs_f64();
+        let callback_pixels = if options.encoder.is_zero_copy() { &[] } else { frame.pixels() };
+        on_frame(frame_index + 1, total_frames, render_started.elapsed().as_secs_f64(), callback_pixels);
+        let phase_started = Instant::now();
         frame = sink.submit(frame)?;
+        submit_seconds += phase_started.elapsed().as_secs_f64();
     }
+    let phase_started = Instant::now();
     sink.finish()?;
+    finish_seconds = phase_started.elapsed().as_secs_f64();
     let elapsed_seconds = render_started.elapsed().as_secs_f64();
+    if profile {
+        eprintln!("render profile: frames={} total={:.6}s render={:.6}s submit={:.6}s finish={:.6}s", total_frames, elapsed_seconds, render_seconds, submit_seconds, finish_seconds);
+    }
     progress.finish_and_clear();
-    Ok(RenderStats {
-        frames: total_frames,
-        elapsed_seconds,
-    })
+    Ok(RenderStats { frames: total_frames, elapsed_seconds })
 }
 
 pub fn read_lyrics_file(

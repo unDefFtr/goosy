@@ -1,0 +1,2 @@
+video encoder: h264_nvenc
+ffmpeg-next selected video encoder: h264_nvenc

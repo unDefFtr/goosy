@@ -176,6 +176,30 @@ impl EncoderBackend {
         false
     }
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NvencPreset {
+    P1,
+    P2,
+    P3,
+    P4,
+    #[default]
+    P5,
+    P6,
+    P7,
+}
+impl NvencPreset {
+    pub fn from_value(value: &str) -> Self {
+        match value { "p1" => Self::P1, "p2" => Self::P2, "p3" => Self::P3, "p4" => Self::P4, "p6" => Self::P6, "p7" => Self::P7, _ => Self::P5 }
+    }
+}
+
+impl NvencPreset {
+    pub const ALL: &'static [Self] = &[Self::P1, Self::P2, Self::P3, Self::P4, Self::P5, Self::P6, Self::P7];
+    pub const fn value(self) -> &'static str {
+        match self { Self::P1 => "p1", Self::P2 => "p2", Self::P3 => "p3", Self::P4 => "p4", Self::P5 => "p5", Self::P6 => "p6", Self::P7 => "p7" }
+    }
+}
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -389,6 +413,7 @@ fn open_video_encoder(
     fps: u32,
     global_header: bool,
     cuda_frames: Option<&CudaFrames>,
+    nvenc_preset: NvencPreset,
 ) -> Result<ffmpeg::codec::encoder::video::Encoder> {
     let context = ffmpeg::codec::context::Context::new_with_codec(codec);
     let mut video = context
@@ -414,41 +439,25 @@ fn open_video_encoder(
     if global_header {
         video.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
     }
+    let mut options = configure_encoder_options(profile);
+    if profile.name == "h264_nvenc" {
+        options.set("preset", nvenc_preset.value());
+    }
     video
-        .open_as_with(codec, configure_encoder_options(profile))
+        .open_as_with(codec, options)
         .with_context(|| format!("open ffmpeg-next {} encoder", profile.name))
 }
-
 impl FfmpegNextEncoder {
-    pub fn new(
-        output: &Path,
-        width: u32,
-        height: u32,
-        fps: u32,
-        audio: Option<&Path>,
-    ) -> Result<Self> {
-        Self::new_internal(output, width, height, fps, audio, false)
+    pub fn new(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>, nvenc_preset: NvencPreset) -> Result<Self> {
+        Self::new_internal(output, width, height, fps, audio, false, nvenc_preset)
     }
 
     #[cfg(target_os = "linux")]
-    pub fn new_zero_copy(
-        output: &Path,
-        width: u32,
-        height: u32,
-        fps: u32,
-        audio: Option<&Path>,
-    ) -> Result<Self> {
-        Self::new_internal(output, width, height, fps, audio, true)
+    pub fn new_zero_copy(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>, nvenc_preset: NvencPreset) -> Result<Self> {
+        Self::new_internal(output, width, height, fps, audio, true, nvenc_preset)
     }
 
-    fn new_internal(
-        output: &Path,
-        width: u32,
-        height: u32,
-        fps: u32,
-        audio: Option<&Path>,
-        zero_copy: bool,
-    ) -> Result<Self> {
+    fn new_internal(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>, zero_copy: bool, nvenc_preset: NvencPreset) -> Result<Self> {
         ffmpeg::init().context("initialize ffmpeg-next")?;
         let staging = audio.map(|_| staging_path(output)).transpose()?;
         let video_path = staging.as_deref().unwrap_or(output);
@@ -489,6 +498,7 @@ impl FfmpegNextEncoder {
                     fps,
                     global_header,
                     cuda_frames.as_ref(),
+                    nvenc_preset,
                 )?;
                 Ok(Some((codec, encoder, cuda_frames)))
             })
@@ -637,7 +647,6 @@ impl FfmpegNextEncoder {
     }
 
     fn submit_zero_copy(&mut self, mut frame: RenderedFrame) -> Result<RenderedFrame> {
-        eprintln!("zero-copy direct NVENC submission frame={}", self.pts);
         let payload = frame
             .gpu_payload()
             .context("zero-copy encoder requires a GPU frame payload")?
@@ -716,6 +725,117 @@ impl FfmpegNextEncoder {
         self.pts += 1;
         self.write_packets()?;
         Ok(frame)
+    }
+}
+
+#[cfg(target_os = "linux")]
+const ZERO_COPY_QUEUE_CAPACITY: usize = 8;
+
+// Keep rendering ahead of NVENC so the render thread does not wait on each
+// CUDA semaphore before submitting the next Vulkan frame.
+
+// FFmpeg owns the CUDA and scaler contexts exclusively after construction;
+// the zero-copy worker is their sole user, so ownership can move to it.
+#[cfg(target_os = "linux")]
+unsafe impl Send for FfmpegNextEncoder {}
+
+#[cfg(target_os = "linux")]
+pub struct AsyncZeroCopyEncoder {
+    sender: Option<std::sync::mpsc::SyncSender<RenderedFrame>>,
+    worker: Option<std::thread::JoinHandle<Result<()>>>,
+    spare: RenderedFrame,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncZeroCopyEncoder {
+    pub fn new(
+        output: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: Option<&Path>,
+        nvenc_preset: NvencPreset,
+    ) -> Result<Self> {
+        let encoder = FfmpegNextEncoder::new_zero_copy(
+            output,
+            width,
+            height,
+            fps,
+            audio,
+            nvenc_preset,
+        )?;
+        let (sender, frames) =
+            std::sync::mpsc::sync_channel::<RenderedFrame>(ZERO_COPY_QUEUE_CAPACITY);
+        let worker = std::thread::Builder::new()
+            .name("nvenc-zero-copy".to_owned())
+            .spawn(move || {
+                let mut encoder = encoder;
+                for mut frame in frames {
+                    frame.drop_cpu_pixels();
+                    encoder.submit_zero_copy(frame)?;
+                }
+                encoder.finish()
+            })
+            .context("spawn zero-copy encoder thread")?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            spare: RenderedFrame::new(width, height),
+            width,
+            height,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl FrameSink for AsyncZeroCopyEncoder {
+    fn submit(&mut self, frame: RenderedFrame) -> Result<RenderedFrame> {
+        if frame.width() != self.width || frame.height() != self.height {
+            bail!(
+                "invalid frame dimensions: expected {}x{}",
+                self.width,
+                self.height
+            );
+        }
+        let result = self
+            .sender
+            .as_ref()
+            .context("zero-copy encoder is already finished")?
+            .send(frame);
+        let spare = std::mem::replace(
+            &mut self.spare,
+            RenderedFrame::new(self.width, self.height),
+        );
+        if let Err(error) = result {
+            self.sender.take();
+            self.spare = spare;
+            return Err(error).context("send frame to zero-copy encoder");
+        }
+        Ok(spare)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.sender.take();
+        let worker = self
+            .worker
+            .take()
+            .context("zero-copy encoder already finished")?;
+        match worker.join() {
+            Ok(result) => result,
+            Err(_) => bail!("zero-copy encoder thread panicked"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for AsyncZeroCopyEncoder {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 

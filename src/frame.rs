@@ -61,6 +61,7 @@ impl RenderedFrame {
         }
     }
 
+
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -88,6 +89,10 @@ impl RenderedFrame {
     }
     pub(crate) fn clear_gpu_payload(&mut self) {
         self.gpu_payload = None;
+    }
+
+    pub(crate) fn drop_cpu_pixels(&mut self) {
+        self.pixels = Vec::new();
     }
 }
 

@@ -101,6 +101,8 @@ enum Command {
         fps: u32,
         #[arg(long, value_enum, default_value_t = CliEncoder::Pipe)]
         encoder: CliEncoder,
+        #[arg(long, default_value = "p5")]
+        nvenc_preset: String,
         #[arg(long, default_value_t = 1.0)]
         font_scale: f32,
         #[arg(long, default_value_t = 0.65)]
@@ -202,12 +204,13 @@ fn main() -> Result<()> {
             height,
             fps,
             encoder,
+            nvenc_preset,
             font_scale,
             translation_font_scale,
             background_font_scale,
             line_height_scale,
-            line_spacing_scale,
             translation_gap_scale,
+            line_spacing_scale,
             background_gap_scale,
             horizontal_padding_scale,
             lyric_blur_sigma_step,
@@ -230,6 +233,7 @@ fn main() -> Result<()> {
             height,
             fps,
             encoder.into(),
+            nvenc_preset,
             font_scale,
             translation_font_scale,
             background_font_scale,
@@ -302,6 +306,7 @@ fn render(
     height: u32,
     fps: u32,
     encoder: libgoosy::EncoderBackend,
+    nvenc_preset: String,
     font_scale: f32,
     translation_font_scale: f32,
     background_font_scale: f32,
@@ -415,13 +420,14 @@ fn render(
     emit_render_stage(progress_events, "starting-ffmpeg", "正在启动 FFmpeg")?;
     #[cfg(target_os = "linux")]
     eprintln!("video encoder: {}", video::preferred_video_encoder_name());
-    let mut sink = video::create_encoder(
+    let mut sink = video::create_encoder_with_preset(
         encoder,
         &output,
         width,
         height,
         fps,
         (!no_audio).then_some(song.as_path()),
+        libgoosy::NvencPreset::from_value(&nvenc_preset),
     )
     .with_context(|| format!("启动 FFmpeg 输出：{}", output.display()))?;
     emit_render_stage(progress_events, "rendering-first-frame", "正在渲染首帧")?;

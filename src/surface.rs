@@ -369,7 +369,6 @@ struct VulkanBackend {
     device_uuid: [u8; 16],
     device_name: String,
     vendor_id: u32,
-    device_id: u32,
     device_type: ash::vk::PhysicalDeviceType,
     external_mode: bool,
     active_slot: Option<usize>,
@@ -383,8 +382,8 @@ impl VulkanBackend {
             .device
             .as_ref()
             .context("Vulkan device unavailable")?;
-        let shader = std::fs::read(env!("GOOSY_NV12_SHADER_PATH"))
-            .context("read compiled RGBA-to-NV12 shader")?;
+        let shader = include_bytes!(env!("GOOSY_NV12_SHADER_PATH"));
+        let shader = shader.as_slice();
         let words = ash::util::read_spv(&mut std::io::Cursor::new(shader))
             .context("parse compiled RGBA-to-NV12 shader")?;
         let shader_module = unsafe {
@@ -685,7 +684,6 @@ impl VulkanBackend {
             device_uuid,
             device_name,
             vendor_id: properties.vendor_id,
-            device_id: properties.device_id,
             device_type: properties.device_type,
             external_mode: false,
             active_slot: None,
@@ -942,8 +940,7 @@ impl VulkanBackend {
         let cuda = crate::gpu_interop::cuda_driver_available();
         let nvenc = crate::gpu_interop::nvenc_available();
         let matching = crate::gpu_interop::cuda_device_uuid_matches(&backend.device_uuid);
-        let shader_spirv = std::env::var_os("GOOSY_NV12_SHADER_PATH")
-            .is_some_and(|path| std::path::Path::new(&path).is_file());
+        let shader_spirv = !include_bytes!(env!("GOOSY_NV12_SHADER_PATH")).is_empty();
         crate::gpu_interop::negotiate(crate::gpu_interop::CapabilityInputs {
             renderer_is_vulkan: true,
             external_memory_fd: memory,
@@ -1004,10 +1001,14 @@ impl VulkanBackend {
     {
         use skia_safe::gpu::{self, Budgeted, SurfaceOrigin};
         let slot_index = if self.external_mode {
-            self.external_slots
-                .iter()
-                .position(|slot| slot.token.state() == crate::gpu_interop::SlotState::Free)
-                .context("no zero-copy Vulkan slot is free")?
+            loop {
+                if let Some(index) = self.external_slots.iter().position(|slot| {
+                    slot.token.state() == crate::gpu_interop::SlotState::Free
+                }) {
+                    break index;
+                }
+                std::thread::park_timeout(std::time::Duration::from_micros(50));
+            }
         } else {
             0
         };
@@ -1086,7 +1087,7 @@ impl VulkanBackend {
                 .as_mut()
                 .expect("Vulkan surface initialized");
             draw(surface.canvas())?;
-            context.flush_submit_and_sync_cpu();
+            context.flush_and_submit();
             if context.is_device_lost() {
                 bail!("Vulkan GPU submission failed: device lost");
             }
@@ -1202,8 +1203,8 @@ impl VulkanBackend {
             );
             device.cmd_dispatch(
                 slot.command_buffer,
-                width.div_ceil(16),
-                height.div_ceil(16),
+                width.div_ceil(32),
+                height.div_ceil(32),
                 1,
             );
             let post_barrier = vk::BufferMemoryBarrier::default()
@@ -1215,7 +1216,7 @@ impl VulkanBackend {
             device.cmd_pipeline_barrier(
                 slot.command_buffer,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
                 std::slice::from_ref(&post_barrier),

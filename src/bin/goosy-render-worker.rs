@@ -84,6 +84,8 @@ enum Command {
         preview_interval: u64,
         #[arg(long, hide = true, value_enum, default_value_t = WorkerEncoder::Pipe)]
         encoder: WorkerEncoder,
+        #[arg(long, hide = true, default_value = "p5")]
+        nvenc_preset: String,
         #[arg(long, value_enum, default_value_t = WorkerLyricFormat::Auto)]
         format: WorkerLyricFormat,
     },
@@ -394,6 +396,7 @@ fn main() -> Result<()> {
             preview_interval,
             format,
             encoder,
+            nvenc_preset,
         } => {
             ensure_renderer_backend(width, height, fps, progress_events)?;
             emit_stage(
@@ -432,6 +435,7 @@ fn main() -> Result<()> {
                 sample_start_ms,
                 sample_duration_ms,
                 encoder: encoder.into(),
+                nvenc_preset,
             };
             let mut preview_dir = preview_dir;
             let mut preview_pixels = Vec::new();

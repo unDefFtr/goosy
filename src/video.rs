@@ -353,14 +353,11 @@ struct FfmpegPipe {
     command: String,
 }
 
-fn video_writer_command(
-    output: &Path,
-    width: u32,
-    height: u32,
-    fps: u32,
-    audio: Option<&Path>,
-    encoder: &VideoEncoder,
-) -> Command {
+fn video_writer_command(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>, encoder: &VideoEncoder) -> Command {
+    video_writer_command_with_preset(output, width, height, fps, audio, encoder, crate::encoder::NvencPreset::default())
+}
+
+fn video_writer_command_with_preset(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>, encoder: &VideoEncoder, preset: crate::encoder::NvencPreset) -> Command {
     let mut command = Command::new("ffmpeg");
     command.args(["-y", "-hide_banner", "-loglevel", "error"]);
     #[cfg(target_os = "linux")]
@@ -386,6 +383,7 @@ fn video_writer_command(
             .args(["-map", "0:v:0", "-map", "1:a:0"]);
     }
     add_video_encoder(&mut command, encoder);
+    if matches!(encoder, VideoEncoder::Nvenc) { command.args(["-preset", preset.value()]); }
     if audio.is_some() {
         command.args(["-c:a", "aac", "-b:a", "192k"]);
     }
@@ -396,11 +394,12 @@ fn video_writer_command(
     command.arg(output);
     command
 }
-
 impl FfmpegPipe {
     fn new(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>) -> Result<Self> {
-        let mut command =
-            video_writer_command(output, width, height, fps, audio, &PREFERRED_VIDEO_ENCODER);
+        Self::new_with_preset(output, width, height, fps, audio, crate::encoder::NvencPreset::default())
+    }
+    fn new_with_preset(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>, preset: crate::encoder::NvencPreset) -> Result<Self> {
+        let mut command = video_writer_command_with_preset(output, width, height, fps, audio, &PREFERRED_VIDEO_ENCODER, preset);
         command.stdin(Stdio::piped()).stderr(Stdio::inherit());
         let command_display = format!("{command:?}");
         let mut child = command
@@ -469,14 +468,11 @@ pub struct PipeEncoder {
 }
 
 impl PipeEncoder {
-    pub fn new(
-        output: &Path,
-        width: u32,
-        height: u32,
-        fps: u32,
-        audio: Option<&Path>,
-    ) -> Result<Self> {
-        let writer = FfmpegPipe::new(output, width, height, fps, audio)?;
+    pub fn new(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>) -> Result<Self> {
+        Self::new_with_preset(output, width, height, fps, audio, crate::encoder::NvencPreset::default())
+    }
+    pub fn new_with_preset(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>, preset: crate::encoder::NvencPreset) -> Result<Self> {
+        let writer = FfmpegPipe::new_with_preset(output, width, height, fps, audio, preset)?;
         let (sender, frames) = std::sync::mpsc::sync_channel::<RenderedFrame>(FRAME_QUEUE_CAPACITY);
         let (recycle_sender, recycled) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
@@ -559,25 +555,15 @@ impl FrameSink for PipeEncoder {
     }
 }
 
-pub fn create_encoder(
-    backend: crate::encoder::EncoderBackend,
-    output: &Path,
-    width: u32,
-    height: u32,
-    fps: u32,
-    audio: Option<&Path>,
-) -> Result<Box<dyn FrameSink>> {
+pub fn create_encoder(backend: crate::encoder::EncoderBackend, output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>) -> Result<Box<dyn FrameSink>> {
+    create_encoder_with_preset(backend, output, width, height, fps, audio, crate::encoder::NvencPreset::default())
+}
+
+pub fn create_encoder_with_preset(backend: crate::encoder::EncoderBackend, output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>, preset: crate::encoder::NvencPreset) -> Result<Box<dyn FrameSink>> {
     match backend {
-        crate::encoder::EncoderBackend::Pipe => Ok(Box::new(PipeEncoder::new(
-            output, width, height, fps, audio,
-        )?)),
-        crate::encoder::EncoderBackend::FfmpegNext => Ok(Box::new(
-            crate::encoder::FfmpegNextEncoder::new(output, width, height, fps, audio)?,
-        )),
-        #[cfg(target_os = "linux")]
-        crate::encoder::EncoderBackend::FfmpegNextNvencZeroCopy => Ok(Box::new(
-            crate::encoder::FfmpegNextEncoder::new_zero_copy(output, width, height, fps, audio)?,
-        )),
+        crate::encoder::EncoderBackend::Pipe => Ok(Box::new(PipeEncoder::new_with_preset(output, width, height, fps, audio, preset)?)),
+        crate::encoder::EncoderBackend::FfmpegNext => Ok(Box::new(crate::encoder::FfmpegNextEncoder::new(output, width, height, fps, audio, preset)?)),
+        crate::encoder::EncoderBackend::FfmpegNextNvencZeroCopy => Ok(Box::new(crate::encoder::AsyncZeroCopyEncoder::new(output, width, height, fps, audio, preset)?)),
     }
 }
 

@@ -137,14 +137,6 @@ type CuWaitExternalSemaphoresAsync = unsafe extern "C" fn(
     CuStream,
 ) -> CuResult;
 #[cfg(target_os = "linux")]
-type CuSignalExternalSemaphoresAsync = unsafe extern "C" fn(
-    *const CuExternalSemaphore,
-    *const CudaExternalSemaphoreSignalParams,
-    u32,
-    CuStream,
-) -> CuResult;
-#[cfg(target_os = "linux")]
-type CuStreamSynchronize = unsafe extern "C" fn(CuStream) -> CuResult;
 
 #[cfg(target_os = "linux")]
 struct CudaDriver {
@@ -162,8 +154,6 @@ struct CudaDriver {
     import_semaphore: CuImportExternalSemaphore,
     destroy_semaphore: CuDestroyExternalSemaphore,
     wait_semaphore: CuWaitExternalSemaphoresAsync,
-    signal_semaphore: CuSignalExternalSemaphoresAsync,
-    stream_synchronize: CuStreamSynchronize,
 }
 #[cfg(target_os = "linux")]
 unsafe impl Send for CudaDriver {}
@@ -205,11 +195,6 @@ impl CudaDriver {
                 "cuWaitExternalSemaphoresAsync",
                 CuWaitExternalSemaphoresAsync
             ),
-            signal_semaphore: symbol!(
-                "cuSignalExternalSemaphoresAsync",
-                CuSignalExternalSemaphoresAsync
-            ),
-            stream_synchronize: symbol!("cuStreamSynchronize", CuStreamSynchronize),
         }))
     }
     fn name(&self, code: CuResult) -> String {
@@ -493,14 +478,6 @@ impl CudaExternalSemaphore {
                 self.driver.name(r)
             )
         }
-        let r = unsafe { (self.driver.stream_synchronize)(stream) };
-        if r != 0 {
-            bail!(
-                "CUDA semaphore wait synchronization failed for frame {frame}, slot {slot} ({r}, {})",
-                self.driver.name(r)
-            )
-        }
-        eprintln!("zero-copy CUDA external semaphore wait complete: frame={frame} slot={slot}");
         Ok(())
     }
 }
