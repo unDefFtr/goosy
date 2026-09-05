@@ -1,5 +1,0 @@
-video encoder: h264_nvenc
-zero-copy capabilities negotiated: Vulkan external memory/semaphore, CUDA UUID, h264_nvenc, shader
-zero-copy Vulkan external slots allocated: 8
-[CUDA @ 0x555558b84e80] Using current CUDA context.
-ffmpeg-next selected video encoder: h264_nvenc
