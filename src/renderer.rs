@@ -42,6 +42,33 @@ impl Renderer {
         width: u32,
         height: u32,
         fps: u32,
+        lines: Vec<LyricLine>,
+        background: BackgroundRenderer,
+        cover: Option<CoverRenderer>,
+        render_translation: bool,
+        render_background_vocal: bool,
+        lyrics_style: LyricsStyle,
+        excluded_lines: &[usize],
+    ) -> Result<Self> {
+        Self::with_scene_options_for_encoder(
+            width,
+            height,
+            fps,
+            lines,
+            background,
+            cover,
+            render_translation,
+            render_background_vocal,
+            lyrics_style,
+            excluded_lines,
+            crate::EncoderBackend::Pipe,
+        )
+    }
+
+    pub fn with_scene_options_for_encoder(
+        width: u32,
+        height: u32,
+        fps: u32,
         mut lines: Vec<LyricLine>,
         background: BackgroundRenderer,
         cover: Option<CoverRenderer>,
@@ -49,6 +76,7 @@ impl Renderer {
         render_background_vocal: bool,
         lyrics_style: LyricsStyle,
         excluded_lines: &[usize],
+        encoder: crate::EncoderBackend,
     ) -> Result<Self> {
         if width == 0 || height == 0 || fps == 0 {
             bail!("width, height, and fps must be positive");
@@ -79,7 +107,7 @@ impl Renderer {
             lyrics.group_gap(),
             lyrics.interlude_slot_height(),
         );
-        let surface = crate::surface::SurfaceRenderer::try_new()?;
+        let surface = crate::surface::SurfaceRenderer::try_new_for_encoder(encoder, width, height)?;
         Ok(Self {
             width,
             height,
@@ -166,7 +194,12 @@ impl Renderer {
                     cover.draw(canvas, &geometry)?;
                 }
                 lyrics.draw(canvas, lines, layout, t_ms, geometry.lyrics.height as u32)
-            })
+            })?;
+        #[cfg(target_os = "linux")]
+        if let Some(payload) = self.surface.gpu_payload()? {
+            frame.set_gpu_payload(payload);
+        }
+        Ok(())
     }
 }
 

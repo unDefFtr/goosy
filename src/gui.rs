@@ -357,6 +357,26 @@ fn write_internal_preview_frame(
     height: u32,
     preview: &mut Vec<u8>,
 ) -> std::io::Result<(u32, u32)> {
+    let required_source_len = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "RGBA frame dimensions overflow",
+            )
+        })?;
+    if source.len() < required_source_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "RGBA frame source is smaller than the frame dimensions",
+        ));
+    }
     let scale = (STYLE_PREVIEW_MAX_WIDTH as f32 / width.max(1) as f32)
         .min(STYLE_PREVIEW_MAX_HEIGHT as f32 / height.max(1) as f32)
         .min(1.0);
@@ -1318,7 +1338,8 @@ impl GoosyApp {
                 |done, total, elapsed, pixels| {
                     let _ =
                         progress_sender.send(format!("GOOSY_PROGRESS {done} {total} {elapsed:.3}"));
-                    let preview_due = done == 1 || done == total || done % preview_interval == 0;
+                    let preview_due = !options.encoder.is_zero_copy()
+                        && (done == 1 || done == total || done % preview_interval == 0);
                     if preview_due {
                         if let Some(directory) = preview_dir.as_deref() {
                             match write_internal_preview_frame(
@@ -1739,7 +1760,7 @@ impl GoosyApp {
                             for backend in EncoderBackend::ALL {
                                 ui.selectable_value(
                                     &mut self.encoder_backend,
-                                    backend,
+                                    *backend,
                                     backend.label(),
                                 );
                             }
@@ -2055,7 +2076,7 @@ mod tests {
         StylePreviewRequest, StylePreviewScene, detect_credit_lines, encoder_cli_args,
         has_extension, new_preview_directory, parse_preview_event, render_page_uses_columns,
         render_style_preview, spawn_style_preview_worker, style_preview_dimensions,
-        terminate_render_child,
+        terminate_render_child, write_internal_preview_frame,
     };
     use libgoosy::{EncoderBackend, LyricsStyle, image_asset::ImageAsset, lrc::LyricLine};
 
@@ -2138,6 +2159,21 @@ mod tests {
         assert_eq!(parse_preview_event("GOOSY_PREVIEW 45 0 360"), None);
         assert_eq!(parse_preview_event("GOOSY_PREVIEW 45 640"), None);
         assert_eq!(parse_preview_event("GOOSY_PROGRESS 45 300 1.0"), None);
+    }
+
+    #[test]
+    fn rejects_empty_preview_source_for_positive_frame_size() {
+        let mut preview = Vec::new();
+        let error = write_internal_preview_frame(
+            std::path::Path::new("unused"),
+            1,
+            &[],
+            2,
+            2,
+            &mut preview,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2385,6 +2421,16 @@ mod tests {
 
     #[test]
     fn encoder_order_labels_and_cli_values_are_stable() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            EncoderBackend::ALL,
+            [
+                EncoderBackend::Pipe,
+                EncoderBackend::FfmpegNext,
+                EncoderBackend::FfmpegNextNvencZeroCopy,
+            ]
+        );
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(
             EncoderBackend::ALL,
             [EncoderBackend::Pipe, EncoderBackend::FfmpegNext]
@@ -2393,6 +2439,11 @@ mod tests {
         assert_eq!(
             EncoderBackend::ALL[1].label(),
             "ffmpeg-next Encoder（自动选择）"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            encoder_cli_args(EncoderBackend::FfmpegNextNvencZeroCopy),
+            ["--encoder", "ffmpeg-next-nvenc-zero-copy"]
         );
         assert_eq!(
             encoder_cli_args(EncoderBackend::Pipe),

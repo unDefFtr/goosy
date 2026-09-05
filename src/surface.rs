@@ -21,6 +21,8 @@ enum Backend {
     Metal(MetalBackend),
 }
 const GPU_RESOURCE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const EXTERNAL_SLOT_COUNT: usize = 8;
 
 impl SurfaceRenderer {
     pub fn new() -> Self {
@@ -103,6 +105,26 @@ impl SurfaceRenderer {
             backend: Backend::Raster,
         })
     }
+    pub fn try_new_for_encoder(
+        encoder: crate::EncoderBackend,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        if matches!(encoder, crate::EncoderBackend::FfmpegNextNvencZeroCopy) {
+            if requested_backend()? == BackendRequest::Raster {
+                bail!(
+                    "Vulkan/CUDA/NVENC zero-copy requires Vulkan; GOOSY_RENDER_BACKEND=raster was requested"
+                );
+            }
+            return VulkanBackend::new_external(width, height)
+                .map(|vulkan| Self {
+                    backend: Backend::Vulkan(vulkan),
+                })
+                .context("negotiate Vulkan/CUDA/NVENC zero-copy capability");
+        }
+        Self::try_new()
+    }
 
     pub fn backend_name(&self) -> &'static str {
         match &self.backend {
@@ -152,6 +174,15 @@ impl SurfaceRenderer {
             Backend::Angle(angle) => angle.render_into(info, row_bytes, pixels, draw),
             #[cfg(target_os = "macos")]
             Backend::Metal(metal) => metal.render_into(info, row_bytes, pixels, draw),
+        }
+    }
+    pub(crate) fn gpu_payload(
+        &self,
+    ) -> Result<Option<std::sync::Arc<crate::gpu_interop::GpuFramePayload>>> {
+        match &self.backend {
+            Backend::Vulkan(vulkan) if vulkan.external_mode => vulkan.gpu_payload().map(Some),
+            Backend::Vulkan(_) => Ok(None),
+            _ => Ok(None),
         }
     }
 }
@@ -277,6 +308,7 @@ fn read_pixels_into(
 struct VulkanNative {
     device: Option<ash::Device>,
     instance: Option<ash::Instance>,
+    physical_device: ash::vk::PhysicalDevice,
     entry: ash::Entry,
 }
 
@@ -296,14 +328,204 @@ impl Drop for VulkanNative {
 }
 
 #[cfg(target_os = "linux")]
+struct ExternalVulkanSlot {
+    image: ash::vk::Image,
+    image_view: ash::vk::ImageView,
+    image_memory: ash::vk::DeviceMemory,
+    image_size: ash::vk::DeviceSize,
+    nv12_buffer: ash::vk::Buffer,
+    buffer_memory: ash::vk::DeviceMemory,
+    buffer_size: ash::vk::DeviceSize,
+    semaphore: ash::vk::Semaphore,
+    cuda_mapping: std::sync::Arc<crate::gpu_interop::CudaNv12Mapping>,
+    cuda_semaphore: std::sync::Arc<crate::gpu_interop::CudaExternalSemaphore>,
+    token: std::sync::Arc<crate::gpu_interop::SlotToken>,
+    layout: crate::gpu_interop::Nv12Layout,
+    descriptor_set: ash::vk::DescriptorSet,
+    command_buffer: ash::vk::CommandBuffer,
+    fence: ash::vk::Fence,
+    image_initialized: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct ComputeResources {
+    command_pool: ash::vk::CommandPool,
+    descriptor_pool: ash::vk::DescriptorPool,
+    descriptor_set_layout: ash::vk::DescriptorSetLayout,
+    pipeline_layout: ash::vk::PipelineLayout,
+    pipeline: ash::vk::Pipeline,
+    shader_module: ash::vk::ShaderModule,
+}
+
+#[cfg(target_os = "linux")]
 struct VulkanBackend {
-    surface: Option<Surface>,
+    surfaces: Vec<Option<Surface>>,
     context: Option<skia_safe::gpu::DirectContext>,
-    #[allow(dead_code)]
+    external_slots: Vec<ExternalVulkanSlot>,
+    compute: Option<ComputeResources>,
     native: VulkanNative,
+    queue: ash::vk::Queue,
+    queue_family_index: u32,
+    device_uuid: [u8; 16],
     device_name: String,
     vendor_id: u32,
+    device_id: u32,
     device_type: ash::vk::PhysicalDeviceType,
+    external_mode: bool,
+    active_slot: Option<usize>,
+}
+#[cfg(target_os = "linux")]
+impl VulkanBackend {
+    fn initialize_compute(&mut self, _width: u32, _height: u32) -> Result<()> {
+        use ash::vk;
+        let device = self
+            .native
+            .device
+            .as_ref()
+            .context("Vulkan device unavailable")?;
+        let shader = std::fs::read(env!("GOOSY_NV12_SHADER_PATH"))
+            .context("read compiled RGBA-to-NV12 shader")?;
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(shader))
+            .context("parse compiled RGBA-to-NV12 shader")?;
+        let shader_module = unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+        }
+        .context("create RGBA-to-NV12 shader module")?;
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let descriptor_set_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+        }
+        .context("create NV12 descriptor-set layout")?;
+        let push_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(24);
+        let pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(std::slice::from_ref(&descriptor_set_layout))
+                    .push_constant_ranges(std::slice::from_ref(&push_range)),
+                None,
+            )
+        }
+        .context("create NV12 pipeline layout")?;
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(c"main");
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(pipeline_layout);
+        let pipeline = unsafe {
+            device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                std::slice::from_ref(&pipeline_info),
+                None,
+            )
+        }
+        .map_err(|(_, error)| error)
+        .context("create NV12 compute pipeline")?[0];
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(EXTERNAL_SLOT_COUNT as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(EXTERNAL_SLOT_COUNT as u32),
+        ];
+        let descriptor_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(EXTERNAL_SLOT_COUNT as u32)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+        }
+        .context("create NV12 descriptor pool")?;
+        let layouts = [descriptor_set_layout; EXTERNAL_SLOT_COUNT];
+        let sets = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+        }
+        .context("allocate NV12 descriptor sets")?;
+        let command_pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(self.queue_family_index)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+        }
+        .context("create NV12 command pool")?;
+        let command_buffers = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(EXTERNAL_SLOT_COUNT as u32),
+            )
+        }
+        .context("allocate NV12 command buffers")?;
+        for (index, slot) in self.external_slots.iter_mut().enumerate() {
+            let image_info = vk::DescriptorImageInfo::default()
+                .image_view(slot.image_view)
+                .image_layout(vk::ImageLayout::GENERAL);
+            let buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(slot.nv12_buffer)
+                .offset(0)
+                .range(slot.buffer_size);
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(sets[index])
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(std::slice::from_ref(&image_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(sets[index])
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&buffer_info)),
+            ];
+            unsafe {
+                device.update_descriptor_sets(&writes, &[]);
+            }
+            slot.command_buffer = command_buffers[index];
+            slot.descriptor_set = sets[index];
+            slot.fence = unsafe {
+                device.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+            }
+            .context("create NV12 slot fence")?;
+        }
+        self.compute = Some(ComputeResources {
+            command_pool,
+            descriptor_pool,
+            descriptor_set_layout,
+            pipeline_layout,
+            pipeline,
+            shader_module,
+        });
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -339,6 +561,7 @@ impl VulkanBackend {
         let mut native = VulkanNative {
             device: None,
             instance: Some(instance),
+            physical_device: vk::PhysicalDevice::null(),
             entry,
         };
 
@@ -351,6 +574,10 @@ impl VulkanBackend {
         let mut candidates = Vec::new();
         for physical_device in physical_devices {
             let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+            let mut id_properties = vk::PhysicalDeviceIDProperties::default();
+            let mut properties2 =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut id_properties);
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut properties2) };
             if properties.api_version < vk::API_VERSION_1_1 {
                 continue;
             }
@@ -373,21 +600,40 @@ impl VulkanBackend {
                 physical_device,
                 queue_family_index as u32,
                 properties,
+                id_properties.device_uuid,
             ));
         }
         candidates.sort_by_key(|candidate| candidate.0);
-        let Some((_, physical_device, queue_family_index, properties)) =
+        let Some((_, physical_device, queue_family_index, properties, device_uuid)) =
             candidates.into_iter().next()
         else {
             bail!("no graphics-capable Vulkan 1.1 device");
         };
+        native.physical_device = physical_device;
 
         let priorities = [1.0_f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities);
-        let queue_infos = [queue_info];
-        let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_infos);
+        let available_extensions =
+            unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                .context("enumerate Vulkan device extensions")?;
+        let extension_supported = |name: &std::ffi::CStr| {
+            available_extensions.iter().any(|property| unsafe {
+                std::ffi::CStr::from_ptr(property.extension_name.as_ptr()) == name
+            })
+        };
+        let enabled_extensions = [
+            vk::KHR_EXTERNAL_MEMORY_FD_NAME,
+            vk::KHR_EXTERNAL_SEMAPHORE_FD_NAME,
+        ]
+        .into_iter()
+        .filter(|name| extension_supported(name))
+        .map(|name| name.as_ptr())
+        .collect::<Vec<_>>();
+        let device_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(std::slice::from_ref(&queue_info))
+            .enabled_extension_names(&enabled_extensions);
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .context("create Vulkan graphics device")?;
         native.device = Some(device);
@@ -428,15 +674,315 @@ impl VulkanBackend {
         let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
-
         Ok(Self {
-            surface: None,
+            surfaces: vec![None],
             context: Some(context),
+            external_slots: Vec::new(),
+            compute: None,
             native,
+            queue,
+            queue_family_index,
+            device_uuid,
             device_name,
             vendor_id: properties.vendor_id,
+            device_id: properties.device_id,
             device_type: properties.device_type,
+            external_mode: false,
+            active_slot: None,
         })
+    }
+    fn create_external_slot(&self, width: u32, height: u32) -> Result<ExternalVulkanSlot> {
+        use ash::vk;
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let layout = crate::gpu_interop::Nv12Layout::nvenc(width, height)?;
+        let instance = self
+            .native
+            .instance
+            .as_ref()
+            .context("Vulkan instance unavailable")?;
+        let device = self
+            .native
+            .device
+            .as_ref()
+            .context("Vulkan device unavailable")?;
+        let memory_type = |bits: u32| -> Result<u32> {
+            let properties = unsafe {
+                instance.get_physical_device_memory_properties(self.native.physical_device)
+            };
+            (0..properties.memory_type_count)
+                .find(|index| {
+                    bits & (1 << index) != 0
+                        && properties.memory_types[*index as usize]
+                            .property_flags
+                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no device-local Vulkan memory type supports external sharing")
+                })
+        };
+
+        let mut image_external = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let image_info = vk::ImageCreateInfo::default()
+            .push_next(&mut image_external)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&image_info, None) }
+            .context("create exportable Vulkan RGBA image")?;
+        let image_requirements = unsafe { device.get_image_memory_requirements(image) };
+        let mut image_export = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let mut image_dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let image_allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(image_requirements.size)
+            .memory_type_index(memory_type(image_requirements.memory_type_bits)?)
+            .push_next(&mut image_export)
+            .push_next(&mut image_dedicated);
+        let image_memory = match unsafe { device.allocate_memory(&image_allocate, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { device.destroy_image(image, None) };
+                return Err(error).context("allocate exportable Vulkan RGBA memory");
+            }
+        };
+        if let Err(error) = unsafe { device.bind_image_memory(image, image_memory, 0) } {
+            unsafe {
+                device.free_memory(image_memory, None);
+                device.destroy_image(image, None);
+            }
+            return Err(error).context("bind exportable Vulkan RGBA memory");
+        }
+
+        let image_view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let image_view = match unsafe { device.create_image_view(&image_view_info, None) } {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe {
+                    device.free_memory(image_memory, None);
+                    device.destroy_image(image, None);
+                }
+                return Err(error).context("create Vulkan RGBA storage image view");
+            }
+        };
+        let size = layout.size as vk::DeviceSize;
+        let mut buffer_external = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let buffer_info = vk::BufferCreateInfo::default()
+            .push_next(&mut buffer_external)
+            .size(size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let nv12_buffer = match unsafe { device.create_buffer(&buffer_info, None) } {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                unsafe {
+                    device.free_memory(image_memory, None);
+                    device.destroy_image(image, None);
+                }
+                return Err(error).context("create exportable Vulkan NV12 buffer");
+            }
+        };
+        let buffer_requirements = unsafe { device.get_buffer_memory_requirements(nv12_buffer) };
+        let mut buffer_export = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(nv12_buffer);
+        let buffer_allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(buffer_requirements.size)
+            .memory_type_index(memory_type(buffer_requirements.memory_type_bits)?)
+            .push_next(&mut buffer_export)
+            .push_next(&mut dedicated);
+        let buffer_memory = match unsafe { device.allocate_memory(&buffer_allocate, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe {
+                    device.destroy_buffer(nv12_buffer, None);
+                    device.free_memory(image_memory, None);
+                    device.destroy_image(image, None);
+                }
+                return Err(error).context("allocate exportable Vulkan NV12 memory");
+            }
+        };
+        if let Err(error) = unsafe { device.bind_buffer_memory(nv12_buffer, buffer_memory, 0) } {
+            unsafe {
+                device.free_memory(buffer_memory, None);
+                device.destroy_buffer(nv12_buffer, None);
+                device.free_memory(image_memory, None);
+                device.destroy_image(image, None);
+            }
+            return Err(error).context("bind exportable Vulkan NV12 memory");
+        }
+
+        let mut semaphore_export = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+        let semaphore_info = vk::SemaphoreCreateInfo::default().push_next(&mut semaphore_export);
+        let semaphore = match unsafe { device.create_semaphore(&semaphore_info, None) } {
+            Ok(semaphore) => semaphore,
+            Err(error) => {
+                unsafe {
+                    device.free_memory(buffer_memory, None);
+                    device.destroy_buffer(nv12_buffer, None);
+                    device.free_memory(image_memory, None);
+                    device.destroy_image(image, None);
+                }
+                return Err(error).context("create exportable Vulkan semaphore");
+            }
+        };
+        let memory_loader = ash::khr::external_memory_fd::Device::new(instance, device);
+        let memory_info = vk::MemoryGetFdInfoKHR::default()
+            .memory(buffer_memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let mut memory_fd = -1;
+        let result = unsafe {
+            (memory_loader.fp().get_memory_fd_khr)(device.handle(), &memory_info, &mut memory_fd)
+        };
+        if result != vk::Result::SUCCESS || memory_fd < 0 {
+            unsafe {
+                device.destroy_semaphore(semaphore, None);
+                device.free_memory(buffer_memory, None);
+                device.destroy_buffer(nv12_buffer, None);
+                device.free_memory(image_memory, None);
+                device.destroy_image(image, None);
+            }
+            bail!("export Vulkan NV12 memory FD: {result:?}");
+        }
+        let semaphore_loader = ash::khr::external_semaphore_fd::Device::new(instance, device);
+        let semaphore_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+        let mut semaphore_fd = -1;
+        let result = unsafe {
+            (semaphore_loader.fp().get_semaphore_fd_khr)(
+                device.handle(),
+                &semaphore_info,
+                &mut semaphore_fd,
+            )
+        };
+        if result != vk::Result::SUCCESS || semaphore_fd < 0 {
+            unsafe {
+                device.destroy_semaphore(semaphore, None);
+                device.free_memory(buffer_memory, None);
+                device.destroy_buffer(nv12_buffer, None);
+                device.free_memory(image_memory, None);
+                device.destroy_image(image, None);
+            }
+            bail!("export Vulkan semaphore FD: {result:?}");
+        }
+        let layout = crate::gpu_interop::Nv12Layout::nvenc(width, height)?;
+        let memory_fd = unsafe { OwnedFd::from_raw_fd(memory_fd) };
+        let cuda_mapping = std::sync::Arc::new(crate::gpu_interop::import_cuda_nv12_memory(
+            memory_fd,
+            buffer_requirements.size as usize,
+        )?);
+        let cuda_semaphore =
+            std::sync::Arc::new(crate::gpu_interop::import_cuda_external_semaphore(
+                unsafe { OwnedFd::from_raw_fd(semaphore_fd) },
+                cuda_mapping.context(),
+            )?);
+        Ok(ExternalVulkanSlot {
+            image,
+            image_view,
+            image_memory,
+            image_size: image_requirements.size,
+            nv12_buffer,
+            buffer_memory,
+            buffer_size: buffer_requirements.size,
+            semaphore,
+            cuda_mapping,
+            cuda_semaphore,
+            token: std::sync::Arc::new(crate::gpu_interop::SlotToken::new()),
+            layout,
+            command_buffer: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            descriptor_set: vk::DescriptorSet::null(),
+            image_initialized: false,
+        })
+    }
+
+    fn new_external(width: u32, height: u32) -> Result<Self> {
+        use ash::vk;
+        let mut backend = Self::new()?;
+        let instance = backend
+            .native
+            .instance
+            .as_ref()
+            .expect("Vulkan instance initialized");
+        let extensions = unsafe {
+            instance.enumerate_device_extension_properties(backend.native.physical_device)
+        }
+        .context("enumerate Vulkan device extensions for zero-copy")?;
+        let has = |name: &std::ffi::CStr| {
+            extensions.iter().any(|property| unsafe {
+                std::ffi::CStr::from_ptr(property.extension_name.as_ptr()) == name
+            })
+        };
+        let memory = has(vk::KHR_EXTERNAL_MEMORY_FD_NAME);
+        let semaphore = has(vk::KHR_EXTERNAL_SEMAPHORE_FD_NAME);
+        let cuda = crate::gpu_interop::cuda_driver_available();
+        let nvenc = crate::gpu_interop::nvenc_available();
+        let matching = crate::gpu_interop::cuda_device_uuid_matches(&backend.device_uuid);
+        let shader_spirv = std::env::var_os("GOOSY_NV12_SHADER_PATH")
+            .is_some_and(|path| std::path::Path::new(&path).is_file());
+        crate::gpu_interop::negotiate(crate::gpu_interop::CapabilityInputs {
+            renderer_is_vulkan: true,
+            external_memory_fd: memory,
+            external_semaphore_fd: semaphore,
+            cuda_driver: cuda,
+            nvenc,
+            matching_device: matching,
+            shader_spirv,
+        })?;
+        eprintln!(
+            "zero-copy capabilities negotiated: Vulkan external memory/semaphore, CUDA UUID, h264_nvenc, shader"
+        );
+        for _ in 0..EXTERNAL_SLOT_COUNT {
+            let slot = backend.create_external_slot(width, height)?;
+            backend.external_slots.push(slot);
+        }
+        backend.surfaces.resize_with(EXTERNAL_SLOT_COUNT, || None);
+        backend.initialize_compute(width, height)?;
+        eprintln!(
+            "zero-copy Vulkan external slots allocated: {}",
+            EXTERNAL_SLOT_COUNT
+        );
+        backend.external_mode = true;
+        Ok(backend)
+    }
+    fn gpu_payload(&self) -> Result<std::sync::Arc<crate::gpu_interop::GpuFramePayload>> {
+        let index = self.active_slot.context("no active Vulkan slot")?;
+        let slot = self
+            .external_slots
+            .get(index)
+            .context("active Vulkan slot disappeared")?;
+        crate::gpu_interop::GpuFramePayload::new(
+            slot.cuda_mapping.clone(),
+            slot.cuda_semaphore.clone(),
+            slot.token.clone(),
+            slot.layout,
+            index,
+        )
+        .map(std::sync::Arc::new)
     }
 
     fn details(&self) -> String {
@@ -457,42 +1003,287 @@ impl VulkanBackend {
         F: FnOnce(&Canvas) -> Result<()>,
     {
         use skia_safe::gpu::{self, Budgeted, SurfaceOrigin};
-
-        let context = self.context.as_mut().expect("Vulkan context initialized");
-        if self.surface.is_none() {
-            self.surface = Some(
-                gpu::surfaces::render_target(
-                    context,
-                    Budgeted::Yes,
-                    info,
-                    0,
-                    SurfaceOrigin::TopLeft,
-                    None,
-                    false,
-                    false,
-                )
-                .context("create Vulkan render target")?,
+        let slot_index = if self.external_mode {
+            self.external_slots
+                .iter()
+                .position(|slot| slot.token.state() == crate::gpu_interop::SlotState::Free)
+                .context("no zero-copy Vulkan slot is free")?
+        } else {
+            0
+        };
+        self.active_slot = Some(slot_index);
+        if self.external_mode {
+            self.external_slots[slot_index].token.transition(
+                crate::gpu_interop::SlotState::Free,
+                crate::gpu_interop::SlotState::VulkanWriting,
+            )?;
+        }
+        {
+            let context = self.context.as_mut().expect("Vulkan context initialized");
+            use ash::vk::Handle;
+            if self
+                .surfaces
+                .get(slot_index)
+                .and_then(Option::as_ref)
+                .is_none()
+            {
+                if self.external_mode {
+                    let slot = &self.external_slots[slot_index];
+                    use skia_safe::gpu::backend_render_targets;
+                    use skia_safe::gpu::vk as skia_vk;
+                    let alloc = unsafe {
+                        skia_vk::Alloc::from_device_memory(
+                            slot.image_memory.as_raw() as _,
+                            0,
+                            slot.image_size,
+                            skia_vk::AllocFlag::empty(),
+                        )
+                    };
+                    let image_info = unsafe {
+                        skia_vk::ImageInfo::new(
+                            slot.image.as_raw() as _,
+                            alloc,
+                            skia_vk::ImageTiling::OPTIMAL,
+                            skia_vk::ImageLayout::UNDEFINED,
+                            skia_vk::Format::R8G8B8A8_UNORM,
+                            1,
+                            self.queue_family_index,
+                            None,
+                            None,
+                            Some(skia_vk::SharingMode::EXCLUSIVE),
+                        )
+                    };
+                    let target =
+                        backend_render_targets::make_vk((info.width(), info.height()), &image_info);
+                    self.surfaces[slot_index] = Some(
+                        gpu::surfaces::wrap_backend_render_target(
+                            context,
+                            &target,
+                            SurfaceOrigin::TopLeft,
+                            skia_safe::ColorType::RGBA8888,
+                            info.color_space(),
+                            None,
+                        )
+                        .context("wrap exportable Vulkan image with Skia")?,
+                    );
+                } else {
+                    self.surfaces[slot_index] = Some(
+                        gpu::surfaces::render_target(
+                            context,
+                            Budgeted::Yes,
+                            info,
+                            0,
+                            SurfaceOrigin::TopLeft,
+                            None,
+                            false,
+                            false,
+                        )
+                        .context("create Vulkan render target")?,
+                    );
+                }
+            }
+            let surface = self.surfaces[slot_index]
+                .as_mut()
+                .expect("Vulkan surface initialized");
+            draw(surface.canvas())?;
+            context.flush_submit_and_sync_cpu();
+            if context.is_device_lost() {
+                bail!("Vulkan GPU submission failed: device lost");
+            }
+            if context.oomed() {
+                bail!("Vulkan GPU submission failed: out of memory");
+            }
+            if !self.external_mode {
+                read_pixels_into(surface, info, row_bytes, pixels)
+                    .context("read RGBA pixels from Vulkan surface")?;
+            }
+        }
+        if self.external_mode {
+            self.submit_compute(info.width() as u32, info.height() as u32, 0)?;
+        }
+        Ok(())
+    }
+    fn submit_compute(&mut self, width: u32, height: u32, frame_index: u64) -> Result<()> {
+        use ash::vk;
+        let device = self
+            .native
+            .device
+            .as_ref()
+            .context("Vulkan device unavailable")?;
+        let compute = self
+            .compute
+            .as_ref()
+            .context("Vulkan compute pipeline unavailable")?;
+        let index = self.active_slot.context("no active Vulkan slot")?;
+        let slot = &mut self.external_slots[index];
+        unsafe {
+            device
+                .wait_for_fences(std::slice::from_ref(&slot.fence), true, u64::MAX)
+                .context("wait zero-copy slot fence")?;
+            device
+                .reset_fences(std::slice::from_ref(&slot.fence))
+                .context("reset zero-copy slot fence")?;
+            device
+                .reset_command_buffer(slot.command_buffer, vk::CommandBufferResetFlags::empty())
+                .context("reset zero-copy command buffer")?;
+            device
+                .begin_command_buffer(slot.command_buffer, &vk::CommandBufferBeginInfo::default())
+                .context("begin zero-copy compute command buffer")?;
+            let old_image_layout = if slot.image_initialized {
+                vk::ImageLayout::GENERAL
+            } else {
+                vk::ImageLayout::UNDEFINED
+            };
+            let image_barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(if slot.image_initialized {
+                    vk::AccessFlags::SHADER_READ
+                } else {
+                    vk::AccessFlags::empty()
+                })
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(old_image_layout)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(slot.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            let buffer_barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(if slot.image_initialized {
+                    vk::AccessFlags::SHADER_WRITE
+                } else {
+                    vk::AccessFlags::empty()
+                })
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .buffer(slot.nv12_buffer)
+                .offset(0)
+                .size(slot.buffer_size);
+            device.cmd_pipeline_barrier(
+                slot.command_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&buffer_barrier),
+                std::slice::from_ref(&image_barrier),
             );
+            device.cmd_bind_pipeline(
+                slot.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                compute.pipeline,
+            );
+            device.cmd_bind_descriptor_sets(
+                slot.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                compute.pipeline_layout,
+                0,
+                std::slice::from_ref(&slot.descriptor_set),
+                &[],
+            );
+            let params = [
+                width,
+                height,
+                slot.layout.y_offset as u32,
+                slot.layout.uv_offset as u32,
+                slot.layout.y_pitch as u32,
+                slot.layout.uv_pitch as u32,
+            ];
+            let bytes = std::slice::from_raw_parts(params.as_ptr() as *const u8, 24);
+            device.cmd_push_constants(
+                slot.command_buffer,
+                compute.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytes,
+            );
+            device.cmd_dispatch(
+                slot.command_buffer,
+                width.div_ceil(16),
+                height.div_ceil(16),
+                1,
+            );
+            let post_barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                .buffer(slot.nv12_buffer)
+                .offset(0)
+                .size(slot.buffer_size);
+            device.cmd_pipeline_barrier(
+                slot.command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&post_barrier),
+                &[],
+            );
+            device
+                .end_command_buffer(slot.command_buffer)
+                .context("end zero-copy compute command buffer")?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&slot.command_buffer))
+                .signal_semaphores(std::slice::from_ref(&slot.semaphore));
+            device
+                .queue_submit(self.queue, std::slice::from_ref(&submit), slot.fence)
+                .with_context(|| {
+                    format!("submit Vulkan NV12 compute frame {frame_index}, slot {index}")
+                })?;
         }
-        let surface = self.surface.as_mut().expect("Vulkan surface initialized");
-        draw(surface.canvas())?;
-        context.flush_submit_and_sync_cpu();
-        if context.is_device_lost() {
-            bail!("Vulkan GPU submission failed: device lost");
-        }
-        if context.oomed() {
-            bail!("Vulkan GPU submission failed: out of memory");
-        }
-        read_pixels_into(surface, info, row_bytes, pixels)
-            .context("read RGBA pixels from Vulkan surface")
+        self.external_slots[index].image_initialized = true;
+        Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for VulkanBackend {
     fn drop(&mut self) {
-        self.surface.take();
+        self.surfaces.clear();
         self.context.take();
+        if let Some(device) = self.native.device.as_ref() {
+            if let Some(compute) = self.compute.take() {
+                unsafe {
+                    device.destroy_pipeline(compute.pipeline, None);
+                    device.destroy_pipeline_layout(compute.pipeline_layout, None);
+                    device.destroy_shader_module(compute.shader_module, None);
+                    device.destroy_descriptor_pool(compute.descriptor_pool, None);
+                    device.destroy_descriptor_set_layout(compute.descriptor_set_layout, None);
+                    device.destroy_command_pool(compute.command_pool, None);
+                }
+            }
+            for slot in self.external_slots.drain(..) {
+                let ExternalVulkanSlot {
+                    image,
+                    image_view,
+                    image_memory,
+                    nv12_buffer,
+                    buffer_memory,
+                    semaphore,
+                    fence,
+                    cuda_mapping,
+                    cuda_semaphore,
+                    ..
+                } = slot;
+                drop(cuda_semaphore);
+                drop(cuda_mapping);
+                unsafe {
+                    if fence != ash::vk::Fence::null() {
+                        device.destroy_fence(fence, None);
+                    }
+                    if semaphore != ash::vk::Semaphore::null() {
+                        device.destroy_semaphore(semaphore, None);
+                    }
+                    device.destroy_image_view(image_view, None);
+                    device.free_memory(buffer_memory, None);
+                    device.destroy_buffer(nv12_buffer, None);
+                    device.free_memory(image_memory, None);
+                    device.destroy_image(image, None);
+                }
+            }
+        }
     }
 }
 
@@ -512,9 +1303,8 @@ struct Direct3DBackend {
 #[cfg(target_os = "windows")]
 impl Direct3DBackend {
     fn new() -> Result<Self> {
+        use skia_safe::gpu::Protected;
         use skia_safe::gpu::ganesh::ResourceCacheLimits;
-        use skia_safe::gpu::{self, Protected};
-
         let selection = select_d3d_adapter().context("find a D3D12-capable hardware adapter")?;
         let queue_desc = windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_QUEUE_DESC {
             Type: windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -979,4 +1769,26 @@ mod tests {
         );
         assert!(parse_backend_request(Some(OsStr::new("metal"))).is_err());
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+#[ignore = "requires NVIDIA Vulkan and CUDA driver"]
+fn nvidia_external_slot_can_be_created() -> Result<()> {
+    let mut backend = VulkanBackend::new_external(2, 2)?;
+    let info = ImageInfo::new(
+        skia_safe::ISize::new(2, 2),
+        skia_safe::ColorType::RGBA8888,
+        skia_safe::AlphaType::Premul,
+        skia_safe::ColorSpace::new_srgb(),
+    );
+    let mut pixels = Vec::new();
+    backend.render_into(&info, 8, &mut pixels, |canvas| {
+        canvas.clear(skia_safe::Color::from_argb(255, 220, 30, 40));
+        Ok(())
+    })?;
+    let payload = backend.gpu_payload()?;
+    payload.wait_for_cuda(0)?;
+    assert_eq!(backend.external_slots.len(), EXTERNAL_SLOT_COUNT);
+    Ok(())
 }

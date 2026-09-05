@@ -5,6 +5,8 @@ pub mod encoder;
 pub mod ffi;
 pub mod frame;
 pub mod geometry;
+#[cfg(target_os = "linux")]
+pub mod gpu_interop;
 pub mod image_asset;
 pub mod layout;
 pub mod lrc;
@@ -212,7 +214,7 @@ where
         .as_ref()
         .map(|asset| cover_renderer::CoverRenderer::from_image_asset(asset, title))
         .transpose()?;
-    let mut renderer = Renderer::with_scene_options(
+    let mut renderer = Renderer::with_scene_options_for_encoder(
         options.width,
         options.height,
         options.fps,
@@ -223,6 +225,7 @@ where
         options.render_background_vocal,
         options.lyrics_style,
         &options.excluded_lines,
+        options.encoder,
     )?;
     let mut sink = video::create_encoder(
         options.encoder,
@@ -244,14 +247,20 @@ where
                 RenderControl::Stop => anyhow::bail!("render stopped by user"),
             }
         }
-        let t_ms = render_start_ms + frame_index * 1_000 / options.fps as u64;
-        renderer.render_frame_into(t_ms, &mut frame)?;
-        progress.inc(1);
+        renderer.render_frame_into(
+            render_start_ms + frame_index * 1_000 / options.fps as u64,
+            &mut frame,
+        )?;
+        let callback_pixels = if options.encoder.is_zero_copy() {
+            &[]
+        } else {
+            frame.pixels()
+        };
         on_frame(
             frame_index + 1,
             total_frames,
             render_started.elapsed().as_secs_f64(),
-            frame.pixels(),
+            callback_pixels,
         );
         frame = sink.submit(frame)?;
     }

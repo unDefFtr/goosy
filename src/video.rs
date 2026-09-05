@@ -574,7 +574,29 @@ pub fn create_encoder(
         crate::encoder::EncoderBackend::FfmpegNext => Ok(Box::new(
             crate::encoder::FfmpegNextEncoder::new(output, width, height, fps, audio)?,
         )),
+        #[cfg(target_os = "linux")]
+        crate::encoder::EncoderBackend::FfmpegNextNvencZeroCopy => Ok(Box::new(
+            crate::encoder::FfmpegNextEncoder::new_zero_copy(output, width, height, fps, audio)?,
+        )),
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn zero_copy_backend_never_constructs_rawvideo_pipe() {
+    let error = match create_encoder(
+        crate::encoder::EncoderBackend::FfmpegNextNvencZeroCopy,
+        Path::new("/tmp/zero-copy-test.mp4"),
+        2,
+        2,
+        30,
+        None,
+    ) {
+        Ok(_) => panic!("zero-copy requires an interop sink"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("zero-copy"));
+    assert!(!error.to_string().contains("rawvideo"));
 }
 
 #[cfg(test)]

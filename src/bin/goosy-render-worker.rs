@@ -151,6 +151,9 @@ enum WorkerEncoder {
     Pipe,
     #[value(name = "ffmpeg-next")]
     FfmpegNext,
+    #[cfg(target_os = "linux")]
+    #[value(name = "ffmpeg-next-nvenc-zero-copy")]
+    FfmpegNextNvencZeroCopy,
 }
 
 impl From<WorkerEncoder> for EncoderBackend {
@@ -158,6 +161,8 @@ impl From<WorkerEncoder> for EncoderBackend {
         match value {
             WorkerEncoder::Pipe => Self::Pipe,
             WorkerEncoder::FfmpegNext => Self::FfmpegNext,
+            #[cfg(target_os = "linux")]
+            WorkerEncoder::FfmpegNextNvencZeroCopy => Self::FfmpegNextNvencZeroCopy,
         }
     }
 }
@@ -449,7 +454,8 @@ fn main() -> Result<()> {
                     if progress_events {
                         println!("GOOSY_PROGRESS {done} {total} {elapsed:.3}");
                     }
-                    let preview_due = done == 1 || done == total || done % preview_interval == 0;
+                    let preview_due = !options.encoder.is_zero_copy()
+                        && (done == 1 || done == total || done % preview_interval == 0);
                     if preview_due {
                         let result = preview_dir.as_deref().map(|directory| {
                             write_preview_frame(
@@ -536,10 +542,15 @@ mod tests {
     }
 
     #[test]
-    fn encoder_argument_accepts_both_protocol_values() {
+    fn encoder_argument_accepts_protocol_values() {
         for (value, expected) in [
             ("pipe", WorkerEncoder::Pipe),
             ("ffmpeg-next", WorkerEncoder::FfmpegNext),
+            #[cfg(target_os = "linux")]
+            (
+                "ffmpeg-next-nvenc-zero-copy",
+                WorkerEncoder::FfmpegNextNvencZeroCopy,
+            ),
         ] {
             let cli = Cli::try_parse_from([
                 "goosy-render-worker",

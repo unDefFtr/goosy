@@ -31,6 +31,30 @@ enum LyricFormat {
     Ttml,
     Yrc,
 }
+#[cfg(not(target_os = "windows"))]
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliEncoder {
+    #[value(name = "pipe")]
+    Pipe,
+    #[value(name = "ffmpeg-next")]
+    FfmpegNext,
+    #[cfg(target_os = "linux")]
+    #[value(name = "ffmpeg-next-nvenc-zero-copy")]
+    FfmpegNextNvencZeroCopy,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl From<CliEncoder> for libgoosy::EncoderBackend {
+    fn from(value: CliEncoder) -> Self {
+        match value {
+            CliEncoder::Pipe => Self::Pipe,
+            CliEncoder::FfmpegNext => Self::FfmpegNext,
+            #[cfg(target_os = "linux")]
+            CliEncoder::FfmpegNextNvencZeroCopy => Self::FfmpegNextNvencZeroCopy,
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[derive(Parser)]
 #[command(name = "goosy", about = "GoosyRenderer GUI")]
@@ -75,6 +99,8 @@ enum Command {
         height: u32,
         #[arg(long, default_value_t = 30)]
         fps: u32,
+        #[arg(long, value_enum, default_value_t = CliEncoder::Pipe)]
+        encoder: CliEncoder,
         #[arg(long, default_value_t = 1.0)]
         font_scale: f32,
         #[arg(long, default_value_t = 0.65)]
@@ -175,6 +201,7 @@ fn main() -> Result<()> {
             width,
             height,
             fps,
+            encoder,
             font_scale,
             translation_font_scale,
             background_font_scale,
@@ -202,6 +229,7 @@ fn main() -> Result<()> {
             width,
             height,
             fps,
+            encoder.into(),
             font_scale,
             translation_font_scale,
             background_font_scale,
@@ -273,6 +301,7 @@ fn render(
     width: u32,
     height: u32,
     fps: u32,
+    encoder: libgoosy::EncoderBackend,
     font_scale: f32,
     translation_font_scale: f32,
     background_font_scale: f32,
@@ -353,7 +382,7 @@ fn render(
         "initializing-renderer",
         "正在初始化图形后端",
     )?;
-    let mut renderer = renderer::Renderer::with_scene_options(
+    let mut renderer = renderer::Renderer::with_scene_options_for_encoder(
         width,
         height,
         fps,
@@ -375,6 +404,7 @@ fn render(
             debug_overlays,
         },
         &exclude_lines,
+        encoder,
     )
     .context("初始化图形渲染器")?;
     eprintln!(
@@ -386,7 +416,7 @@ fn render(
     #[cfg(target_os = "linux")]
     eprintln!("video encoder: {}", video::preferred_video_encoder_name());
     let mut sink = video::create_encoder(
-        libgoosy::EncoderBackend::Pipe,
+        encoder,
         &output,
         width,
         height,
@@ -481,5 +511,25 @@ mod tests {
         let lines =
             parse_lyrics_text(input, Some(Path::new("lyrics.ttml")), LyricFormat::Auto).unwrap();
         assert_eq!(lines[0].text, "hello");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_accepts_explicit_zero_copy_encoder() {
+        let cli = Cli::try_parse_from([
+            "goosy",
+            "render",
+            "song.wav",
+            "--encoder",
+            "ffmpeg-next-nvenc-zero-copy",
+        ])
+        .unwrap();
+        let Command::Render { encoder, .. } = cli.command else {
+            panic!("expected render command");
+        };
+        assert_eq!(
+            libgoosy::EncoderBackend::from(encoder).cli_value(),
+            "ffmpeg-next-nvenc-zero-copy"
+        );
     }
 }
