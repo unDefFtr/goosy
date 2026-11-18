@@ -15,6 +15,7 @@ use crate::image_asset::ImageAsset;
 struct CoverCache {
     geometry: FrameGeometry,
     image: Image,
+    draw_bounds: Rect,
 }
 
 pub struct CoverRenderer {
@@ -113,13 +114,18 @@ impl CoverRenderer {
     }
 
     pub fn draw(&mut self, canvas: &Canvas, geometry: &FrameGeometry) -> Result<()> {
-        if geometry.cover.is_none() {
+        let Some(viewport) = geometry.cover else {
             return Ok(());
-        }
+        };
         if let Some(cache) = &self.cached_layer
             && cache.geometry == *geometry
         {
-            canvas.draw_image(&cache.image, (0.0, 0.0), None);
+            canvas.draw_image_rect(
+                &cache.image,
+                Some((&cache.draw_bounds, SrcRectConstraint::Fast)),
+                cache.draw_bounds,
+                &Paint::default(),
+            );
             return Ok(());
         }
 
@@ -134,10 +140,22 @@ impl CoverRenderer {
         cache_surface.canvas().clear(Color::TRANSPARENT);
         self.draw_contents(cache_surface.canvas(), geometry)?;
         let image = cache_surface.image_snapshot();
-        canvas.draw_image(&image, (0.0, 0.0), None);
+        let draw_bounds = Rect::from_xywh(
+            viewport.x.floor().max(0.0),
+            viewport.y.floor().max(0.0),
+            viewport.width.ceil().min(dimensions.0 as f32),
+            viewport.height.ceil().min(dimensions.1 as f32),
+        );
+        canvas.draw_image_rect(
+            &image,
+            Some((&draw_bounds, SrcRectConstraint::Fast)),
+            draw_bounds,
+            &Paint::default(),
+        );
         self.cached_layer = Some(CoverCache {
             geometry: *geometry,
             image,
+            draw_bounds,
         });
         Ok(())
     }

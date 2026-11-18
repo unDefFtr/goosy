@@ -6,9 +6,14 @@ use skia_safe::textlayout::{
     TextAlign, TextBox, TextHeightBehavior, TextStyle,
 };
 use skia_safe::{
-    BlendMode, Canvas, Color, FontMgr, FontStyle, Paint, PaintStyle, PathBuilder, Point, Rect,
+    BlendMode, Canvas, Color, FilterMode, FontMgr, FontStyle, Image, MipmapMode, Paint, PaintStyle,
+    PathBuilder, Point, Rect, SamplingOptions,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+
+thread_local! {
+    static BASELINE_REFERENCE_MODE: Cell<bool> = const { Cell::new(false) };
+}
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::geometry::Viewport;
@@ -133,6 +138,13 @@ impl LyricsStyle {
         Ok(())
     }
 }
+struct BlurredGroupCacheEntry {
+    blur_level: usize,
+    is_gpu: bool,
+    pad: f32,
+    image: Image,
+}
+
 pub struct LyricsRenderer {
     base_paragraphs: Vec<Paragraph>,
     solid_paragraphs: Vec<Paragraph>,
@@ -161,6 +173,7 @@ pub struct LyricsRenderer {
     lyric_blur_paints: Vec<RefCell<Paint>>,
     background_vocal_blur_paint: RefCell<Paint>,
     dot_paint: RefCell<Paint>,
+    blurred_group_cache: RefCell<Vec<Option<BlurredGroupCacheEntry>>>,
     style: LyricsStyle,
 }
 
@@ -337,6 +350,7 @@ impl LyricsRenderer {
         let mut dot_paint = Paint::default();
         dot_paint.set_color(Color::WHITE);
         dot_paint.set_anti_alias(true);
+        let num_lines = base_paragraphs.len();
         Ok(Self {
             base_paragraphs,
             solid_paragraphs,
@@ -360,9 +374,24 @@ impl LyricsRenderer {
             dot_gap,
             lyric_blur_paints,
             background_vocal_blur_paint,
+            blurred_group_cache: RefCell::new((0..num_lines).map(|_| None).collect()),
             style,
             dot_paint: RefCell::new(dot_paint),
         })
+    }
+
+    pub fn draw_unoptimized_reference(
+        &self,
+        canvas: &Canvas,
+        lines: &[LyricLine],
+        layout: &Layout,
+        t_ms: u64,
+        height: u32,
+    ) -> Result<()> {
+        BASELINE_REFERENCE_MODE.with(|mode| mode.set(true));
+        let res = self.draw(canvas, lines, layout, t_ms, height);
+        BASELINE_REFERENCE_MODE.with(|mode| mode.set(false));
+        res
     }
 
     pub fn draw(
@@ -388,6 +417,7 @@ impl LyricsRenderer {
             let extent = self.base_heights[index] + translation_height + self.main_font_size * 0.5;
             if top_y + extent < -self.main_font_size || top_y > height as f32 + self.main_font_size
             {
+                self.blurred_group_cache.borrow_mut()[index] = None;
                 continue;
             }
             let scale = layout.scale[index].current_position() as f32;
@@ -419,9 +449,27 @@ impl LyricsRenderer {
                 )
             };
             let blur_level = blur_distance.min(LYRIC_BLUR_LEVELS);
+            if opacity <= 0.0 {
+                self.blurred_group_cache.borrow_mut()[index] = None;
+                canvas.restore_to_count(transform);
+                continue;
+            }
+            if blur_level == 0 || render_highlight {
+                self.blurred_group_cache.borrow_mut()[index] = None;
+            }
             if blur_level > 0 {
                 let blur_sigma =
                     lyric_blur_sigma(blur_level, self.style.lyric_blur_sigma_step as usize) as f32;
+                let is_ref_mode = BASELINE_REFERENCE_MODE.with(Cell::get);
+                if !is_ref_mode
+                    && !render_highlight
+                    && self.draw_cached_blurred_group(
+                        canvas, lines, index, blur_level, blur_sigma, opacity, top_y,
+                    )
+                {
+                    canvas.restore_to_count(transform);
+                    continue;
+                }
                 let mut layer_paint = self.lyric_blur_paints[blur_level - 1].borrow_mut();
                 layer_paint.set_alpha_f(opacity);
                 let bounds = self.group_bounds(index, top_y, blur_sigma);
@@ -471,6 +519,83 @@ impl LyricsRenderer {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
+    fn draw_cached_blurred_group(
+        &self,
+        canvas: &Canvas,
+        lines: &[LyricLine],
+        index: usize,
+        blur_level: usize,
+        blur_sigma: f32,
+        opacity: f32,
+        top_y: f32,
+    ) -> bool {
+        let bounds = self.group_bounds(index, top_y, blur_sigma);
+        if bounds.is_empty() {
+            self.blurred_group_cache.borrow_mut()[index] = None;
+            return true;
+        }
+        let is_gpu = canvas.recording_context().is_some();
+        let needs_rebuild = {
+            let cache = self.blurred_group_cache.borrow();
+            match &cache[index] {
+                Some(entry) => entry.blur_level != blur_level || entry.is_gpu != is_gpu,
+                None => true,
+            }
+        };
+        if needs_rebuild {
+            let visual_margin = (self.main_font_size * 0.25).max(4.0);
+            let pad = (blur_sigma + visual_margin).ceil();
+            let cache_w = (self.text_width + pad * 2.0).ceil().max(1.0) as i32;
+            let cache_h = (self.group_heights[index] as f32 + pad * 2.0)
+                .ceil()
+                .max(1.0) as i32;
+            let info = canvas.image_info().with_dimensions((cache_w, cache_h));
+            let Some(mut surface) = canvas.new_surface(&info, None) else {
+                return false;
+            };
+            let cache_canvas = surface.canvas();
+            cache_canvas.clear(Color::TRANSPARENT);
+            cache_canvas.translate((pad - self.margin_x, 0.0));
+            let local_bounds =
+                Rect::from_xywh(self.margin_x - pad, 0.0, cache_w as f32, cache_h as f32);
+            let layer = {
+                let mut layer_paint = self.lyric_blur_paints[blur_level - 1].borrow_mut();
+                layer_paint.set_alpha_f(1.0);
+                let layer_rec = SaveLayerRec::default()
+                    .bounds(&local_bounds)
+                    .paint(&layer_paint);
+                cache_canvas.save_layer(&layer_rec)
+            };
+            self.draw_group(cache_canvas, lines, index, false, true, 0.0, 0, pad);
+            cache_canvas.restore_to_count(layer);
+            let image = surface.image_snapshot();
+            self.blurred_group_cache.borrow_mut()[index] = Some(BlurredGroupCacheEntry {
+                blur_level,
+                is_gpu,
+                pad,
+                image,
+            });
+        }
+        let cache = self.blurred_group_cache.borrow();
+        let entry = cache[index]
+            .as_ref()
+            .expect("blurred group cache populated");
+        let clip_save = canvas.save();
+        canvas.clip_rect(bounds, None, true);
+        let mut paint = Paint::default();
+        paint.set_alpha_f(opacity);
+        let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
+        canvas.draw_image_with_sampling_options(
+            &entry.image,
+            (self.margin_x - entry.pad, top_y - entry.pad),
+            sampling,
+            Some(&paint),
+        );
+        canvas.restore_to_count(clip_save);
+        true
+    }
+
     fn group_bounds(&self, index: usize, top_y: f32, expansion: f32) -> Rect {
         let mut bounds = Rect::from_xywh(
             self.margin_x,
@@ -924,6 +1049,17 @@ fn draw_line(
     }
     let feather_width = (main_font_size * 0.08).clamp(2.0, 8.0);
     if has_timed_words {
+        let word_position = Point::new(margin_x, top_y);
+        struct WordBatch {
+            lift_offset: f32,
+            can_merge: bool,
+            word_mask: PathBuilder,
+            core_mask: PathBuilder,
+            has_core: bool,
+            feather_masks: [PathBuilder; 3],
+            has_feather: [bool; 3],
+        }
+        let mut batches: Vec<WordBatch> = Vec::with_capacity(4);
         for (word, boxes) in line.words.iter().zip(word_boxes) {
             let total_width = boxes
                 .iter()
@@ -935,23 +1071,40 @@ fn draw_line(
             let emphasis = emphasis_graphemes(&word.text, word.start_ms, word.end_ms).is_some();
             let lift_offset = word_lift_offset(lift_progress, highlight_strength, main_font_size)
                 * if emphasis { 1.5 } else { 1.0 };
-            let word_position = Point::new(margin_x, top_y);
             let feather = if progress < 0.999 {
                 feather_width.min(fill_width)
             } else {
                 0.0
             };
             let core_end = fill_width - feather;
-            let mut core_mask = PathBuilder::new();
-            let mut feather_masks = [PathBuilder::new(), PathBuilder::new(), PathBuilder::new()];
-            let mut has_core = false;
-            let mut has_feather = [false; 3];
-            let mut word_mask = PathBuilder::new();
+            let is_ref_mode = BASELINE_REFERENCE_MODE.with(Cell::get);
+            let can_merge = !is_ref_mode && feather <= 0.0;
+            let batch_idx = if can_merge {
+                batches.iter().position(|b| {
+                    b.can_merge && (b.lift_offset - lift_offset).abs() <= f32::EPSILON
+                })
+            } else {
+                None
+            };
+            let batch = if let Some(idx) = batch_idx {
+                &mut batches[idx]
+            } else {
+                batches.push(WordBatch {
+                    lift_offset,
+                    can_merge,
+                    word_mask: PathBuilder::new(),
+                    core_mask: PathBuilder::new(),
+                    has_core: false,
+                    feather_masks: [PathBuilder::new(), PathBuilder::new(), PathBuilder::new()],
+                    has_feather: [false; 3],
+                });
+                batches.last_mut().unwrap()
+            };
             let mut cursor = 0.0;
             for text_box in boxes {
                 let rect = text_box.rect;
                 let box_start = cursor;
-                word_mask.add_rect(
+                batch.word_mask.add_rect(
                     Rect::from_xywh(
                         rect.left() + margin_x,
                         top_y + rect.top(),
@@ -965,7 +1118,7 @@ fn draw_line(
                 let core_start = box_start.max(0.0);
                 let core_stop = core_end.min(box_end);
                 if core_stop > core_start {
-                    core_mask.add_rect(
+                    batch.core_mask.add_rect(
                         Rect::from_xywh(
                             rect.left() + margin_x + core_start - box_start,
                             top_y + rect.top(),
@@ -975,7 +1128,7 @@ fn draw_line(
                         None,
                         None,
                     );
-                    has_core = true;
+                    batch.has_core = true;
                 }
                 for level in 0..3 {
                     let edge_start = core_end + feather * level as f32 / 3.0;
@@ -983,7 +1136,7 @@ fn draw_line(
                     let start = edge_start.max(box_start);
                     let stop = edge_stop.min(box_end).min(fill_width);
                     if stop > start {
-                        feather_masks[level].add_rect(
+                        batch.feather_masks[level].add_rect(
                             Rect::from_xywh(
                                 rect.left() + margin_x + start - box_start,
                                 top_y + rect.top(),
@@ -993,41 +1146,64 @@ fn draw_line(
                             None,
                             None,
                         );
-                        has_feather[level] = true;
+                        batch.has_feather[level] = true;
                     }
                 }
                 cursor = box_end;
             }
+        }
+        for mut batch in batches {
+            let word_path = batch.word_mask.detach();
             paint_lifted_highlight_mask(
                 canvas,
-                &word_mask.detach(),
+                &word_path,
                 paragraph,
                 word_position,
-                lift_offset,
+                batch.lift_offset,
                 1.0,
             );
-            if has_core {
-                paint_lifted_highlight_mask(
-                    canvas,
-                    &core_mask.detach(),
-                    active_paragraph,
-                    word_position,
-                    lift_offset,
-                    highlight_strength,
-                );
-            }
-            for level in 0..3 {
-                if has_feather[level] {
-                    let edge_alpha = highlight_strength * (1.0 - (level as f32 + 0.5) / 3.0);
+            let core_path = batch.has_core.then(|| batch.core_mask.detach());
+            let [mut f0, mut f1, mut f2] = batch.feather_masks;
+            let feather_paths = [
+                batch.has_feather[0].then(|| f0.detach()),
+                batch.has_feather[1].then(|| f1.detach()),
+                batch.has_feather[2].then(|| f2.detach()),
+            ];
+            let is_ref_mode = BASELINE_REFERENCE_MODE.with(Cell::get);
+            if is_ref_mode {
+                if let Some(core_path) = core_path.as_ref() {
                     paint_lifted_highlight_mask(
                         canvas,
-                        &feather_masks[level].detach(),
+                        core_path,
                         active_paragraph,
                         word_position,
-                        lift_offset,
-                        edge_alpha,
+                        batch.lift_offset,
+                        highlight_strength,
                     );
                 }
+                for (level, feather_path) in feather_paths.iter().enumerate() {
+                    if let Some(feather_path) = feather_path.as_ref() {
+                        let edge_alpha = highlight_strength * (1.0 - (level as f32 + 0.5) / 3.0);
+                        paint_lifted_highlight_mask(
+                            canvas,
+                            feather_path,
+                            active_paragraph,
+                            word_position,
+                            batch.lift_offset,
+                            edge_alpha,
+                        );
+                    }
+                }
+            } else if core_path.is_some() || feather_paths.iter().any(Option::is_some) {
+                paint_lifted_active_masks(
+                    canvas,
+                    core_path.as_ref(),
+                    &feather_paths,
+                    active_paragraph,
+                    word_position,
+                    batch.lift_offset,
+                    highlight_strength,
+                );
             }
         }
     } else {
@@ -1094,6 +1270,80 @@ fn draw_line(
         margin_x,
         top_y + paragraph.height() + main_font_size * TRANSLATION_GAP_EM * translation_gap_scale,
     );
+}
+
+fn paint_lifted_active_masks(
+    canvas: &Canvas,
+    core_mask: Option<&skia_safe::Path>,
+    feather_masks: &[Option<skia_safe::Path>; 3],
+    paragraph: &Paragraph,
+    position: Point,
+    lift_offset: f32,
+    highlight_strength: f32,
+) {
+    let lower_lift = lift_offset.floor();
+    let fraction = lift_offset - lower_lift;
+    let paint_all = |canvas: &Canvas| {
+        if let Some(core) = core_mask {
+            paint_highlight_mask(canvas, core, paragraph, position, highlight_strength);
+        }
+        for (level, feather) in feather_masks.iter().enumerate() {
+            if let Some(feather) = feather {
+                let edge_alpha = highlight_strength * (1.0 - (level as f32 + 0.5) / 3.0);
+                paint_highlight_mask(canvas, feather, paragraph, position, edge_alpha);
+            }
+        }
+    };
+    if fraction <= f32::EPSILON {
+        let transform = canvas.save();
+        canvas.translate((0.0, -lower_lift));
+        paint_all(canvas);
+        canvas.restore_to_count(transform);
+        return;
+    }
+
+    let mut union_bounds: Option<Rect> = None;
+    for path in core_mask
+        .into_iter()
+        .chain(feather_masks.iter().filter_map(Option::as_ref))
+    {
+        let pb = path.bounds();
+        union_bounds = Some(match union_bounds {
+            Some(mut u) => {
+                u.join(pb);
+                u
+            }
+            None => *pb,
+        });
+    }
+    let Some(raw_bounds) = union_bounds else {
+        return;
+    };
+    let bounds_for_lift = |lift: f32| {
+        Rect::new(
+            raw_bounds.left() - 1.0,
+            raw_bounds.top() - lift - 1.0,
+            raw_bounds.right() + 1.0,
+            raw_bounds.bottom() + 1.0,
+        )
+    };
+    let outer_bounds = bounds_for_lift(lower_lift + 1.0);
+    let interpolation_rec = SaveLayerRec::default().bounds(&outer_bounds);
+    let interpolation_layer = canvas.save_layer(&interpolation_rec);
+    for (lift, weight) in [(lower_lift, 1.0 - fraction), (lower_lift + 1.0, fraction)] {
+        let mut restore_paint = Paint::default();
+        restore_paint.set_alpha_f(weight);
+        restore_paint.set_blend_mode(BlendMode::Plus);
+        let sample_bounds = bounds_for_lift(lift);
+        let sample_rec = SaveLayerRec::default()
+            .bounds(&sample_bounds)
+            .paint(&restore_paint);
+        let sample_layer = canvas.save_layer(&sample_rec);
+        canvas.translate((0.0, -lift));
+        paint_all(canvas);
+        canvas.restore_to_count(sample_layer);
+    }
+    canvas.restore_to_count(interpolation_layer);
 }
 
 fn paint_lifted_highlight_mask(

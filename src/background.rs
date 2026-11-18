@@ -1,17 +1,18 @@
 use crate::geometry::FrameGeometry;
 use crate::image_asset::ImageAsset;
 use anyhow::{Context, Result};
-use skia_safe::canvas::SrcRectConstraint;
+use skia_safe::canvas::{SaveLayerRec, SrcRectConstraint};
 use skia_safe::gradient::shaders::linear_gradient;
 use skia_safe::gradient::{Colors, Gradient};
 use skia_safe::image::CachingHint;
 use skia_safe::image_filters;
 use skia_safe::{
-    AlphaType, Canvas, Color, ColorSpace, ColorType, IPoint, ISize, Image, ImageFilter, ImageInfo,
-    Paint, Point, Rect, TileMode,
+    AlphaType, Canvas, Color, ColorSpace, ColorType, FilterMode, IPoint, ISize, Image, ImageInfo,
+    MipmapMode, Paint, Point, Rect, SamplingOptions, Surface, TileMode,
 };
 const BACKGROUND_ZOOM: f32 = 1.45;
 const BACKGROUND_BLUR_SIGMA: f32 = 96.0;
+const BACKGROUND_DOWNSCALE: f32 = 8.0;
 use std::path::Path;
 
 pub trait BackgroundLayer {
@@ -48,7 +49,8 @@ impl BackgroundRenderer {
         Self::from_image(asset.image().clone())
     }
 
-    pub(crate) fn from_image(image: Image) -> Result<Self> {
+    pub fn from_image_asset_baseline_reference(asset: &ImageAsset) -> Result<Self> {
+        let image = asset.image().clone();
         let image_width = image.width() as f32;
         let image_height = image.height() as f32;
         let sampled_color = sample_image_color(&image).unwrap_or((32, 32, 40));
@@ -58,14 +60,49 @@ impl BackgroundRenderer {
             None,
             None,
         )
-        .context("create background blur filter")?;
+        .context("create baseline background blur filter")?;
+        let pass_paints = [0.80_f32, 0.20_f32].map(|alpha| {
+            let mut paint = Paint::default();
+            paint
+                .set_alpha_f(alpha)
+                .set_image_filter(blur_filter.clone());
+            paint
+        });
         let mut renderer = Self { layers: Vec::new() };
         renderer.add_layer(ImageLayer {
             image,
             image_width,
             image_height,
-            blur_paints: ImageLayer::make_blur_paints(&blur_filter),
+            pass_paints,
+            blur_paint: Paint::default(),
             tint_paint: ImageLayer::make_tint_paint(sampled_color),
+            work_surface: None,
+            use_downscale: false,
+        });
+        renderer.add_layer(FallbackMaskLayer::new());
+        Ok(renderer)
+    }
+
+    pub(crate) fn from_image(image: Image) -> Result<Self> {
+        let image_width = image.width() as f32;
+        let image_height = image.height() as f32;
+        let sampled_color = sample_image_color(&image).unwrap_or((32, 32, 40));
+        let scaled_sigma = BACKGROUND_BLUR_SIGMA / BACKGROUND_DOWNSCALE;
+        let blur_filter =
+            image_filters::blur((scaled_sigma, scaled_sigma), TileMode::Clamp, None, None)
+                .context("create background blur filter")?;
+        let mut blur_paint = Paint::default();
+        blur_paint.set_image_filter(blur_filter);
+        let mut renderer = Self { layers: Vec::new() };
+        renderer.add_layer(ImageLayer {
+            image,
+            image_width,
+            image_height,
+            pass_paints: ImageLayer::make_pass_paints(),
+            blur_paint,
+            tint_paint: ImageLayer::make_tint_paint(sampled_color),
+            work_surface: None,
+            use_downscale: true,
         });
         renderer.add_layer(FallbackMaskLayer::new());
         Ok(renderer)
@@ -176,17 +213,18 @@ struct ImageLayer {
     image: Image,
     image_width: f32,
     image_height: f32,
-    blur_paints: [Paint; 2],
+    pass_paints: [Paint; 2],
+    blur_paint: Paint,
     tint_paint: Paint,
+    work_surface: Option<(i32, i32, Surface)>,
+    use_downscale: bool,
 }
 
 impl ImageLayer {
-    fn make_blur_paints(blur_filter: &ImageFilter) -> [Paint; 2] {
+    fn make_pass_paints() -> [Paint; 2] {
         [0.80_f32, 0.20_f32].map(|alpha| {
             let mut paint = Paint::default();
-            paint
-                .set_alpha_f(alpha)
-                .set_image_filter(blur_filter.clone());
+            paint.set_alpha_f(alpha);
             paint
         })
     }
@@ -226,23 +264,72 @@ impl BackgroundLayer for ImageLayer {
             visible_w.min(iw),
             visible_h.min(ih),
         );
-        let center = Point::new(dst.center_x(), dst.center_y());
+        let work_w = (dst.width() / BACKGROUND_DOWNSCALE).ceil().max(16.0) as i32;
+        let work_h = (dst.height() / BACKGROUND_DOWNSCALE).ceil().max(16.0) as i32;
+        let needs_surface = self.use_downscale
+            && match &self.work_surface {
+                Some((w, h, _)) => *w != work_w || *h != work_h,
+                None => true,
+            };
+        if needs_surface {
+            let info = canvas.image_info().with_dimensions((work_w, work_h));
+            if let Some(surface) = canvas.new_surface(&info, None) {
+                self.work_surface = Some((work_w, work_h, surface));
+            }
+        }
         let phase = t_ms as f32 / 9_000.0;
         let passes = [
             (0.0, 1.0, 0.80),
             ((phase * 1.7).sin() * 4.0 - 2.0, 1.08, 0.20),
         ];
-        for (index, (angle, pass_scale, _alpha)) in passes.into_iter().enumerate() {
-            let saved = canvas.save();
-            canvas.rotate(angle, Some(center));
-            canvas.scale((pass_scale, pass_scale));
-            canvas.draw_image_rect(
-                &self.image,
-                Some((&src, SrcRectConstraint::Strict)),
-                &dst,
-                &self.blur_paints[index],
+        let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
+        if self.use_downscale
+            && let Some((_, _, work_surface)) = &mut self.work_surface
+        {
+            let work_dst = Rect::from_xywh(0.0, 0.0, work_w as f32, work_h as f32);
+            let work_center = Point::new(work_dst.center_x(), work_dst.center_y());
+            let work_canvas = work_surface.canvas();
+            work_canvas.clear(Color::BLACK);
+            let layer_rec = SaveLayerRec::default()
+                .bounds(&work_dst)
+                .paint(&self.blur_paint);
+            let layer = work_canvas.save_layer(&layer_rec);
+            for (index, (angle, pass_scale, _alpha)) in passes.into_iter().enumerate() {
+                let saved = work_canvas.save();
+                work_canvas.rotate(angle, Some(work_center));
+                work_canvas.scale((pass_scale, pass_scale));
+                work_canvas.draw_image_rect_with_sampling_options(
+                    &self.image,
+                    Some((&src, SrcRectConstraint::Fast)),
+                    work_dst,
+                    sampling,
+                    &self.pass_paints[index],
+                );
+                work_canvas.restore_to_count(saved);
+            }
+            work_canvas.restore_to_count(layer);
+            let blurred = work_surface.image_snapshot();
+            canvas.draw_image_rect_with_sampling_options(
+                &blurred,
+                None,
+                dst,
+                sampling,
+                &Paint::default(),
             );
-            canvas.restore_to_count(saved);
+        } else {
+            let center = Point::new(dst.center_x(), dst.center_y());
+            for (index, (angle, pass_scale, _alpha)) in passes.into_iter().enumerate() {
+                let saved = canvas.save();
+                canvas.rotate(angle, Some(center));
+                canvas.scale((pass_scale, pass_scale));
+                canvas.draw_image_rect(
+                    &self.image,
+                    Some((&src, SrcRectConstraint::Strict)),
+                    &dst,
+                    &self.pass_paints[index],
+                );
+                canvas.restore_to_count(saved);
+            }
         }
         canvas.draw_rect(dst, &self.tint_paint);
         Ok(())
