@@ -1,7 +1,9 @@
 use crate::frame::{FrameSink, RenderedFrame};
 use anyhow::{Context, Result, bail};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::LazyLock;
 
@@ -397,10 +399,83 @@ fn video_writer_command(
     command
 }
 
+fn video_writer_command_hevc(
+    output: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    audio: Option<&Path>,
+) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command.args(["-y", "-hide_banner", "-loglevel", "error"]);
+    command.args([
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-s",
+        &format!("{width}x{height}"),
+        "-r",
+        &fps.to_string(),
+        "-i",
+        "pipe:0",
+    ]);
+    if let Some(audio) = audio {
+        command
+            .arg("-i")
+            .arg(audio)
+            .args(["-map", "0:v:0", "-map", "1:a:0"]);
+    }
+    #[cfg(target_os = "macos")]
+    if encoder_available("hevc_videotoolbox") {
+        command.args([
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "hevc_videotoolbox",
+            "-b:v",
+            "8M",
+            "-tag:v",
+            "hvc1",
+        ]);
+    } else {
+        command.args([
+            "-pix_fmt", "yuv420p", "-c:v", "libx265", "-preset", "veryfast", "-crf", "22",
+            "-tag:v", "hvc1",
+        ]);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        command.args([
+            "-pix_fmt", "yuv420p", "-c:v", "libx265", "-preset", "veryfast", "-crf", "22",
+            "-tag:v", "hvc1",
+        ]);
+    }
+    if audio.is_some() {
+        command.args(["-c:a", "aac", "-b:a", "192k"]);
+    }
+    command.args(["-movflags", "+faststart"]);
+    if audio.is_some() {
+        command.arg("-shortest");
+    }
+    command.arg(output);
+    command
+}
+
 impl FfmpegPipe {
-    fn new(output: &Path, width: u32, height: u32, fps: u32, audio: Option<&Path>) -> Result<Self> {
-        let mut command =
-            video_writer_command(output, width, height, fps, audio, &PREFERRED_VIDEO_ENCODER);
+    fn new_with_codec(
+        output: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: Option<&Path>,
+        codec: crate::encoder::VideoCodec,
+    ) -> Result<Self> {
+        let mut command = if codec == crate::encoder::VideoCodec::Hevc {
+            video_writer_command_hevc(output, width, height, fps, audio)
+        } else {
+            video_writer_command(output, width, height, fps, audio, &PREFERRED_VIDEO_ENCODER)
+        };
         command.stdin(Stdio::piped()).stderr(Stdio::inherit());
         let command_display = format!("{command:?}");
         let mut child = command
@@ -476,7 +551,25 @@ impl PipeEncoder {
         fps: u32,
         audio: Option<&Path>,
     ) -> Result<Self> {
-        let writer = FfmpegPipe::new(output, width, height, fps, audio)?;
+        Self::new_with_codec(
+            output,
+            width,
+            height,
+            fps,
+            audio,
+            crate::encoder::VideoCodec::H264,
+        )
+    }
+
+    pub fn new_with_codec(
+        output: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: Option<&Path>,
+        codec: crate::encoder::VideoCodec,
+    ) -> Result<Self> {
+        let writer = FfmpegPipe::new_with_codec(output, width, height, fps, audio, codec)?;
         let (sender, frames) = std::sync::mpsc::sync_channel::<RenderedFrame>(FRAME_QUEUE_CAPACITY);
         let (recycle_sender, recycled) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
@@ -567,13 +660,35 @@ pub fn create_encoder(
     fps: u32,
     audio: Option<&Path>,
 ) -> Result<Box<dyn FrameSink>> {
+    create_encoder_with_codec(
+        backend,
+        crate::encoder::VideoCodec::H264,
+        output,
+        width,
+        height,
+        fps,
+        audio,
+    )
+}
+
+pub fn create_encoder_with_codec(
+    backend: crate::encoder::EncoderBackend,
+    codec: crate::encoder::VideoCodec,
+    output: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    audio: Option<&Path>,
+) -> Result<Box<dyn FrameSink>> {
     match backend {
-        crate::encoder::EncoderBackend::Pipe => Ok(Box::new(PipeEncoder::new(
-            output, width, height, fps, audio,
+        crate::encoder::EncoderBackend::Pipe => Ok(Box::new(PipeEncoder::new_with_codec(
+            output, width, height, fps, audio, codec,
         )?)),
-        crate::encoder::EncoderBackend::FfmpegNext => Ok(Box::new(
-            crate::encoder::FfmpegNextEncoder::new(output, width, height, fps, audio)?,
-        )),
+        crate::encoder::EncoderBackend::FfmpegNext => {
+            Ok(Box::new(crate::encoder::FfmpegNextEncoder::new_with_codec(
+                output, width, height, fps, audio, codec,
+            )?))
+        }
     }
 }
 

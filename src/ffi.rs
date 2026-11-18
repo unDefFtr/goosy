@@ -179,6 +179,13 @@ fn request_options(request: &str) -> Result<RenderOptions, String> {
         "yrc" => LyricFormat::Yrc,
         other => return Err(format!("unsupported lyric format: {other}")),
     };
+    if let Some(codec) = object.get("codec").and_then(serde_json::Value::as_str) {
+        options.codec = match codec {
+            "h264" | "avc" => crate::VideoCodec::H264,
+            "hevc" | "h265" => crate::VideoCodec::Hevc,
+            other => return Err(format!("unsupported video codec: {other}")),
+        };
+    }
     Ok(options)
 }
 

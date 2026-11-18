@@ -31,6 +31,25 @@ enum LyricFormat {
     Ttml,
     Yrc,
 }
+
+#[cfg(not(target_os = "windows"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum CliVideoCodec {
+    #[default]
+    H264,
+    #[value(alias = "h265")]
+    Hevc,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl From<CliVideoCodec> for libgoosy::VideoCodec {
+    fn from(value: CliVideoCodec) -> Self {
+        match value {
+            CliVideoCodec::H264 => Self::H264,
+            CliVideoCodec::Hevc => Self::Hevc,
+        }
+    }
+}
 #[cfg(target_os = "windows")]
 #[derive(Parser)]
 #[command(name = "goosy", about = "GoosyRenderer GUI")]
@@ -115,6 +134,8 @@ enum Command {
         progress_events: bool,
         #[arg(long, value_enum, default_value_t = LyricFormat::Auto)]
         format: LyricFormat,
+        #[arg(long, value_enum, default_value_t = CliVideoCodec::H264)]
+        codec: CliVideoCodec,
     },
     Pdf {
         song: PathBuf,
@@ -195,6 +216,7 @@ fn main() -> Result<()> {
             no_background_vocal,
             exclude_lines,
             format,
+            codec,
         } => render(
             song,
             lyrics,
@@ -222,6 +244,7 @@ fn main() -> Result<()> {
             no_background_vocal,
             exclude_lines,
             format,
+            codec.into(),
         ),
     }
 }
@@ -293,6 +316,7 @@ fn render(
     no_background_vocal: bool,
     exclude_lines: Vec<usize>,
     format: LyricFormat,
+    codec: libgoosy::VideoCodec,
 ) -> Result<()> {
     if width == 0 || height == 0 || fps == 0 {
         bail!("width, height, and fps must be positive");
@@ -385,8 +409,14 @@ fn render(
     emit_render_stage(progress_events, "starting-ffmpeg", "正在启动 FFmpeg")?;
     #[cfg(target_os = "linux")]
     eprintln!("video encoder: {}", video::preferred_video_encoder_name());
-    let mut sink = video::create_encoder(
-        libgoosy::EncoderBackend::Pipe,
+    let encoder_backend = if cfg!(target_os = "macos") {
+        libgoosy::EncoderBackend::FfmpegNext
+    } else {
+        libgoosy::EncoderBackend::Pipe
+    };
+    let mut sink = video::create_encoder_with_codec(
+        encoder_backend,
+        codec,
         &output,
         width,
         height,
@@ -408,10 +438,11 @@ fn render(
     let mut frame_buffer = RenderedFrame::new(width, height);
     let render_started = Instant::now();
     let progress_interval = (fps as u64 / 10).max(1);
+    let read_cpu_pixels = encoder_backend == libgoosy::EncoderBackend::Pipe;
     for frame_index in 0..total_frames {
         let t_ms = frame_index * 1_000 / fps as u64;
         renderer
-            .render_frame_into(t_ms, &mut frame_buffer)
+            .render_frame_into_opts(t_ms, &mut frame_buffer, read_cpu_pixels)
             .with_context(|| format!("渲染第 {} 帧（{} ms）", frame_index + 1, t_ms))?;
         frame_buffer = sink
             .submit(frame_buffer)

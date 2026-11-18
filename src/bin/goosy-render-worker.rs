@@ -2,7 +2,9 @@ use anyhow::Result;
 #[cfg(target_os = "windows")]
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use libgoosy::{EncoderBackend, LyricFormat, LyricsStyle, RenderControl, RenderOptions};
+use libgoosy::{
+    EncoderBackend, LyricFormat, LyricsStyle, RenderControl, RenderOptions, VideoCodec,
+};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -84,6 +86,8 @@ enum Command {
         preview_interval: u64,
         #[arg(long, hide = true, value_enum, default_value_t = WorkerEncoder::Pipe)]
         encoder: WorkerEncoder,
+        #[arg(long, hide = true, value_enum, default_value_t = WorkerCodec::H264)]
+        codec: WorkerCodec,
         #[arg(long, value_enum, default_value_t = WorkerLyricFormat::Auto)]
         format: WorkerLyricFormat,
     },
@@ -158,6 +162,23 @@ impl From<WorkerEncoder> for EncoderBackend {
         match value {
             WorkerEncoder::Pipe => Self::Pipe,
             WorkerEncoder::FfmpegNext => Self::FfmpegNext,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum, Eq, PartialEq)]
+enum WorkerCodec {
+    #[default]
+    H264,
+    #[value(alias = "h265")]
+    Hevc,
+}
+
+impl From<WorkerCodec> for VideoCodec {
+    fn from(value: WorkerCodec) -> Self {
+        match value {
+            WorkerCodec::H264 => Self::H264,
+            WorkerCodec::Hevc => Self::Hevc,
         }
     }
 }
@@ -389,6 +410,7 @@ fn main() -> Result<()> {
             preview_interval,
             format,
             encoder,
+            codec,
         } => {
             ensure_renderer_backend(width, height, fps, progress_events)?;
             emit_stage(
@@ -427,6 +449,7 @@ fn main() -> Result<()> {
                 sample_start_ms,
                 sample_duration_ms,
                 encoder: encoder.into(),
+                codec: codec.into(),
             };
             let mut preview_dir = preview_dir;
             let mut preview_pixels = Vec::new();
@@ -443,8 +466,12 @@ fn main() -> Result<()> {
                 "video encoder: {}",
                 libgoosy::video::preferred_video_encoder_name()
             );
-            let stats = libgoosy::render_with_frame_progress_control_stats(
+            let has_preview = preview_dir.is_some();
+            let _stats = libgoosy::render_with_frame_progress_control_stats_lazy(
                 &options,
+                move |done, total| {
+                    has_preview && (done == 1 || done == total || done % preview_interval == 0)
+                },
                 |done, total, elapsed, pixels| {
                     if progress_events {
                         println!("GOOSY_PROGRESS {done} {total} {elapsed:.3}");
@@ -504,7 +531,7 @@ fn main() -> Result<()> {
             {
                 println!(
                     "GOOSY_COMPLETE {} {:.3}",
-                    stats.frames, stats.elapsed_seconds
+                    _stats.frames, _stats.elapsed_seconds
                 );
                 std::io::stdout().flush()?;
             }
