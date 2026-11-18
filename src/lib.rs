@@ -29,7 +29,7 @@ pub static NvOptimusEnablement: u32 = 1;
 #[unsafe(no_mangle)]
 pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 pub use anyhow::Result;
-pub use encoder::EncoderBackend;
+pub use encoder::{EncoderBackend, VideoCodec};
 pub use frame::{FrameSink, RenderedFrame};
 use indicatif::{ProgressBar, ProgressStyle};
 pub use lrc::{BackgroundVocal, LyricLine, LyricWord};
@@ -69,6 +69,7 @@ pub struct RenderOptions {
     pub sample_start_ms: Option<u64>,
     pub sample_duration_ms: Option<u64>,
     pub encoder: encoder::EncoderBackend,
+    pub codec: encoder::VideoCodec,
 }
 impl RenderOptions {
     pub fn new(song: impl Into<PathBuf>, output: impl Into<PathBuf>) -> Self {
@@ -91,7 +92,12 @@ impl RenderOptions {
             format: LyricFormat::Auto,
             sample_start_ms: None,
             sample_duration_ms: None,
-            encoder: encoder::EncoderBackend::Pipe,
+            encoder: if cfg!(target_os = "macos") {
+                encoder::EncoderBackend::FfmpegNext
+            } else {
+                encoder::EncoderBackend::Pipe
+            },
+            codec: encoder::VideoCodec::H264,
         }
     }
 }
@@ -121,13 +127,15 @@ pub fn render_with_progress<F>(options: &RenderOptions, mut on_progress: F) -> a
 where
     F: FnMut(u64, u64, f64),
 {
-    render_with_frame_progress_control(
+    render_with_frame_progress_control_stats_lazy(
         options,
+        |_, _| false,
         |done, total, elapsed, _pixels| {
             on_progress(done, total, elapsed);
         },
         || RenderControl::Continue,
     )
+    .map(|_| ())
 }
 
 pub fn render_with_frame_progress<F>(options: &RenderOptions, on_frame: F) -> anyhow::Result<()>
@@ -157,10 +165,25 @@ where
 
 pub fn render_with_frame_progress_control_stats<F, C>(
     options: &RenderOptions,
+    on_frame: F,
+    control: C,
+) -> anyhow::Result<RenderStats>
+where
+    F: FnMut(u64, u64, f64, &[u8]),
+    C: FnMut() -> RenderControl,
+{
+    let need_cpu = !cfg!(target_os = "macos") || options.encoder == EncoderBackend::Pipe;
+    render_with_frame_progress_control_stats_lazy(options, move |_, _| need_cpu, on_frame, control)
+}
+
+pub fn render_with_frame_progress_control_stats_lazy<P, F, C>(
+    options: &RenderOptions,
+    mut need_pixels: P,
     mut on_frame: F,
     mut control: C,
 ) -> anyhow::Result<RenderStats>
 where
+    P: FnMut(u64, u64) -> bool,
     F: FnMut(u64, u64, f64, &[u8]),
     C: FnMut() -> RenderControl,
 {
@@ -224,8 +247,9 @@ where
         options.lyrics_style,
         &options.excluded_lines,
     )?;
-    let mut sink = video::create_encoder(
+    let mut sink = video::create_encoder_with_codec(
         options.encoder,
+        options.codec,
         &options.output,
         options.width,
         options.height,
@@ -245,7 +269,9 @@ where
             }
         }
         let t_ms = render_start_ms + frame_index * 1_000 / options.fps as u64;
-        renderer.render_frame_into(t_ms, &mut frame)?;
+        let read_cpu_pixels =
+            options.encoder == EncoderBackend::Pipe || need_pixels(frame_index + 1, total_frames);
+        renderer.render_frame_into_opts(t_ms, &mut frame, read_cpu_pixels)?;
         progress.inc(1);
         on_frame(
             frame_index + 1,

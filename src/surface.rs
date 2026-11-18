@@ -154,6 +154,32 @@ impl SurfaceRenderer {
             Backend::Metal(metal) => metal.render_into(info, row_bytes, pixels, draw),
         }
     }
+
+    pub fn render_into_frame<F>(
+        &mut self,
+        info: &ImageInfo,
+        row_bytes: usize,
+        frame: &mut crate::frame::RenderedFrame,
+        read_cpu_pixels: bool,
+        draw: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Canvas) -> Result<()>,
+    {
+        #[cfg(target_os = "macos")]
+        if let Backend::Metal(metal) = &mut self.backend {
+            let gpu_frame = metal.render_gpu_frame(
+                info,
+                row_bytes,
+                read_cpu_pixels.then(|| frame.pixels_mut()),
+                draw,
+            )?;
+            frame.set_gpu_frame(gpu_frame);
+            return Ok(());
+        }
+        let _ = read_cpu_pixels;
+        self.render_into(info, row_bytes, frame.pixels_mut(), draw)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -860,74 +886,710 @@ fn load_angle_egl() -> Option<khronos_egl::DynamicInstance<khronos_egl::EGL1_5>>
 }
 
 #[cfg(target_os = "macos")]
-struct MetalBackend {
-    context: skia_safe::gpu::DirectContext,
-    _backend: skia_safe::gpu::mtl::BackendContext,
-    _queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
-    surface: Option<Surface>,
+mod macos_metal {
+    use super::{GPU_RESOURCE_CACHE_BYTES, read_pixels_into};
+    use anyhow::{Context, Result, bail};
+    use objc2::{
+        Encode, Encoding, msg_send,
+        rc::{Retained, autoreleasepool},
+        runtime::{AnyClass, AnyObject, ProtocolObject},
+    };
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat,
+    };
+    use skia_safe::{
+        Canvas, ColorSpace, ColorType, ImageInfo, Surface,
+        gpu::{self, Budgeted, SurfaceOrigin, mtl},
+    };
+    use std::ffi::{CString, c_void};
+    use std::ptr::{null, null_mut};
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFBooleanTrue: *const c_void;
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+
+        fn CFDictionaryCreateMutable(
+            allocator: *const c_void,
+            capacity: isize,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> *mut c_void;
+        fn CFDictionarySetValue(dict: *mut c_void, key: *const c_void, value: *const c_void);
+        fn CFNumberCreate(
+            allocator: *const c_void,
+            the_type: isize,
+            value_ptr: *const c_void,
+        ) -> *mut c_void;
+        pub(crate) fn CFRelease(cf: *const c_void);
+    }
+
+    #[link(name = "CoreVideo", kind = "framework")]
+    unsafe extern "C" {
+        static kCVPixelBufferPixelFormatTypeKey: *const c_void;
+        static kCVPixelBufferWidthKey: *const c_void;
+        static kCVPixelBufferHeightKey: *const c_void;
+        static kCVPixelBufferMetalCompatibilityKey: *const c_void;
+        static kCVPixelBufferIOSurfacePropertiesKey: *const c_void;
+
+        fn CVPixelBufferPoolCreate(
+            allocator: *const c_void,
+            pool_attributes: *const c_void,
+            pixel_buffer_attributes: *const c_void,
+            pool_out: *mut *mut c_void,
+        ) -> i32;
+        pub(crate) fn CVPixelBufferPoolCreatePixelBuffer(
+            allocator: *const c_void,
+            pool: *mut c_void,
+            pixel_buffer_out: *mut *mut c_void,
+        ) -> i32;
+        pub(crate) fn CVPixelBufferRelease(buffer: *mut c_void);
+        fn CVPixelBufferGetIOSurface(buffer: *mut c_void) -> *mut c_void;
+
+        fn CVMetalTextureCacheCreate(
+            allocator: *const c_void,
+            cache_attributes: *const c_void,
+            metal_device: *mut c_void,
+            texture_attributes: *const c_void,
+            cache_out: *mut *mut c_void,
+        ) -> i32;
+        fn CVMetalTextureCacheCreateTextureFromImage(
+            allocator: *const c_void,
+            texture_cache: *mut c_void,
+            source_image: *mut c_void,
+            texture_attributes: *const c_void,
+            pixel_format: usize,
+            width: usize,
+            height: usize,
+            plane_index: usize,
+            texture_out: *mut *mut c_void,
+        ) -> i32;
+        fn CVMetalTextureGetTexture(image: *mut c_void) -> *mut c_void;
+        fn CVMetalTextureCacheFlush(texture_cache: *mut c_void, options: u64);
+    }
+
+    #[link(name = "IOSurface", kind = "framework")]
+    unsafe extern "C" {
+        fn IOSurfaceGetID(buffer: *mut c_void) -> u32;
+    }
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    static POOL_ACQUIRED: AtomicU64 = AtomicU64::new(0);
+    static POOL_RELEASED: AtomicU64 = AtomicU64::new(0);
+    static SEEN_IOSURFACE_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct MacosPoolTelemetry {
+        pub acquired_count: u64,
+        pub released_count: u64,
+        pub in_flight_count: u64,
+        pub unique_iosurface_count: usize,
+    }
+
+    pub fn macos_pool_telemetry() -> MacosPoolTelemetry {
+        let acquired = POOL_ACQUIRED.load(AtomicOrdering::Relaxed);
+        let released = POOL_RELEASED.load(AtomicOrdering::Relaxed);
+        let unique = SEEN_IOSURFACE_IDS.lock().map(|ids| ids.len()).unwrap_or(0);
+        MacosPoolTelemetry {
+            acquired_count: acquired,
+            released_count: released,
+            in_flight_count: acquired.saturating_sub(released),
+            unique_iosurface_count: unique,
+        }
+    }
+
+    pub fn reset_macos_pool_telemetry() {
+        POOL_ACQUIRED.store(0, AtomicOrdering::Relaxed);
+        POOL_RELEASED.store(0, AtomicOrdering::Relaxed);
+        if let Ok(mut ids) = SEEN_IOSURFACE_IDS.lock() {
+            ids.clear();
+        }
+    }
+
+    pub(crate) unsafe fn record_pool_acquire(pb: *mut c_void) {
+        POOL_ACQUIRED.fetch_add(1, AtomicOrdering::Relaxed);
+        if !pb.is_null() {
+            let ios = unsafe { CVPixelBufferGetIOSurface(pb) };
+            if !ios.is_null() {
+                let id = unsafe { IOSurfaceGetID(ios) };
+                if let Ok(mut ids) = SEEN_IOSURFACE_IDS.lock()
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+
+    pub(crate) unsafe fn release_tracked_pixel_buffer(pb: *mut c_void) {
+        if !pb.is_null() {
+            POOL_RELEASED.fetch_add(1, AtomicOrdering::Relaxed);
+            unsafe { CVPixelBufferRelease(pb) };
+        }
+    }
+
+    const K_CF_NUMBER_SINT32_TYPE: isize = 3;
+    const K_CV_PIXEL_FORMAT_420_YP_CB_CR_8_BI_PLANAR_VIDEO_RANGE: i32 = 0x34323076; // '420v'
+    const RING_SIZE: usize = 3;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MTLSize {
+        width: usize,
+        height: usize,
+        depth: usize,
+    }
+
+    unsafe impl Encode for MTLSize {
+        const ENCODING: Encoding = Encoding::Struct(
+            "MTLSize",
+            &[usize::ENCODING, usize::ENCODING, usize::ENCODING],
+        );
+    }
+
+    const METAL_SHADER_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rgba_to_nv12(
+    texture2d<float, access::read> rgba_tex [[texture(0)]],
+    texture2d<float, access::write> y_tex [[texture(1)]],
+    texture2d<float, access::write> uv_tex [[texture(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint width = y_tex.get_width();
+    uint height = y_tex.get_height();
+    uint x = gid.x * 2;
+    uint y = gid.y * 2;
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    float4 p00 = rgba_tex.read(uint2(x, y));
+    float4 p10 = rgba_tex.read(uint2(min(x + 1, width - 1), y));
+    float4 p01 = rgba_tex.read(uint2(x, min(y + 1, height - 1)));
+    float4 p11 = rgba_tex.read(uint2(min(x + 1, width - 1), min(y + 1, height - 1)));
+
+    const float3 y_coeff = float3(0.25678824, 0.50412941, 0.09790588);
+    const float y_offset = 16.0 / 255.0;
+
+    y_tex.write(float4(dot(p00.rgb, y_coeff) + y_offset, 0.0, 0.0, 1.0), uint2(x, y));
+    if (x + 1 < width) {
+        y_tex.write(float4(dot(p10.rgb, y_coeff) + y_offset, 0.0, 0.0, 1.0), uint2(x + 1, y));
+    }
+    if (y + 1 < height) {
+        y_tex.write(float4(dot(p01.rgb, y_coeff) + y_offset, 0.0, 0.0, 1.0), uint2(x, y + 1));
+    }
+    if (x + 1 < width && y + 1 < height) {
+        y_tex.write(float4(dot(p11.rgb, y_coeff) + y_offset, 0.0, 0.0, 1.0), uint2(x + 1, y + 1));
+    }
+
+    float3 avg_rgb = 0.25 * (p00.rgb + p10.rgb + p01.rgb + p11.rgb);
+    const float3 u_coeff = float3(-0.14822353, -0.29099216, 0.43921569);
+    const float3 v_coeff = float3(0.43921569, -0.36778824, -0.07142745);
+    float u = dot(avg_rgb, u_coeff) + (128.0 / 255.0);
+    float v = dot(avg_rgb, v_coeff) + (128.0 / 255.0);
+
+    uv_tex.write(float4(u, v, 0.0, 1.0), gid);
+}
+"#;
+
+    pub struct MacosGpuFrame {
+        pixel_buffer: *mut c_void,
+        cmd_buf: *mut c_void,
+    }
+
+    unsafe impl Send for MacosGpuFrame {}
+    unsafe impl Sync for MacosGpuFrame {}
+
+    impl MacosGpuFrame {
+        pub(crate) fn wait_and_take_pixel_buffer(&mut self) -> *mut c_void {
+            if !self.cmd_buf.is_null() {
+                autoreleasepool(|_| {
+                    let cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>> = unsafe {
+                        Retained::from_raw(
+                            self.cmd_buf as *mut ProtocolObject<dyn MTLCommandBuffer>,
+                        )
+                        .expect("non-null MTLCommandBuffer")
+                    };
+                    cmd.waitUntilCompleted();
+                });
+                self.cmd_buf = null_mut();
+            }
+            let pb = self.pixel_buffer;
+            self.pixel_buffer = null_mut();
+            pb
+        }
+    }
+
+    impl Drop for MacosGpuFrame {
+        fn drop(&mut self) {
+            if !self.cmd_buf.is_null() {
+                autoreleasepool(|_| {
+                    let cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>> = unsafe {
+                        Retained::from_raw(
+                            self.cmd_buf as *mut ProtocolObject<dyn MTLCommandBuffer>,
+                        )
+                        .expect("non-null MTLCommandBuffer")
+                    };
+                    cmd.waitUntilCompleted();
+                });
+                self.cmd_buf = null_mut();
+            }
+            if !self.pixel_buffer.is_null() {
+                unsafe { release_tracked_pixel_buffer(self.pixel_buffer) };
+                self.pixel_buffer = null_mut();
+            }
+        }
+    }
+
+    struct RingSlot {
+        texture: Retained<AnyObject>,
+        surface: Surface,
+        last_cmd_buf: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    }
+
+    struct Nv12Converter {
+        width: u32,
+        height: u32,
+        pool: *mut c_void,
+        tex_cache: *mut c_void,
+        pipeline: Retained<AnyObject>,
+        slots: Vec<RingSlot>,
+        next_slot: usize,
+    }
+
+    impl Drop for Nv12Converter {
+        fn drop(&mut self) {
+            for slot in &mut self.slots {
+                if let Some(cmd) = slot.last_cmd_buf.take() {
+                    cmd.waitUntilCompleted();
+                }
+            }
+            self.slots.clear();
+            if !self.pool.is_null() {
+                unsafe { CFRelease(self.pool) };
+                self.pool = null_mut();
+            }
+            if !self.tex_cache.is_null() {
+                unsafe { CFRelease(self.tex_cache) };
+                self.tex_cache = null_mut();
+            }
+        }
+    }
+
+    unsafe fn create_nsstring(s: &str) -> Retained<AnyObject> {
+        let cstr = CString::new(s).unwrap();
+        let cls = AnyClass::get(c"NSString").unwrap();
+        let obj: *mut AnyObject = unsafe { msg_send![cls, stringWithUTF8String: cstr.as_ptr()] };
+        unsafe { Retained::retain(obj).unwrap() }
+    }
+
+    unsafe fn compile_compute_pipeline(
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<Retained<AnyObject>> {
+        let src = unsafe { create_nsstring(METAL_SHADER_SRC) };
+        let mut err: *mut AnyObject = null_mut();
+        let library: *mut AnyObject = unsafe {
+            msg_send![device, newLibraryWithSource: &*src, options: null::<AnyObject>(), error: &mut err]
+        };
+        if library.is_null() {
+            bail!("failed to compile Metal RGBA->NV12 shader library");
+        }
+        let library = unsafe { Retained::from_raw(library).unwrap() };
+        let fn_name = unsafe { create_nsstring("rgba_to_nv12") };
+        let func: *mut AnyObject = unsafe { msg_send![&*library, newFunctionWithName: &*fn_name] };
+        if func.is_null() {
+            bail!("failed to find rgba_to_nv12 Metal kernel");
+        }
+        let func = unsafe { Retained::from_raw(func).unwrap() };
+        let mut err: *mut AnyObject = null_mut();
+        let pipeline: *mut AnyObject = unsafe {
+            msg_send![device, newComputePipelineStateWithFunction: &*func, error: &mut err]
+        };
+        if pipeline.is_null() {
+            bail!("failed to create rgba_to_nv12 compute pipeline state");
+        }
+        Ok(unsafe { Retained::from_raw(pipeline).unwrap() })
+    }
+
+    unsafe fn create_render_texture(
+        device: &ProtocolObject<dyn MTLDevice>,
+        width: u32,
+        height: u32,
+    ) -> Result<Retained<AnyObject>> {
+        let cls = AnyClass::get(c"MTLTextureDescriptor").unwrap();
+        let desc: *mut AnyObject = unsafe {
+            msg_send![
+                cls,
+                texture2DDescriptorWithPixelFormat: MTLPixelFormat::RGBA8Unorm,
+                width: width as usize,
+                height: height as usize,
+                mipmapped: false
+            ]
+        };
+        // MTLTextureUsageShaderRead (1) | MTLTextureUsageRenderTarget (4) = 5
+        let _: () = unsafe { msg_send![desc, setUsage: 5usize] };
+        // MTLStorageModePrivate = 2
+        let _: () = unsafe { msg_send![desc, setStorageMode: 2usize] };
+        let tex: *mut AnyObject = unsafe { msg_send![device, newTextureWithDescriptor: desc] };
+        if tex.is_null() {
+            bail!("failed to allocate Metal render texture");
+        }
+        Ok(unsafe { Retained::from_raw(tex).unwrap() })
+    }
+
+    pub(crate) unsafe fn create_pixel_buffer_pool(width: u32, height: u32) -> Result<*mut c_void> {
+        unsafe {
+            let dict = CFDictionaryCreateMutable(
+                null(),
+                0,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            );
+            let fmt = K_CV_PIXEL_FORMAT_420_YP_CB_CR_8_BI_PLANAR_VIDEO_RANGE;
+            let fmt_num = CFNumberCreate(
+                null(),
+                K_CF_NUMBER_SINT32_TYPE,
+                &fmt as *const _ as *const c_void,
+            );
+            let w = width as i32;
+            let w_num = CFNumberCreate(
+                null(),
+                K_CF_NUMBER_SINT32_TYPE,
+                &w as *const _ as *const c_void,
+            );
+            let h = height as i32;
+            let h_num = CFNumberCreate(
+                null(),
+                K_CF_NUMBER_SINT32_TYPE,
+                &h as *const _ as *const c_void,
+            );
+            let io_props = CFDictionaryCreateMutable(
+                null(),
+                0,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            );
+
+            CFDictionarySetValue(dict, kCVPixelBufferPixelFormatTypeKey, fmt_num);
+            CFDictionarySetValue(dict, kCVPixelBufferWidthKey, w_num);
+            CFDictionarySetValue(dict, kCVPixelBufferHeightKey, h_num);
+            CFDictionarySetValue(dict, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
+            CFDictionarySetValue(dict, kCVPixelBufferIOSurfacePropertiesKey, io_props);
+
+            let mut pool: *mut c_void = null_mut();
+            let status = CVPixelBufferPoolCreate(null(), null(), dict, &mut pool);
+
+            CFRelease(fmt_num);
+            CFRelease(w_num);
+            CFRelease(h_num);
+            CFRelease(io_props);
+            CFRelease(dict);
+
+            if status != 0 || pool.is_null() {
+                bail!("CVPixelBufferPoolCreate failed with status {status}");
+            }
+            Ok(pool)
+        }
+    }
+
+    pub(super) struct MetalBackend {
+        nv12: Option<Nv12Converter>,
+        surface: Option<Surface>,
+        context: skia_safe::gpu::DirectContext,
+        _backend: skia_safe::gpu::mtl::BackendContext,
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    }
+
+    impl Drop for MetalBackend {
+        fn drop(&mut self) {
+            autoreleasepool(|_| {
+                self.nv12.take();
+                self.surface.take();
+                self.context.flush_submit_and_sync_cpu();
+                self.context.free_gpu_resources();
+            });
+        }
+    }
+
+    impl MetalBackend {
+        pub(super) fn new() -> Option<Self> {
+            let device = MTLCreateSystemDefaultDevice()?;
+            let queue = device.newCommandQueue()?;
+            let backend = unsafe {
+                mtl::BackendContext::new(
+                    Retained::as_ptr(&device) as mtl::Handle,
+                    Retained::as_ptr(&queue) as mtl::Handle,
+                )
+            };
+            let mut context = gpu::direct_contexts::make_metal(&backend, None)?;
+            context.set_resource_cache_limits(skia_safe::gpu::ganesh::ResourceCacheLimits {
+                max_resources: 4_096,
+                max_resource_bytes: GPU_RESOURCE_CACHE_BYTES,
+            });
+            Some(Self {
+                context,
+                _backend: backend,
+                device,
+                queue,
+                surface: None,
+                nv12: None,
+            })
+        }
+
+        pub(super) fn render_into<F>(
+            &mut self,
+            info: &ImageInfo,
+            row_bytes: usize,
+            pixels: &mut Vec<u8>,
+            draw: F,
+        ) -> Result<()>
+        where
+            F: FnOnce(&Canvas) -> Result<()>,
+        {
+            autoreleasepool(|_| {
+                if self
+                    .surface
+                    .as_ref()
+                    .is_none_or(|s| s.image_info().dimensions() != info.dimensions())
+                {
+                    self.surface = Some(
+                        gpu::surfaces::render_target(
+                            &mut self.context,
+                            Budgeted::No,
+                            info,
+                            0,
+                            SurfaceOrigin::TopLeft,
+                            None,
+                            false,
+                            false,
+                        )
+                        .context("create Metal render target")?,
+                    );
+                }
+                let surface = self.surface.as_mut().expect("Metal surface initialized");
+                draw(surface.canvas())?;
+                read_pixels_into(surface, info, row_bytes, pixels)
+            })
+        }
+
+        fn ensure_nv12_converter(&mut self, width: u32, height: u32) -> Result<()> {
+            if self
+                .nv12
+                .as_ref()
+                .is_some_and(|c| c.width == width && c.height == height)
+            {
+                return Ok(());
+            }
+            self.nv12 = None;
+            let pool = unsafe { create_pixel_buffer_pool(width, height)? };
+            let mut tex_cache: *mut c_void = null_mut();
+            let status = unsafe {
+                CVMetalTextureCacheCreate(
+                    null(),
+                    null(),
+                    Retained::as_ptr(&self.device) as *mut c_void,
+                    null(),
+                    &mut tex_cache,
+                )
+            };
+            if status != 0 || tex_cache.is_null() {
+                unsafe { CFRelease(pool) };
+                bail!("CVMetalTextureCacheCreate failed with status {status}");
+            }
+            let pipeline = match unsafe { compile_compute_pipeline(&self.device) } {
+                Ok(p) => p,
+                Err(e) => {
+                    unsafe {
+                        CFRelease(pool);
+                        CFRelease(tex_cache);
+                    }
+                    return Err(e);
+                }
+            };
+            let mut slots = Vec::with_capacity(RING_SIZE);
+            for _ in 0..RING_SIZE {
+                let texture = unsafe { create_render_texture(&self.device, width, height)? };
+                let tex_info =
+                    unsafe { mtl::TextureInfo::new(Retained::as_ptr(&texture) as mtl::Handle) };
+                let backend_rt =
+                    gpu::backend_render_targets::make_mtl((width as i32, height as i32), &tex_info);
+                let surface = gpu::surfaces::wrap_backend_render_target(
+                    &mut self.context,
+                    &backend_rt,
+                    SurfaceOrigin::TopLeft,
+                    ColorType::RGBA8888,
+                    ColorSpace::new_srgb(),
+                    None,
+                )
+                .context("wrap Metal render texture in Skia surface")?;
+                slots.push(RingSlot {
+                    texture,
+                    surface,
+                    last_cmd_buf: None,
+                });
+            }
+            self.nv12 = Some(Nv12Converter {
+                width,
+                height,
+                pool,
+                tex_cache,
+                pipeline,
+                slots,
+                next_slot: 0,
+            });
+            Ok(())
+        }
+
+        pub(super) fn render_gpu_frame<F>(
+            &mut self,
+            info: &ImageInfo,
+            row_bytes: usize,
+            pixels: Option<&mut Vec<u8>>,
+            draw: F,
+        ) -> Result<Option<MacosGpuFrame>>
+        where
+            F: FnOnce(&Canvas) -> Result<()>,
+        {
+            let width = info.width() as u32;
+            let height = info.height() as u32;
+            if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+                let Some(pixels) = pixels else {
+                    let mut scratch = Vec::new();
+                    self.render_into(info, row_bytes, &mut scratch, draw)?;
+                    return Ok(None);
+                };
+                self.render_into(info, row_bytes, pixels, draw)?;
+                return Ok(None);
+            }
+            autoreleasepool(|_| {
+                self.ensure_nv12_converter(width, height)?;
+                let nv12 = self.nv12.as_mut().expect("NV12 converter initialized");
+                let slot_idx = nv12.next_slot;
+                nv12.next_slot = (nv12.next_slot + 1) % RING_SIZE;
+                let slot = &mut nv12.slots[slot_idx];
+                if let Some(prev_cmd) = slot.last_cmd_buf.take() {
+                    prev_cmd.waitUntilCompleted();
+                }
+
+                draw(slot.surface.canvas())?;
+                if let Some(pixels) = pixels {
+                    read_pixels_into(&mut slot.surface, info, row_bytes, pixels)?;
+                } else {
+                    self.context.flush_and_submit();
+                }
+
+                let mut pb: *mut c_void = null_mut();
+                let status =
+                    unsafe { CVPixelBufferPoolCreatePixelBuffer(null(), nv12.pool, &mut pb) };
+                if status != 0 || pb.is_null() {
+                    bail!("CVPixelBufferPoolCreatePixelBuffer failed with status {status}");
+                }
+                unsafe { record_pool_acquire(pb) };
+
+                let mut cv_y: *mut c_void = null_mut();
+                let mut cv_uv: *mut c_void = null_mut();
+                let s1 = unsafe {
+                    CVMetalTextureCacheCreateTextureFromImage(
+                        null(),
+                        nv12.tex_cache,
+                        pb,
+                        null(),
+                        MTLPixelFormat::R8Unorm.0,
+                        width as usize,
+                        height as usize,
+                        0,
+                        &mut cv_y,
+                    )
+                };
+                let s2 = unsafe {
+                    CVMetalTextureCacheCreateTextureFromImage(
+                        null(),
+                        nv12.tex_cache,
+                        pb,
+                        null(),
+                        MTLPixelFormat::RG8Unorm.0,
+                        (width / 2) as usize,
+                        (height / 2) as usize,
+                        1,
+                        &mut cv_uv,
+                    )
+                };
+                if s1 != 0 || s2 != 0 || cv_y.is_null() || cv_uv.is_null() {
+                    if !cv_y.is_null() {
+                        unsafe { CFRelease(cv_y) };
+                    }
+                    if !cv_uv.is_null() {
+                        unsafe { CFRelease(cv_uv) };
+                    }
+                    unsafe { release_tracked_pixel_buffer(pb) };
+                    bail!("CVMetalTextureCacheCreateTextureFromImage failed ({s1}, {s2})");
+                }
+
+                let y_mtl = unsafe { CVMetalTextureGetTexture(cv_y) as *mut AnyObject };
+                let uv_mtl = unsafe { CVMetalTextureGetTexture(cv_uv) as *mut AnyObject };
+                let cmd_buf = self
+                    .queue
+                    .commandBuffer()
+                    .context("create Metal command buffer for NV12 conversion")?;
+                let comp: *mut AnyObject = unsafe { msg_send![&*cmd_buf, computeCommandEncoder] };
+                unsafe {
+                    let _: () = msg_send![comp, setComputePipelineState: &*nv12.pipeline];
+                    let src_tex: *const AnyObject = Retained::as_ptr(&slot.texture);
+                    let _: () = msg_send![comp, setTexture: src_tex, atIndex: 0usize];
+                    let _: () = msg_send![comp, setTexture: y_mtl, atIndex: 1usize];
+                    let _: () = msg_send![comp, setTexture: uv_mtl, atIndex: 2usize];
+                    let tg_size = MTLSize {
+                        width: 16,
+                        height: 16,
+                        depth: 1,
+                    };
+                    let tgs = MTLSize {
+                        width: (width as usize).div_ceil(2).div_ceil(16),
+                        height: (height as usize).div_ceil(2).div_ceil(16),
+                        depth: 1,
+                    };
+                    let _: () = msg_send![
+                        comp,
+                        dispatchThreadgroups: tgs,
+                        threadsPerThreadgroup: tg_size
+                    ];
+                    let _: () = msg_send![comp, endEncoding];
+                }
+                cmd_buf.commit();
+                unsafe {
+                    CFRelease(cv_y);
+                    CFRelease(cv_uv);
+                    CVMetalTextureCacheFlush(nv12.tex_cache, 0);
+                }
+
+                slot.last_cmd_buf = Some(cmd_buf.clone());
+                let cmd_raw = Retained::into_raw(cmd_buf) as *mut c_void;
+                Ok(Some(MacosGpuFrame {
+                    pixel_buffer: pb,
+                    cmd_buf: cmd_raw,
+                }))
+            })
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl MetalBackend {
-    fn new() -> Option<Self> {
-        use objc2::{rc::Retained, runtime::ProtocolObject};
-        use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
-        use skia_safe::gpu::{self, mtl};
-
-        let device = MTLCreateSystemDefaultDevice()?;
-        let queue = device.newCommandQueue()?;
-        let backend = unsafe {
-            mtl::BackendContext::new(
-                Retained::as_ptr(&device) as mtl::Handle,
-                Retained::as_ptr(&queue) as mtl::Handle,
-            )
-        };
-        let mut context = gpu::direct_contexts::make_metal(&backend, None)?;
-        context.set_resource_cache_limits(skia_safe::gpu::ganesh::ResourceCacheLimits {
-            max_resources: 4_096,
-            max_resource_bytes: GPU_RESOURCE_CACHE_BYTES,
-        });
-        let queue: Retained<ProtocolObject<dyn MTLCommandQueue>> = queue;
-        Some(Self {
-            context,
-            _backend: backend,
-            _queue: queue,
-            surface: None,
-        })
-    }
-
-    fn render_into<F>(
-        &mut self,
-        info: &ImageInfo,
-        row_bytes: usize,
-        pixels: &mut Vec<u8>,
-        draw: F,
-    ) -> Result<()>
-    where
-        F: FnOnce(&Canvas) -> Result<()>,
-    {
-        use skia_safe::gpu::{self, Budgeted, SurfaceOrigin};
-
-        if self.surface.is_none() {
-            self.surface = Some(
-                gpu::surfaces::render_target(
-                    &mut self.context,
-                    Budgeted::No,
-                    info,
-                    0,
-                    SurfaceOrigin::TopLeft,
-                    None,
-                    false,
-                    false,
-                )
-                .context("create Metal render target")?,
-            );
-        }
-        let surface = self.surface.as_mut().expect("Metal surface initialized");
-        draw(surface.canvas())?;
-        read_pixels_into(surface, info, row_bytes, pixels)
-    }
-}
+use macos_metal::MetalBackend;
+#[cfg(target_os = "macos")]
+pub(crate) use macos_metal::{
+    CFRelease, CVPixelBufferPoolCreatePixelBuffer, create_pixel_buffer_pool, record_pool_acquire,
+    release_tracked_pixel_buffer,
+};
+#[cfg(target_os = "macos")]
+pub use macos_metal::{
+    MacosGpuFrame, MacosPoolTelemetry, macos_pool_telemetry, reset_macos_pool_telemetry,
+};
 
 #[cfg(test)]
 mod tests {
