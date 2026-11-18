@@ -168,6 +168,49 @@ impl Renderer {
                 lyrics.draw(canvas, lines, layout, t_ms, geometry.lyrics.height as u32)
             })
     }
+
+    pub fn render_frame_into_opts(
+        &mut self,
+        t_ms: u64,
+        frame: &mut RenderedFrame,
+        read_cpu_pixels: bool,
+    ) -> Result<()> {
+        if frame.width() != self.width || frame.height() != self.height {
+            bail!(
+                "invalid frame dimensions: expected {}x{}, got {}x{}",
+                self.width,
+                self.height,
+                frame.width(),
+                frame.height()
+            );
+        }
+        if frame.row_bytes() != self.row_bytes
+            || frame.pixels().len() != self.height as usize * self.row_bytes
+        {
+            bail!("invalid frame pixel buffer");
+        }
+        self.layout.update(&self.lines, t_ms, self.fps);
+        let geometry = self.geometry;
+        let lines = &self.lines;
+        let layout = &self.layout;
+        let background = &mut self.background;
+        let cover = &mut self.cover;
+        let lyrics = &self.lyrics;
+        self.surface.render_into_frame(
+            &self.info,
+            self.row_bytes,
+            frame,
+            read_cpu_pixels,
+            |canvas| {
+                canvas.clear(Color::BLACK);
+                background.draw(canvas, &geometry, t_ms)?;
+                if let Some(cover) = cover {
+                    cover.draw(canvas, &geometry)?;
+                }
+                lyrics.draw(canvas, lines, layout, t_ms, geometry.lyrics.height as u32)
+            },
+        )
+    }
 }
 
 #[cfg(target_os = "windows")]
