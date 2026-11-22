@@ -1,0 +1,67 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba8) readonly uniform image2D rgba_image;
+layout(set = 0, binding = 1, std430) writeonly buffer Nv12Output {
+    uint8_t bytes[];
+} output_buffer;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint y_offset;
+    uint uv_offset;
+    uint y_pitch;
+    uint uv_pitch;
+} params;
+
+vec3 sample_rgb(ivec2 p) {
+    return imageLoad(rgba_image, p).rgb;
+}
+
+uint limited_y(vec3 rgb) {
+    float y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    return uint(clamp(round(16.0 + 219.0 * y), 16.0, 235.0));
+}
+
+uvec2 limited_uv(vec3 rgb) {
+    float u = dot(rgb, vec3(-0.1146, -0.3854, 0.5000));
+    float v = dot(rgb, vec3(0.5000, -0.4542, -0.0458));
+    return uvec2(
+        uint(clamp(round(128.0 + 224.0 * u), 16.0, 240.0)),
+        uint(clamp(round(128.0 + 224.0 * v), 16.0, 240.0))
+    );
+}
+
+void main() {
+    // One invocation handles one 2x2 luma block. This halves invocation count
+    // and computes the four samples needed for chroma only once.
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy) * 2;
+    if (p.x >= int(params.width) || p.y >= int(params.height)) return;
+    ivec2 max_p = ivec2(params.width - 1, params.height - 1);
+    ivec2 q = min(p + ivec2(1, 0), max_p);
+    ivec2 r = min(p + ivec2(0, 1), max_p);
+    ivec2 s = min(p + ivec2(1, 1), max_p);
+    vec3 rgb_p = sample_rgb(p);
+    vec3 rgb_q = sample_rgb(q);
+    vec3 rgb_r = sample_rgb(r);
+    vec3 rgb_s = sample_rgb(s);
+    output_buffer.bytes[params.y_offset + uint(p.y) * params.y_pitch + uint(p.x)] = uint8_t(limited_y(rgb_p));
+    if (q.x < int(params.width)) {
+        output_buffer.bytes[params.y_offset + uint(p.y) * params.y_pitch + uint(q.x)] = uint8_t(limited_y(rgb_q));
+    }
+    if (r.y < int(params.height)) {
+        output_buffer.bytes[params.y_offset + uint(r.y) * params.y_pitch + uint(p.x)] = uint8_t(limited_y(rgb_r));
+    }
+    if (q.x < int(params.width) && r.y < int(params.height)) {
+        output_buffer.bytes[params.y_offset + uint(r.y) * params.y_pitch + uint(q.x)] = uint8_t(limited_y(rgb_s));
+    }
+    vec3 rgb = (rgb_p + rgb_q + rgb_r + rgb_s) * 0.25;
+    uvec2 uv = limited_uv(rgb);
+    uint uv_index = params.uv_offset + uint(p.y / 2) * params.uv_pitch + uint(p.x);
+    output_buffer.bytes[uv_index] = uint8_t(uv.x);
+    output_buffer.bytes[uv_index + 1] = uint8_t(uv.y);
+}

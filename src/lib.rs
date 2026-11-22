@@ -5,6 +5,8 @@ pub mod encoder;
 pub mod ffi;
 pub mod frame;
 pub mod geometry;
+#[cfg(target_os = "linux")]
+pub mod gpu_interop;
 pub mod image_asset;
 pub mod layout;
 pub mod lrc;
@@ -29,7 +31,7 @@ pub static NvOptimusEnablement: u32 = 1;
 #[unsafe(no_mangle)]
 pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 pub use anyhow::Result;
-pub use encoder::{EncoderBackend, VideoCodec};
+pub use encoder::{EncoderBackend, NvencPreset, VideoCodec};
 pub use frame::{FrameSink, RenderedFrame};
 use indicatif::{ProgressBar, ProgressStyle};
 pub use lrc::{BackgroundVocal, LyricLine, LyricWord};
@@ -70,6 +72,7 @@ pub struct RenderOptions {
     pub sample_duration_ms: Option<u64>,
     pub encoder: encoder::EncoderBackend,
     pub codec: encoder::VideoCodec,
+    pub nvenc_preset: String,
 }
 impl RenderOptions {
     pub fn new(song: impl Into<PathBuf>, output: impl Into<PathBuf>) -> Self {
@@ -98,6 +101,7 @@ impl RenderOptions {
                 encoder::EncoderBackend::Pipe
             },
             codec: encoder::VideoCodec::H264,
+            nvenc_preset: "p5".to_owned(),
         }
     }
 }
@@ -190,6 +194,7 @@ where
     if options.width == 0 || options.height == 0 || options.fps == 0 {
         anyhow::bail!("width, height, and fps must be positive");
     }
+    options.encoder.validate_codec(options.codec)?;
     let metadata = video::audio_metadata(&options.song)?;
     let title = options.title.clone().or(metadata.title.clone());
     let text = if let Some(lyrics) = options.lyrics.as_deref() {
@@ -235,7 +240,7 @@ where
         .as_ref()
         .map(|asset| cover_renderer::CoverRenderer::from_image_asset(asset, title))
         .transpose()?;
-    let mut renderer = Renderer::with_scene_options(
+    let mut renderer = Renderer::with_scene_options_for_encoder(
         options.width,
         options.height,
         options.fps,
@@ -246,8 +251,9 @@ where
         options.render_background_vocal,
         options.lyrics_style,
         &options.excluded_lines,
+        options.encoder,
     )?;
-    let mut sink = video::create_encoder_with_codec(
+    let mut sink = video::create_encoder_with_codec_and_preset(
         options.encoder,
         options.codec,
         &options.output,
@@ -255,9 +261,22 @@ where
         options.height,
         options.fps,
         (!options.no_audio).then_some(options.song.as_path()),
+        NvencPreset::from_value(&options.nvenc_preset),
     )?;
+    let require_cpu_pixels = sink.requires_cpu_pixels();
+    let profile = std::env::var_os("GOOSY_PROFILE").is_some();
+    let mut render_seconds = 0.0;
+    let mut submit_seconds = 0.0;
+    let finish_seconds;
     let progress = ProgressBar::hidden();
     progress.set_style(ProgressStyle::default_bar());
+    #[cfg(target_os = "linux")]
+    let mut frame = if options.encoder.is_zero_copy() {
+        RenderedFrame::new_gpu_only(options.width, options.height)
+    } else {
+        RenderedFrame::new(options.width, options.height)
+    };
+    #[cfg(not(target_os = "linux"))]
     let mut frame = RenderedFrame::new(options.width, options.height);
     let render_started = Instant::now();
     for frame_index in 0..total_frames {
@@ -268,26 +287,41 @@ where
                 RenderControl::Stop => anyhow::bail!("render stopped by user"),
             }
         }
+        let phase_started = Instant::now();
         let t_ms = render_start_ms + frame_index * 1_000 / options.fps as u64;
-        let read_cpu_pixels =
-            options.encoder == EncoderBackend::Pipe || need_pixels(frame_index + 1, total_frames);
-        renderer.render_frame_into_opts(t_ms, &mut frame, read_cpu_pixels)?;
+        let read_cpu_pixels = require_cpu_pixels
+            || (!options.encoder.is_zero_copy() && need_pixels(frame_index + 1, total_frames));
+        if require_cpu_pixels {
+            renderer.render_frame_into(t_ms, &mut frame)?;
+        } else {
+            renderer.render_frame_into_opts(t_ms, &mut frame, read_cpu_pixels)?;
+        }
+        render_seconds += phase_started.elapsed().as_secs_f64();
         progress.inc(1);
+        let callback_pixels: &[u8] = if read_cpu_pixels {
+            frame.pixels()
+        } else {
+            &[]
+        };
         on_frame(
             frame_index + 1,
             total_frames,
             render_started.elapsed().as_secs_f64(),
-            frame.pixels(),
+            callback_pixels,
         );
+        let phase_started = Instant::now();
         frame = sink.submit(frame)?;
+        submit_seconds += phase_started.elapsed().as_secs_f64();
     }
+    let phase_started = Instant::now();
     sink.finish()?;
+    finish_seconds = phase_started.elapsed().as_secs_f64();
     let elapsed_seconds = render_started.elapsed().as_secs_f64();
+    if profile {
+        eprintln!("render profile: frames={} total={:.6}s render={:.6}s submit={:.6}s finish={:.6}s", total_frames, elapsed_seconds, render_seconds, submit_seconds, finish_seconds);
+    }
     progress.finish_and_clear();
-    Ok(RenderStats {
-        frames: total_frames,
-        elapsed_seconds,
-    })
+    Ok(RenderStats { frames: total_frames, elapsed_seconds })
 }
 
 pub fn read_lyrics_file(

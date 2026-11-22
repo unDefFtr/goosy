@@ -724,6 +724,7 @@ mod macos_impl {
                 sample_duration_ms: Some(duration_ms),
                 encoder: backend,
                 codec,
+                nvenc_preset: "p5".to_owned(),
             };
             let m0 = get_process_metrics();
             let t0 = Instant::now();
@@ -894,6 +895,7 @@ mod macos_impl {
                 sample_duration_ms: Some(4_000),
                 encoder: EncoderBackend::FfmpegNext,
                 codec: libgoosy::VideoCodec::Hevc,
+                nvenc_preset: "p5".to_owned(),
             };
             let device = MTLCreateSystemDefaultDevice().unwrap();
             let mut checkpoints = Vec::new();

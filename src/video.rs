@@ -1,3 +1,4 @@
+use crate::encoder::{EncoderBackend, FfmpegNextEncoder, NvencPreset, VideoCodec};
 use crate::frame::{FrameSink, RenderedFrame};
 use anyhow::{Context, Result, bail};
 use std::io::Write;
@@ -294,7 +295,7 @@ pub fn preferred_video_encoder_name() -> &'static str {
     PREFERRED_VIDEO_ENCODER.name()
 }
 
-fn add_video_encoder(command: &mut Command, encoder: &VideoEncoder) {
+fn add_video_encoder(command: &mut Command, encoder: &VideoEncoder, _preset: NvencPreset) {
     match encoder {
         #[cfg(target_os = "macos")]
         VideoEncoder::VideoToolbox => {
@@ -315,7 +316,7 @@ fn add_video_encoder(command: &mut Command, encoder: &VideoEncoder) {
                 "-c:v",
                 "h264_nvenc",
                 "-preset",
-                "p5",
+                _preset.value(),
                 "-b:v",
                 "8M",
             ]);
@@ -362,6 +363,7 @@ fn video_writer_command(
     fps: u32,
     audio: Option<&Path>,
     encoder: &VideoEncoder,
+    preset: NvencPreset,
 ) -> Command {
     let mut command = Command::new("ffmpeg");
     command.args(["-y", "-hide_banner", "-loglevel", "error"]);
@@ -387,7 +389,7 @@ fn video_writer_command(
             .arg(audio)
             .args(["-map", "0:v:0", "-map", "1:a:0"]);
     }
-    add_video_encoder(&mut command, encoder);
+    add_video_encoder(&mut command, encoder, preset);
     if audio.is_some() {
         command.args(["-c:a", "aac", "-b:a", "192k"]);
     }
@@ -470,11 +472,20 @@ impl FfmpegPipe {
         fps: u32,
         audio: Option<&Path>,
         codec: crate::encoder::VideoCodec,
+        preset: NvencPreset,
     ) -> Result<Self> {
         let mut command = if codec == crate::encoder::VideoCodec::Hevc {
             video_writer_command_hevc(output, width, height, fps, audio)
         } else {
-            video_writer_command(output, width, height, fps, audio, &PREFERRED_VIDEO_ENCODER)
+            video_writer_command(
+                output,
+                width,
+                height,
+                fps,
+                audio,
+                &PREFERRED_VIDEO_ENCODER,
+                preset,
+            )
         };
         command.stdin(Stdio::piped()).stderr(Stdio::inherit());
         let command_display = format!("{command:?}");
@@ -569,7 +580,30 @@ impl PipeEncoder {
         audio: Option<&Path>,
         codec: crate::encoder::VideoCodec,
     ) -> Result<Self> {
-        let writer = FfmpegPipe::new_with_codec(output, width, height, fps, audio, codec)?;
+        Self::new_with_codec_and_preset(output, width, height, fps, audio, codec, NvencPreset::P5)
+    }
+
+    pub fn new_with_preset(
+        output: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: Option<&Path>,
+        preset: NvencPreset,
+    ) -> Result<Self> {
+        Self::new_with_codec_and_preset(output, width, height, fps, audio, VideoCodec::H264, preset)
+    }
+
+    pub(crate) fn new_with_codec_and_preset(
+        output: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: Option<&Path>,
+        codec: VideoCodec,
+        preset: NvencPreset,
+    ) -> Result<Self> {
+        let writer = FfmpegPipe::new_with_codec(output, width, height, fps, audio, codec, preset)?;
         let (sender, frames) = std::sync::mpsc::sync_channel::<RenderedFrame>(FRAME_QUEUE_CAPACITY);
         let (recycle_sender, recycled) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
@@ -653,7 +687,7 @@ impl FrameSink for PipeEncoder {
 }
 
 pub fn create_encoder(
-    backend: crate::encoder::EncoderBackend,
+    backend: EncoderBackend,
     output: &Path,
     width: u32,
     height: u32,
@@ -680,15 +714,61 @@ pub fn create_encoder_with_codec(
     fps: u32,
     audio: Option<&Path>,
 ) -> Result<Box<dyn FrameSink>> {
+    create_encoder_with_codec_and_preset(
+        backend,
+        codec,
+        output,
+        width,
+        height,
+        fps,
+        audio,
+        NvencPreset::P5,
+    )
+}
+
+pub fn create_encoder_with_preset(
+    backend: EncoderBackend,
+    output: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    audio: Option<&Path>,
+    preset: NvencPreset,
+) -> Result<Box<dyn FrameSink>> {
+    create_encoder_with_codec_and_preset(
+        backend,
+        VideoCodec::H264,
+        output,
+        width,
+        height,
+        fps,
+        audio,
+        preset,
+    )
+}
+
+pub fn create_encoder_with_codec_and_preset(
+    backend: EncoderBackend,
+    codec: VideoCodec,
+    output: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    audio: Option<&Path>,
+    preset: NvencPreset,
+) -> Result<Box<dyn FrameSink>> {
+    backend.validate_codec(codec)?;
     match backend {
-        crate::encoder::EncoderBackend::Pipe => Ok(Box::new(PipeEncoder::new_with_codec(
-            output, width, height, fps, audio, codec,
+        EncoderBackend::Pipe => Ok(Box::new(PipeEncoder::new_with_codec_and_preset(
+            output, width, height, fps, audio, codec, preset,
         )?)),
-        crate::encoder::EncoderBackend::FfmpegNext => {
-            Ok(Box::new(crate::encoder::FfmpegNextEncoder::new_with_codec(
-                output, width, height, fps, audio, codec,
-            )?))
-        }
+        EncoderBackend::FfmpegNext => Ok(Box::new(FfmpegNextEncoder::new_with_codec_and_preset(
+            output, width, height, fps, audio, codec, preset,
+        )?)),
+        #[cfg(target_os = "linux")]
+        EncoderBackend::FfmpegNextNvencZeroCopy => Ok(Box::new(
+            crate::encoder::AsyncZeroCopyEncoder::new(output, width, height, fps, audio, preset)?,
+        )),
     }
 }
 
@@ -860,6 +940,7 @@ mod tests {
             30,
             None,
             &VideoEncoder::Software,
+            NvencPreset::P5,
         );
         let args = command_args(&command);
         assert!(contains_sequence(
@@ -881,7 +962,15 @@ mod tests {
         let encoder = VideoEncoder::Vaapi {
             device: device.clone(),
         };
-        let command = video_writer_command(Path::new("out.mp4"), 1_920, 1_080, 30, None, &encoder);
+        let command = video_writer_command(
+            Path::new("out.mp4"),
+            1_920,
+            1_080,
+            30,
+            None,
+            &encoder,
+            NvencPreset::P5,
+        );
         let args = command_args(&command);
         let device_index = args.iter().position(|arg| arg == "-vaapi_device").unwrap();
         let input_index = args.iter().position(|arg| arg == "-f").unwrap();
@@ -904,7 +993,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
-    fn nvenc_command_keeps_existing_quality_settings() {
+    fn nvenc_command_uses_requested_preset_once() {
         let command = video_writer_command(
             Path::new("out.mp4"),
             1_920,
@@ -912,11 +1001,22 @@ mod tests {
             30,
             None,
             &VideoEncoder::Nvenc,
+            NvencPreset::P3,
         );
         let args = command_args(&command);
+        assert_eq!(args.iter().filter(|arg| *arg == "-preset").count(), 1);
         assert!(contains_sequence(
             &args,
-            &["-c:v", "h264_nvenc", "-preset", "p5", "-b:v", "8M"]
+            &[
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p3",
+                "-b:v",
+                "8M"
+            ]
         ));
     }
 
@@ -930,6 +1030,7 @@ mod tests {
             30,
             None,
             &VideoEncoder::VideoToolbox,
+            NvencPreset::P5,
         );
         assert!(contains_sequence(
             &command_args(&command),
@@ -947,6 +1048,7 @@ mod tests {
             30,
             None,
             &VideoEncoder::Amf,
+            NvencPreset::P5,
         ));
         let qsv = command_args(&video_writer_command(
             Path::new("out.mp4"),
@@ -955,6 +1057,7 @@ mod tests {
             30,
             None,
             &VideoEncoder::Qsv,
+            NvencPreset::P5,
         ));
         assert!(contains_sequence(
             &amf,

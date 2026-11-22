@@ -88,6 +88,8 @@ enum Command {
         encoder: WorkerEncoder,
         #[arg(long, hide = true, value_enum, default_value_t = WorkerCodec::H264)]
         codec: WorkerCodec,
+        #[arg(long, hide = true, default_value = "p5")]
+        nvenc_preset: String,
         #[arg(long, value_enum, default_value_t = WorkerLyricFormat::Auto)]
         format: WorkerLyricFormat,
     },
@@ -155,6 +157,9 @@ enum WorkerEncoder {
     Pipe,
     #[value(name = "ffmpeg-next")]
     FfmpegNext,
+    #[cfg(target_os = "linux")]
+    #[value(name = "ffmpeg-next-nvenc-zero-copy")]
+    FfmpegNextNvencZeroCopy,
 }
 
 impl From<WorkerEncoder> for EncoderBackend {
@@ -162,6 +167,8 @@ impl From<WorkerEncoder> for EncoderBackend {
         match value {
             WorkerEncoder::Pipe => Self::Pipe,
             WorkerEncoder::FfmpegNext => Self::FfmpegNext,
+            #[cfg(target_os = "linux")]
+            WorkerEncoder::FfmpegNextNvencZeroCopy => Self::FfmpegNextNvencZeroCopy,
         }
     }
 }
@@ -411,6 +418,7 @@ fn main() -> Result<()> {
             format,
             encoder,
             codec,
+            nvenc_preset,
         } => {
             ensure_renderer_backend(width, height, fps, progress_events)?;
             emit_stage(
@@ -450,6 +458,7 @@ fn main() -> Result<()> {
                 sample_duration_ms,
                 encoder: encoder.into(),
                 codec: codec.into(),
+                nvenc_preset,
             };
             let mut preview_dir = preview_dir;
             let mut preview_pixels = Vec::new();
@@ -467,16 +476,18 @@ fn main() -> Result<()> {
                 libgoosy::video::preferred_video_encoder_name()
             );
             let has_preview = preview_dir.is_some();
+            let preview_enabled = has_preview && !options.encoder.is_zero_copy();
             let _stats = libgoosy::render_with_frame_progress_control_stats_lazy(
                 &options,
                 move |done, total| {
-                    has_preview && (done == 1 || done == total || done % preview_interval == 0)
+                    preview_enabled && (done == 1 || done == total || done % preview_interval == 0)
                 },
                 |done, total, elapsed, pixels| {
                     if progress_events {
                         println!("GOOSY_PROGRESS {done} {total} {elapsed:.3}");
                     }
-                    let preview_due = done == 1 || done == total || done % preview_interval == 0;
+                    let preview_due = preview_enabled
+                        && (done == 1 || done == total || done % preview_interval == 0);
                     if preview_due {
                         let result = preview_dir.as_deref().map(|directory| {
                             write_preview_frame(
@@ -542,7 +553,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, WorkerEncoder, downscale_rgba_nearest, preview_dimensions};
+    use super::{Cli, Command, WorkerCodec, WorkerEncoder, downscale_rgba_nearest, preview_dimensions};
     use clap::Parser;
 
     #[test]
@@ -563,10 +574,15 @@ mod tests {
     }
 
     #[test]
-    fn encoder_argument_accepts_both_protocol_values() {
+    fn encoder_argument_accepts_protocol_values() {
         for (value, expected) in [
             ("pipe", WorkerEncoder::Pipe),
             ("ffmpeg-next", WorkerEncoder::FfmpegNext),
+            #[cfg(target_os = "linux")]
+            (
+                "ffmpeg-next-nvenc-zero-copy",
+                WorkerEncoder::FfmpegNextNvencZeroCopy,
+            ),
         ] {
             let cli = Cli::try_parse_from([
                 "goosy-render-worker",
@@ -581,5 +597,41 @@ mod tests {
             };
             assert_eq!(encoder, expected);
         }
+    }
+
+    #[test]
+    fn render_options_parse_codec_and_nvenc_preset() {
+        let cli = Cli::try_parse_from([
+            "goosy-render-worker",
+            "render",
+            "song.wav",
+            "--codec",
+            "hevc",
+            "--nvenc-preset",
+            "p3",
+        ])
+        .unwrap();
+        let Command::Render {
+            codec,
+            nvenc_preset,
+            ..
+        } = cli.command
+        else {
+            panic!("expected render command");
+        };
+        assert_eq!(codec, WorkerCodec::Hevc);
+        assert_eq!(nvenc_preset, "p3");
+
+        let cli = Cli::try_parse_from(["goosy-render-worker", "render", "song.wav"]).unwrap();
+        let Command::Render {
+            codec,
+            nvenc_preset,
+            ..
+        } = cli.command
+        else {
+            panic!("expected render command");
+        };
+        assert_eq!(codec, WorkerCodec::H264);
+        assert_eq!(nvenc_preset, "p5");
     }
 }

@@ -362,6 +362,26 @@ fn write_internal_preview_frame(
     height: u32,
     preview: &mut Vec<u8>,
 ) -> std::io::Result<(u32, u32)> {
+    let required_source_len = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "RGBA frame dimensions overflow",
+            )
+        })?;
+    if source.len() < required_source_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "RGBA frame source is smaller than the frame dimensions",
+        ));
+    }
     let scale = (STYLE_PREVIEW_MAX_WIDTH as f32 / width.max(1) as f32)
         .min(STYLE_PREVIEW_MAX_HEIGHT as f32 / height.max(1) as f32)
         .min(1.0);
@@ -426,6 +446,7 @@ struct GoosyApp {
     font_scale_percent: u32,
     encoder_backend: EncoderBackend,
     video_codec: VideoCodec,
+    nvenc_preset: String,
     translation_font_scale_percent: u32,
     background_font_scale_percent: u32,
     line_height_percent: u32,
@@ -495,6 +516,7 @@ impl Default for GoosyApp {
             debug_overlays: false,
             encoder_backend: EncoderBackend::Pipe,
             video_codec: VideoCodec::H264,
+            nvenc_preset: "p5".to_owned(),
             use_embedded_cover: true,
             no_audio: false,
             render_child: None,
@@ -1191,6 +1213,7 @@ impl GoosyApp {
         command.args(encoder_args);
         let codec_args = codec_cli_args(self.video_codec);
         command.args(codec_args);
+        command.arg("--nvenc-preset").arg(&self.nvenc_preset);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1311,6 +1334,7 @@ impl GoosyApp {
             sample_duration_ms: sample.map(|(start, end)| end.saturating_sub(start)),
             encoder: self.encoder_backend,
             codec: self.video_codec,
+            nvenc_preset: self.nvenc_preset.clone(),
         };
         let preview_interval = self.preview_interval;
         let width = self.width;
@@ -1323,13 +1347,17 @@ impl GoosyApp {
             let mut preview_dir = Some(thread_preview_directory);
             let mut preview_pixels = Vec::new();
             let mut paused = false;
+            let zero_copy = options.encoder.is_zero_copy();
             let result = libgoosy::render_with_frame_progress_control_stats_lazy(
                 &options,
-                |done, total| done == 1 || done == total || done % preview_interval == 0,
+                |done, total| {
+                    !zero_copy && (done == 1 || done == total || done % preview_interval == 0)
+                },
                 |done, total, elapsed, pixels| {
                     let _ =
                         progress_sender.send(format!("GOOSY_PROGRESS {done} {total} {elapsed:.3}"));
-                    let preview_due = done == 1 || done == total || done % preview_interval == 0;
+                    let preview_due = !zero_copy
+                        && (done == 1 || done == total || done % preview_interval == 0);
                     if preview_due {
                         if let Some(directory) = preview_dir.as_deref() {
                             match write_internal_preview_frame(
@@ -1748,7 +1776,7 @@ impl GoosyApp {
                     egui::ComboBox::from_id_salt("encoder_combo")
                         .selected_text(self.encoder_backend.label())
                         .show_ui(ui, |ui| {
-                            for backend in EncoderBackend::ALL {
+                            for &backend in EncoderBackend::ALL {
                                 ui.selectable_value(
                                     &mut self.encoder_backend,
                                     backend,
@@ -1756,16 +1784,48 @@ impl GoosyApp {
                                 );
                             }
                         });
-                    ui.label("格式");
-                    egui::ComboBox::from_id_salt("video_codec_combo")
-                        .selected_text(self.video_codec.label())
-                        .show_ui(ui, |ui| {
-                            for codec in VideoCodec::ALL {
-                                ui.selectable_value(&mut self.video_codec, codec, codec.label());
-                            }
-                        });
+                    if self.encoder_backend.is_zero_copy() {
+                        self.video_codec = VideoCodec::H264;
+                    }
+                    let codec_enabled = !self.encoder_backend.is_zero_copy();
+                    ui.add_enabled_ui(codec_enabled, |ui| {
+                        ui.label("格式");
+                        egui::ComboBox::from_id_salt("video_codec_combo")
+                            .selected_text(self.video_codec.label())
+                            .show_ui(ui, |ui| {
+                                for codec in VideoCodec::ALL {
+                                    ui.selectable_value(&mut self.video_codec, codec, codec.label());
+                                }
+                            });
+                    });
                 });
             });
+            let uses_nvenc = match self.encoder_backend {
+                EncoderBackend::Pipe | EncoderBackend::FfmpegNext => {
+                    video::preferred_video_encoder_name() == "h264_nvenc"
+                }
+                #[cfg(target_os = "linux")]
+                EncoderBackend::FfmpegNextNvencZeroCopy => true,
+            };
+            if uses_nvenc {
+                let active = self.render_child.is_some() || self.internal_render.is_some();
+                ui.add_enabled_ui(!active, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("NVENC Preset");
+                        egui::ComboBox::from_id_salt("nvenc_preset_combo")
+                            .selected_text(&self.nvenc_preset)
+                            .show_ui(ui, |ui| {
+                                for preset in ["p1", "p2", "p3", "p4", "p5", "p6", "p7"] {
+                                    ui.selectable_value(
+                                        &mut self.nvenc_preset,
+                                        preset.to_owned(),
+                                        preset,
+                                    );
+                                }
+                            });
+                    });
+                });
+            }
             egui::CollapsingHeader::new("歌词样式")
                 .default_open(true)
                 .show(ui, |ui| {
@@ -2075,7 +2135,7 @@ mod tests {
         StylePreviewRequest, StylePreviewScene, codec_cli_args, detect_credit_lines,
         encoder_cli_args, has_extension, new_preview_directory, parse_preview_event,
         render_page_uses_columns, render_style_preview, spawn_style_preview_worker,
-        style_preview_dimensions, terminate_render_child,
+        style_preview_dimensions, terminate_render_child, write_internal_preview_frame,
     };
     use libgoosy::{
         EncoderBackend, LyricsStyle, VideoCodec, image_asset::ImageAsset, lrc::LyricLine,
@@ -2160,6 +2220,21 @@ mod tests {
         assert_eq!(parse_preview_event("GOOSY_PREVIEW 45 0 360"), None);
         assert_eq!(parse_preview_event("GOOSY_PREVIEW 45 640"), None);
         assert_eq!(parse_preview_event("GOOSY_PROGRESS 45 300 1.0"), None);
+    }
+
+    #[test]
+    fn rejects_empty_preview_source_for_positive_frame_size() {
+        let mut preview = Vec::new();
+        let error = write_internal_preview_frame(
+            std::path::Path::new("unused"),
+            1,
+            &[],
+            2,
+            2,
+            &mut preview,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2407,6 +2482,16 @@ mod tests {
 
     #[test]
     fn encoder_order_labels_and_cli_values_are_stable() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            EncoderBackend::ALL,
+            [
+                EncoderBackend::Pipe,
+                EncoderBackend::FfmpegNext,
+                EncoderBackend::FfmpegNextNvencZeroCopy,
+            ]
+        );
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(
             EncoderBackend::ALL,
             [EncoderBackend::Pipe, EncoderBackend::FfmpegNext]
@@ -2415,6 +2500,11 @@ mod tests {
         assert_eq!(
             EncoderBackend::ALL[1].label(),
             "ffmpeg-next Encoder（自动选择）"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            encoder_cli_args(EncoderBackend::FfmpegNextNvencZeroCopy),
+            ["--encoder", "ffmpeg-next-nvenc-zero-copy"]
         );
         assert_eq!(
             encoder_cli_args(EncoderBackend::Pipe),
@@ -2425,6 +2515,7 @@ mod tests {
             ["--encoder", "ffmpeg-next"]
         );
         assert_eq!(GoosyApp::default().video_codec, VideoCodec::H264);
+        assert_eq!(GoosyApp::default().nvenc_preset, "p5");
         assert_eq!(VideoCodec::ALL, [VideoCodec::H264, VideoCodec::Hevc]);
         assert_eq!(VideoCodec::H264.label(), "H.264 (AVC)");
         assert_eq!(VideoCodec::Hevc.label(), "HEVC (H.265)");

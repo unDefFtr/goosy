@@ -50,6 +50,41 @@ impl From<CliVideoCodec> for libgoosy::VideoCodec {
         }
     }
 }
+
+#[cfg(not(target_os = "windows"))]
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliEncoder {
+    #[value(name = "pipe")]
+    Pipe,
+    #[value(name = "ffmpeg-next")]
+    FfmpegNext,
+    #[cfg(target_os = "linux")]
+    #[value(name = "ffmpeg-next-nvenc-zero-copy")]
+    FfmpegNextNvencZeroCopy,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Default for CliEncoder {
+    fn default() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::FfmpegNext
+        } else {
+            Self::Pipe
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl From<CliEncoder> for libgoosy::EncoderBackend {
+    fn from(value: CliEncoder) -> Self {
+        match value {
+            CliEncoder::Pipe => Self::Pipe,
+            CliEncoder::FfmpegNext => Self::FfmpegNext,
+            #[cfg(target_os = "linux")]
+            CliEncoder::FfmpegNextNvencZeroCopy => Self::FfmpegNextNvencZeroCopy,
+        }
+    }
+}
 #[cfg(target_os = "windows")]
 #[derive(Parser)]
 #[command(name = "goosy", about = "GoosyRenderer GUI")]
@@ -94,6 +129,10 @@ enum Command {
         height: u32,
         #[arg(long, default_value_t = 30)]
         fps: u32,
+        #[arg(long, value_enum, default_value_t = CliEncoder::default())]
+        encoder: CliEncoder,
+        #[arg(long, default_value = "p5")]
+        nvenc_preset: String,
         #[arg(long, default_value_t = 1.0)]
         font_scale: f32,
         #[arg(long, default_value_t = 0.65)]
@@ -196,12 +235,14 @@ fn main() -> Result<()> {
             width,
             height,
             fps,
+            encoder,
+            nvenc_preset,
             font_scale,
             translation_font_scale,
             background_font_scale,
             line_height_scale,
-            line_spacing_scale,
             translation_gap_scale,
+            line_spacing_scale,
             background_gap_scale,
             horizontal_padding_scale,
             lyric_blur_sigma_step,
@@ -224,6 +265,8 @@ fn main() -> Result<()> {
             width,
             height,
             fps,
+            encoder.into(),
+            nvenc_preset,
             font_scale,
             translation_font_scale,
             background_font_scale,
@@ -296,6 +339,8 @@ fn render(
     width: u32,
     height: u32,
     fps: u32,
+    encoder: libgoosy::EncoderBackend,
+    nvenc_preset: String,
     font_scale: f32,
     translation_font_scale: f32,
     background_font_scale: f32,
@@ -321,6 +366,7 @@ fn render(
     if width == 0 || height == 0 || fps == 0 {
         bail!("width, height, and fps must be positive");
     }
+    encoder.validate_codec(codec)?;
     emit_render_stage(progress_events, "probing-audio", "正在读取音频信息")?;
     let metadata = video::audio_metadata(&song)
         .with_context(|| format!("读取音频信息：{}", song.display()))?;
@@ -377,7 +423,7 @@ fn render(
         "initializing-renderer",
         "正在初始化图形后端",
     )?;
-    let mut renderer = renderer::Renderer::with_scene_options(
+    let mut renderer = renderer::Renderer::with_scene_options_for_encoder(
         width,
         height,
         fps,
@@ -399,6 +445,7 @@ fn render(
             debug_overlays,
         },
         &exclude_lines,
+        encoder,
     )
     .context("初始化图形渲染器")?;
     eprintln!(
@@ -409,19 +456,15 @@ fn render(
     emit_render_stage(progress_events, "starting-ffmpeg", "正在启动 FFmpeg")?;
     #[cfg(target_os = "linux")]
     eprintln!("video encoder: {}", video::preferred_video_encoder_name());
-    let encoder_backend = if cfg!(target_os = "macos") {
-        libgoosy::EncoderBackend::FfmpegNext
-    } else {
-        libgoosy::EncoderBackend::Pipe
-    };
-    let mut sink = video::create_encoder_with_codec(
-        encoder_backend,
+    let mut sink = video::create_encoder_with_codec_and_preset(
+        encoder,
         codec,
         &output,
         width,
         height,
         fps,
         (!no_audio).then_some(song.as_path()),
+        libgoosy::NvencPreset::from_value(&nvenc_preset),
     )
     .with_context(|| format!("启动 FFmpeg 输出：{}", output.display()))?;
     emit_render_stage(progress_events, "rendering-first-frame", "正在渲染首帧")?;
@@ -435,15 +478,25 @@ fn render(
     );
     progress.set_message(format!("Rendering {}", output.display()));
     progress.enable_steady_tick(Duration::from_millis(100));
-    let mut frame_buffer = RenderedFrame::new(width, height);
+    let zero_copy = encoder.is_zero_copy();
+    let require_cpu_pixels = sink.requires_cpu_pixels();
     let render_started = Instant::now();
+    let mut frame_buffer = if zero_copy && total_frames > 0 {
+        renderer.render_frame(0).context("渲染首帧")?
+    } else {
+        RenderedFrame::new(width, height)
+    };
     let progress_interval = (fps as u64 / 10).max(1);
-    let read_cpu_pixels = encoder_backend == libgoosy::EncoderBackend::Pipe;
     for frame_index in 0..total_frames {
         let t_ms = frame_index * 1_000 / fps as u64;
-        renderer
-            .render_frame_into_opts(t_ms, &mut frame_buffer, read_cpu_pixels)
+        if !(zero_copy && frame_index == 0) {
+            if require_cpu_pixels {
+                renderer.render_frame_into(t_ms, &mut frame_buffer)
+            } else {
+                renderer.render_frame_into_opts(t_ms, &mut frame_buffer, false)
+            }
             .with_context(|| format!("渲染第 {} 帧（{} ms）", frame_index + 1, t_ms))?;
+        }
         frame_buffer = sink
             .submit(frame_buffer)
             .with_context(|| format!("向 FFmpeg 提交第 {} 帧", frame_index + 1))?;
@@ -512,5 +565,25 @@ mod tests {
         let lines =
             parse_lyrics_text(input, Some(Path::new("lyrics.ttml")), LyricFormat::Auto).unwrap();
         assert_eq!(lines[0].text, "hello");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_accepts_explicit_zero_copy_encoder() {
+        let cli = Cli::try_parse_from([
+            "goosy",
+            "render",
+            "song.wav",
+            "--encoder",
+            "ffmpeg-next-nvenc-zero-copy",
+        ])
+        .unwrap();
+        let Command::Render { encoder, .. } = cli.command else {
+            panic!("expected render command");
+        };
+        assert_eq!(
+            libgoosy::EncoderBackend::from(encoder).cli_value(),
+            "ffmpeg-next-nvenc-zero-copy"
+        );
     }
 }

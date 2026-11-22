@@ -38,22 +38,61 @@ impl Drop for AvBufferRef {
     }
 }
 
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn free_gpu_payload(opaque: *mut std::ffi::c_void, _data: *mut u8) {
+    if !opaque.is_null() {
+        drop(unsafe {
+            Box::from_raw(opaque as *mut std::sync::Arc<crate::gpu_interop::GpuFramePayload>)
+        });
+    }
+}
+
 struct CudaFrames {
     frames: AvBufferRef,
 }
 
 impl CudaFrames {
     fn new(width: u32, height: u32) -> Result<Self> {
+        Self::new_with_format(
+            width,
+            height,
+            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
+        )
+    }
+
+    fn new_with_format(
+        width: u32,
+        height: u32,
+        sw_format: ffmpeg::ffi::AVPixelFormat,
+    ) -> Result<Self> {
+        Self::new_with_format_and_context(width, height, sw_format, false)
+    }
+
+    fn new_with_format_and_context(
+        width: u32,
+        height: u32,
+        sw_format: ffmpeg::ffi::AVPixelFormat,
+        primary_context: bool,
+    ) -> Result<Self> {
+        let mut options = null_mut();
+        if primary_context {
+            let key = std::ffi::CString::new("current_ctx").unwrap();
+            let value = std::ffi::CString::new("1").unwrap();
+            unsafe {
+                ffmpeg::ffi::av_dict_set(&mut options, key.as_ptr(), value.as_ptr(), 0);
+            }
+        }
         let mut device = null_mut();
         let result = unsafe {
             ffmpeg::ffi::av_hwdevice_ctx_create(
                 &mut device,
                 ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
                 null(),
-                null_mut(),
+                options,
                 0,
             )
         };
+        unsafe { ffmpeg::ffi::av_dict_free(&mut options) };
         if result < 0 {
             if !device.is_null() {
                 let _ = AvBufferRef::new(device);
@@ -73,10 +112,9 @@ impl CudaFrames {
             bail!("allocate CUDA FFmpeg hardware frames context returned null data");
         }
         unsafe {
-            // Fixed dimensions/format and 20 preallocated surfaces; FFmpeg's standard pool may grow.
             (*frames_context).initial_pool_size = 20;
             (*frames_context).format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
-            (*frames_context).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
+            (*frames_context).sw_format = sw_format;
             (*frames_context).width = width as std::ffi::c_int;
             (*frames_context).height = height as std::ffi::c_int;
         }
@@ -129,15 +167,24 @@ pub enum EncoderBackend {
     #[default]
     Pipe,
     FfmpegNext,
+    #[cfg(target_os = "linux")]
+    FfmpegNextNvencZeroCopy,
 }
 
 impl EncoderBackend {
-    pub const ALL: [Self; 2] = [Self::Pipe, Self::FfmpegNext];
+    pub const ALL: &'static [Self] = &[
+        Self::Pipe,
+        Self::FfmpegNext,
+        #[cfg(target_os = "linux")]
+        Self::FfmpegNextNvencZeroCopy,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Pipe => "PipeEncoder（外部 FFmpeg）",
             Self::FfmpegNext => "ffmpeg-next Encoder（自动选择）",
+            #[cfg(target_os = "linux")]
+            Self::FfmpegNextNvencZeroCopy => "Vulkan/CUDA/NVENC zero-copy",
         }
     }
 
@@ -145,11 +192,129 @@ impl EncoderBackend {
         match self {
             Self::Pipe => "pipe",
             Self::FfmpegNext => "ffmpeg-next",
+            #[cfg(target_os = "linux")]
+            Self::FfmpegNextNvencZeroCopy => "ffmpeg-next-nvenc-zero-copy",
+        }
+    }
+
+    pub fn is_zero_copy(self) -> bool {
+        #[cfg(target_os = "linux")]
+        return matches!(self, Self::FfmpegNextNvencZeroCopy);
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    pub fn validate_codec(self, codec: VideoCodec) -> Result<()> {
+        if self.is_zero_copy() && codec != VideoCodec::H264 {
+            bail!("Vulkan/CUDA/NVENC zero-copy requires H.264");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NvencPreset {
+    P1,
+    P2,
+    P3,
+    P4,
+    #[default]
+    P5,
+    P6,
+    P7,
+}
+impl NvencPreset {
+    pub fn from_value(value: &str) -> Self {
+        match value {
+            "p1" => Self::P1,
+            "p2" => Self::P2,
+            "p3" => Self::P3,
+            "p4" => Self::P4,
+            "p6" => Self::P6,
+            "p7" => Self::P7,
+            _ => Self::P5,
         }
     }
 }
 
+impl NvencPreset {
+    pub const ALL: &'static [Self] = &[
+        Self::P1,
+        Self::P2,
+        Self::P3,
+        Self::P4,
+        Self::P5,
+        Self::P6,
+        Self::P7,
+    ];
+    pub const fn value(self) -> &'static str {
+        match self {
+            Self::P1 => "p1",
+            Self::P2 => "p2",
+            Self::P3 => "p3",
+            Self::P4 => "p4",
+            Self::P5 => "p5",
+            Self::P6 => "p6",
+            Self::P7 => "p7",
+        }
+    }
+}
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+mod backend_tests {
+    use super::EncoderBackend;
+
+    #[test]
+    fn backend_cli_literals_are_stable() {
+        assert_eq!(EncoderBackend::Pipe.cli_value(), "pipe");
+        assert_eq!(EncoderBackend::FfmpegNext.cli_value(), "ffmpeg-next");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            EncoderBackend::FfmpegNextNvencZeroCopy.cli_value(),
+            "ffmpeg-next-nvenc-zero-copy"
+        );
+    }
+
+    #[test]
+    fn zero_copy_profile_is_explicit_only() {
+        assert!(!EncoderBackend::Pipe.is_zero_copy());
+        assert!(!EncoderBackend::FfmpegNext.is_zero_copy());
+        #[cfg(target_os = "linux")]
+        assert!(EncoderBackend::FfmpegNextNvencZeroCopy.is_zero_copy());
+    }
+
+    #[test]
+    fn only_zero_copy_backend_restricts_video_codec() {
+        use crate::encoder::VideoCodec;
+
+        assert!(
+            EncoderBackend::Pipe
+                .validate_codec(VideoCodec::Hevc)
+                .is_ok()
+        );
+        assert!(
+            EncoderBackend::FfmpegNext
+                .validate_codec(VideoCodec::Hevc)
+                .is_ok()
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                EncoderBackend::FfmpegNextNvencZeroCopy
+                    .validate_codec(VideoCodec::H264)
+                    .is_ok()
+            );
+            let error = EncoderBackend::FfmpegNextNvencZeroCopy
+                .validate_codec(VideoCodec::Hevc)
+                .expect_err("zero-copy must reject HEVC instead of changing the codec");
+            assert_eq!(
+                error.to_string(),
+                "Vulkan/CUDA/NVENC zero-copy requires H.264"
+            );
+        }
+    }
+}
 
 fn staging_path(output: &Path) -> Result<PathBuf> {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
@@ -241,7 +406,7 @@ pub struct FfmpegNextEncoder {
     hw_frame: Option<ffmpeg::util::frame::video::Video>,
     encoder: Option<ffmpeg::codec::encoder::video::Encoder>,
     cuda_frames: Option<CudaFrames>,
-    scaler: ffmpeg::software::scaling::Context,
+    scaler: Option<ffmpeg::software::scaling::Context>,
     rgba: ffmpeg::util::frame::video::Video,
     yuv420p: ffmpeg::util::frame::video::Video,
     #[cfg(target_os = "macos")]
@@ -253,6 +418,7 @@ pub struct FfmpegNextEncoder {
     row_bytes: usize,
     pts: i64,
     finished: bool,
+    zero_copy: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,7 +430,15 @@ struct EncoderProfile {
 const LIBX264_OPTIONS: &[(&str, &str)] = &[("preset", "veryfast"), ("crf", "20")];
 const LIBX265_OPTIONS: &[(&str, &str)] = &[("preset", "veryfast"), ("crf", "22")];
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-const NVENC_OPTIONS: &[(&str, &str)] = &[("preset", "p5"), ("b", "8M")];
+const NVENC_OPTIONS: &[(&str, &str)] = &[
+    ("preset", "p5"),
+    ("b", "8M"),
+    ("bf", "0"),
+    ("rc-lookahead", "0"),
+    ("zerolatency", "1"),
+];
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const HEVC_NVENC_OPTIONS: &[(&str, &str)] = &[("preset", "p5"), ("b", "8M")];
 #[cfg(target_os = "windows")]
 const AMF_OPTIONS: &[(&str, &str)] = &[("quality", "quality"), ("b", "8M")];
 #[cfg(target_os = "windows")]
@@ -288,7 +462,7 @@ const ENCODER_PROFILES: &[EncoderProfile] = &[
 const HEVC_ENCODER_PROFILES: &[EncoderProfile] = &[
     EncoderProfile {
         name: "hevc_nvenc",
-        options: NVENC_OPTIONS,
+        options: HEVC_NVENC_OPTIONS,
     },
     EncoderProfile {
         name: "libx265",
@@ -344,7 +518,7 @@ const ENCODER_PROFILES: &[EncoderProfile] = &[
 const HEVC_ENCODER_PROFILES: &[EncoderProfile] = &[
     EncoderProfile {
         name: "hevc_nvenc",
-        options: NVENC_OPTIONS,
+        options: HEVC_NVENC_OPTIONS,
     },
     EncoderProfile {
         name: "hevc_amf",
@@ -439,6 +613,7 @@ fn open_video_encoder(
     fps: u32,
     global_header: bool,
     cuda_frames: Option<&CudaFrames>,
+    nvenc_preset: NvencPreset,
 ) -> Result<ffmpeg::codec::encoder::video::Encoder> {
     let context = ffmpeg::codec::context::Context::new_with_codec(codec);
     let mut video = context
@@ -483,8 +658,12 @@ fn open_video_encoder(
     if global_header {
         video.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
     }
+    let mut options = configure_encoder_options(profile);
+    if profile.name == "h264_nvenc" || profile.name == "hevc_nvenc" {
+        options.set("preset", nvenc_preset.value());
+    }
     video
-        .open_as_with(codec, configure_encoder_options(profile))
+        .open_as_with(codec, options)
         .with_context(|| format!("open ffmpeg-next {} encoder", profile.name))
 }
 
@@ -697,6 +876,69 @@ impl FfmpegNextEncoder {
         audio: Option<&Path>,
         video_codec: VideoCodec,
     ) -> Result<Self> {
+        Self::new_with_codec_and_preset(
+            output,
+            width,
+            height,
+            fps,
+            audio,
+            video_codec,
+            NvencPreset::P5,
+        )
+    }
+
+    pub(crate) fn new_with_codec_and_preset(
+        output: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: Option<&Path>,
+        video_codec: VideoCodec,
+        nvenc_preset: NvencPreset,
+    ) -> Result<Self> {
+        Self::new_internal(
+            output,
+            width,
+            height,
+            fps,
+            audio,
+            video_codec,
+            false,
+            nvenc_preset,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn new_zero_copy(
+        output: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: Option<&Path>,
+        nvenc_preset: NvencPreset,
+    ) -> Result<Self> {
+        Self::new_internal(
+            output,
+            width,
+            height,
+            fps,
+            audio,
+            VideoCodec::H264,
+            true,
+            nvenc_preset,
+        )
+    }
+
+    fn new_internal(
+        output: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: Option<&Path>,
+        video_codec: VideoCodec,
+        zero_copy: bool,
+        nvenc_preset: NvencPreset,
+    ) -> Result<Self> {
         ffmpeg::init().context("initialize ffmpeg-next")?;
         let staging = audio.map(|_| staging_path(output)).transpose()?;
         let video_path = staging.as_deref().unwrap_or(output);
@@ -711,8 +953,22 @@ impl FfmpegNextEncoder {
             let Some(codec) = ffmpeg::encoder::find_by_name(profile.name) else {
                 return Ok(None);
             };
+            if zero_copy && profile.name != "h264_nvenc" {
+                return Ok(None);
+            }
             let cuda_frames = (profile.name == "h264_nvenc" || profile.name == "hevc_nvenc")
-                .then(|| CudaFrames::new(width, height))
+                .then(|| {
+                    if zero_copy {
+                        CudaFrames::new_with_format_and_context(
+                            width,
+                            height,
+                            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                            true,
+                        )
+                    } else {
+                        CudaFrames::new(width, height)
+                    }
+                })
                 .transpose()
                 .with_context(|| format!("initialize CUDA frames for {}", profile.name))?;
             let encoder = open_video_encoder(
@@ -723,6 +979,7 @@ impl FfmpegNextEncoder {
                 fps,
                 global_header,
                 cuda_frames.as_ref(),
+                nvenc_preset,
             )?;
             Ok(Some((codec, encoder, cuda_frames)))
         })
@@ -754,16 +1011,6 @@ impl FfmpegNextEncoder {
             .stream(stream_index)
             .context("ffmpeg-next output stream disappeared")?
             .time_base();
-        let scaler = ffmpeg::software::scaling::Context::get(
-            ffmpeg::format::Pixel::RGBA,
-            width,
-            height,
-            ffmpeg::format::Pixel::YUV420P,
-            width,
-            height,
-            ffmpeg::software::scaling::flag::Flags::BILINEAR,
-        )
-        .context("create RGBA to YUV420P scaler")?;
 
         #[cfg(target_os = "macos")]
         if profile.name == "h264_videotoolbox" || profile.name == "hevc_videotoolbox" {
@@ -783,7 +1030,7 @@ impl FfmpegNextEncoder {
                 hw_frame: None,
                 encoder: None,
                 cuda_frames: None,
-                scaler,
+                scaler: None,
                 rgba: ffmpeg::util::frame::video::Video::empty(),
                 yuv420p: ffmpeg::util::frame::video::Video::empty(),
                 vt_worker: Some(vt_worker),
@@ -794,9 +1041,23 @@ impl FfmpegNextEncoder {
                 row_bytes: width as usize * 4,
                 pts: 0,
                 finished: false,
+                zero_copy: false,
             });
         }
-
+        let scaler = (!zero_copy)
+            .then(|| {
+                ffmpeg::software::scaling::Context::get(
+                    ffmpeg::format::Pixel::RGBA,
+                    width,
+                    height,
+                    ffmpeg::format::Pixel::YUV420P,
+                    width,
+                    height,
+                    ffmpeg::software::scaling::flag::Flags::BILINEAR,
+                )
+            })
+            .transpose()
+            .context("create RGBA to YUV420P scaler")?;
         Ok(Self {
             output: Some(format),
             output_path: output.to_owned(),
@@ -808,16 +1069,20 @@ impl FfmpegNextEncoder {
             encoder: Some(encoder),
             cuda_frames,
             scaler,
-            rgba: ffmpeg::util::frame::video::Video::new(
-                ffmpeg::format::Pixel::RGBA,
-                width,
-                height,
-            ),
-            yuv420p: ffmpeg::util::frame::video::Video::new(
-                ffmpeg::format::Pixel::YUV420P,
-                width,
-                height,
-            ),
+            rgba: if zero_copy {
+                ffmpeg::util::frame::video::Video::empty()
+            } else {
+                ffmpeg::util::frame::video::Video::new(ffmpeg::format::Pixel::RGBA, width, height)
+            },
+            yuv420p: if zero_copy {
+                ffmpeg::util::frame::video::Video::empty()
+            } else {
+                ffmpeg::util::frame::video::Video::new(
+                    ffmpeg::format::Pixel::YUV420P,
+                    width,
+                    height,
+                )
+            },
             #[cfg(target_os = "macos")]
             vt_worker: None,
             stream_index,
@@ -827,20 +1092,21 @@ impl FfmpegNextEncoder {
             row_bytes: width as usize * 4,
             pts: 0,
             finished: false,
+            zero_copy,
         })
     }
 
-    fn validate(&self, frame: &RenderedFrame) -> Result<()> {
-        if frame.width() != self.width
-            || frame.height() != self.height
-            || frame.row_bytes() != self.row_bytes
-            || frame.pixels().len() != self.height as usize * self.row_bytes
+    fn validate(width: u32, height: u32, row_bytes: usize, frame: &RenderedFrame) -> Result<()> {
+        if frame.width() != width
+            || frame.height() != height
+            || frame.row_bytes() != row_bytes
+            || frame.pixels().len() != height as usize * row_bytes
         {
             bail!(
                 "invalid frame dimensions or pixel buffer: expected {}x{} with {} bytes per row",
-                self.width,
-                self.height,
-                self.row_bytes
+                width,
+                height,
+                row_bytes
             );
         }
         Ok(())
@@ -911,16 +1177,225 @@ impl FfmpegNextEncoder {
         }
         Ok(())
     }
+
+    #[cfg(target_os = "linux")]
+    fn submit_zero_copy(&mut self, mut frame: RenderedFrame) -> Result<RenderedFrame> {
+        let payload = frame
+            .gpu_payload()
+            .context("zero-copy encoder requires a GPU frame payload")?
+            .clone()
+            .downcast::<crate::gpu_interop::GpuFramePayload>()
+            .map_err(|_| anyhow::anyhow!("zero-copy frame payload has an incompatible owner"))?;
+        if frame.width() != self.width || frame.height() != self.height {
+            bail!("zero-copy frame dimensions do not match encoder");
+        }
+        let layout = payload.layout();
+        if layout.width != self.width
+            || layout.height != self.height
+            || payload.pointer() == 0
+            || payload.mapping_size() < layout.size as u64
+            || layout.y_pitch > i32::MAX as usize
+            || layout.uv_pitch > i32::MAX as usize
+            || layout
+                .uv_offset
+                .checked_add(layout.uv_pitch * (layout.height / 2) as usize)
+                .is_none_or(|end| end > payload.mapping_size() as usize)
+        {
+            bail!("zero-copy frame has invalid CUDA NV12 allocation bounds or pitch");
+        }
+        payload.wait_for_cuda(self.pts.max(0) as u64)?;
+        payload.claim_encoder()?;
+        let pointer = payload.pointer();
+        frame.clear_gpu_payload();
+        let frames = self
+            .cuda_frames
+            .as_ref()
+            .context("zero-copy encoder has no CUDA frames context")?;
+        let mut hw_frame = ffmpeg::util::frame::video::Video::empty();
+        let frames_ref = frames
+            .clone_ref()
+            .context("clone CUDA frames context for zero-copy frame")?;
+        let opaque = Box::into_raw(Box::new(payload)) as *mut std::ffi::c_void;
+        let buffer = unsafe {
+            ffmpeg::ffi::av_buffer_create(
+                pointer as *mut u8,
+                layout.size,
+                Some(free_gpu_payload),
+                opaque,
+                0,
+            )
+        };
+        if buffer.is_null() {
+            unsafe {
+                drop(Box::from_raw(
+                    opaque as *mut std::sync::Arc<crate::gpu_interop::GpuFramePayload>,
+                ));
+                ffmpeg::ffi::av_buffer_unref(&mut (frames_ref as *mut _));
+            }
+            bail!("FFmpeg failed to create CUDA frame owner buffer");
+        }
+        unsafe {
+            let raw = hw_frame.as_mut_ptr();
+            (*raw).format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA as i32;
+            (*raw).width = self.width as i32;
+            (*raw).height = self.height as i32;
+            (*raw).pts = self.pts;
+            (*raw).data[0] = pointer as *mut u8;
+            (*raw).data[1] = pointer
+                .checked_add(layout.uv_offset as u64)
+                .context("NV12 UV pointer overflow")? as *mut u8;
+            (*raw).extended_data = (*raw).data.as_mut_ptr();
+            (*raw).linesize[0] = layout.y_pitch as i32;
+            (*raw).linesize[1] = layout.uv_pitch as i32;
+            (*raw).buf[0] = buffer;
+            (*raw).hw_frames_ctx = frames_ref;
+        }
+        let send_result = self
+            .encoder
+            .as_mut()
+            .context("ffmpeg-next encoder is closed")
+            .and_then(|encoder| encoder.send_frame(&hw_frame).map_err(anyhow::Error::from));
+        unsafe { ffmpeg::ffi::av_frame_unref(hw_frame.as_mut_ptr()) };
+        if let Err(error) = send_result {
+            return Err(error.context("send zero-copy CUDA frame to NVENC"));
+        }
+        self.pts += 1;
+        self.write_packets()?;
+        Ok(frame)
+    }
+}
+
+#[cfg(target_os = "linux")]
+const ZERO_COPY_QUEUE_CAPACITY: usize = 8;
+
+// Keep rendering ahead of NVENC so the render thread does not wait on each
+// CUDA semaphore before submitting the next Vulkan frame.
+
+// FFmpeg owns the CUDA and scaler contexts exclusively after construction;
+// the zero-copy worker is their sole user, so ownership can move to it.
+#[cfg(target_os = "linux")]
+unsafe impl Send for FfmpegNextEncoder {}
+
+#[cfg(target_os = "linux")]
+pub struct AsyncZeroCopyEncoder {
+    sender: Option<std::sync::mpsc::SyncSender<RenderedFrame>>,
+    worker: Option<std::thread::JoinHandle<Result<()>>>,
+    spare: RenderedFrame,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncZeroCopyEncoder {
+    pub fn new(
+        output: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: Option<&Path>,
+        nvenc_preset: NvencPreset,
+    ) -> Result<Self> {
+        let encoder =
+            FfmpegNextEncoder::new_zero_copy(output, width, height, fps, audio, nvenc_preset)?;
+        let (sender, frames) =
+            std::sync::mpsc::sync_channel::<RenderedFrame>(ZERO_COPY_QUEUE_CAPACITY);
+        let worker = std::thread::Builder::new()
+            .name("nvenc-zero-copy".to_owned())
+            .spawn(move || {
+                let mut encoder = encoder;
+                for frame in frames {
+                    encoder.submit_zero_copy(frame)?;
+                }
+                encoder.finish()
+            })
+            .context("spawn zero-copy encoder thread")?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            spare: RenderedFrame::new_gpu_only(width, height),
+            width,
+            height,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl FrameSink for AsyncZeroCopyEncoder {
+    fn requires_cpu_pixels(&self) -> bool {
+        false
+    }
+
+    fn submit(&mut self, mut frame: RenderedFrame) -> Result<RenderedFrame> {
+        if frame.width() != self.width || frame.height() != self.height {
+            bail!(
+                "invalid frame dimensions: expected {}x{}",
+                self.width,
+                self.height
+            );
+        }
+        frame.drop_cpu_pixels();
+        let result = self
+            .sender
+            .as_ref()
+            .context("zero-copy encoder is already finished")?
+            .send(frame);
+        let spare = std::mem::replace(
+            &mut self.spare,
+            RenderedFrame::new_gpu_only(self.width, self.height),
+        );
+        if let Err(error) = result {
+            self.sender.take();
+            self.spare = spare;
+            return Err(error).context("send frame to zero-copy encoder");
+        }
+        Ok(spare)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.sender.take();
+        let worker = self
+            .worker
+            .take()
+            .context("zero-copy encoder already finished")?;
+        match worker.join() {
+            Ok(result) => result,
+            Err(_) => bail!("zero-copy encoder thread panicked"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for AsyncZeroCopyEncoder {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl FrameSink for FfmpegNextEncoder {
+    fn requires_cpu_pixels(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.vt_worker.is_some() {
+            return false;
+        }
+        true
+    }
+
     fn submit(&mut self, mut frame: RenderedFrame) -> Result<RenderedFrame> {
         if self.finished {
             bail!("ffmpeg-next encoder is already finished");
         }
-        self.validate(&frame)?;
+        if self.zero_copy {
+            #[cfg(target_os = "linux")]
+            return self.submit_zero_copy(frame);
+            #[cfg(not(target_os = "linux"))]
+            unreachable!("zero-copy encoder is Linux-only");
+        }
         let frame_pts = self.pts;
         self.pts += 1;
+        let (width, height, row_bytes) = (self.width, self.height, self.row_bytes);
 
         #[cfg(target_os = "macos")]
         if let Some(vt_worker) = self.vt_worker.as_mut() {
@@ -941,6 +1416,7 @@ impl FrameSink for FfmpegNextEncoder {
                 }
                 return Ok(frame);
             }
+            Self::validate(width, height, row_bytes, &frame)?;
             if sender
                 .send(MacosWorkerItem::Cpu {
                     pts: frame_pts,
@@ -973,6 +1449,7 @@ impl FrameSink for FfmpegNextEncoder {
             }
         }
 
+        Self::validate(width, height, row_bytes, &frame)?;
         let stride = self.rgba.stride(0);
         for row in 0..self.height as usize {
             let source = &frame.pixels()[row * frame.row_bytes()..(row + 1) * frame.row_bytes()];
@@ -982,6 +1459,8 @@ impl FrameSink for FfmpegNextEncoder {
         }
         self.rgba.set_pts(Some(frame_pts));
         self.scaler
+            .as_mut()
+            .context("ordinary encoder has no RGBA scaler")?
             .run(&self.rgba, &mut self.yuv420p)
             .context("convert RGBA frame to YUV420P")?;
         self.yuv420p.set_pts(Some(frame_pts));
@@ -1132,9 +1611,30 @@ mod tests {
         for profile in encoder_profiles() {
             let expected = match profile.name {
                 "libx264" => [("preset", "veryfast"), ("crf", "20")].as_slice(),
-                "h264_nvenc" => [("preset", "p5"), ("b", "8M")].as_slice(),
+                "h264_nvenc" => [
+                    ("preset", "p5"),
+                    ("b", "8M"),
+                    ("bf", "0"),
+                    ("rc-lookahead", "0"),
+                    ("zerolatency", "1"),
+                ]
+                .as_slice(),
                 "h264_amf" => [("quality", "quality"), ("b", "8M")].as_slice(),
                 "h264_qsv" | "h264_videotoolbox" => [("b", "8M")].as_slice(),
+                name => panic!("unexpected encoder profile {name}"),
+            };
+            assert_eq!(profile.options, expected);
+        }
+    }
+
+    #[test]
+    fn hevc_candidate_profiles_keep_exact_encoder_options() {
+        for profile in encoder_profiles_for_codec(VideoCodec::Hevc) {
+            let expected = match profile.name {
+                "libx265" => [("preset", "veryfast"), ("crf", "22")].as_slice(),
+                "hevc_nvenc" => [("preset", "p5"), ("b", "8M")].as_slice(),
+                "hevc_amf" => [("quality", "quality"), ("b", "8M")].as_slice(),
+                "hevc_qsv" | "hevc_videotoolbox" => [("b", "8M")].as_slice(),
                 name => panic!("unexpected encoder profile {name}"),
             };
             assert_eq!(profile.options, expected);

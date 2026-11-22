@@ -42,6 +42,33 @@ impl Renderer {
         width: u32,
         height: u32,
         fps: u32,
+        lines: Vec<LyricLine>,
+        background: BackgroundRenderer,
+        cover: Option<CoverRenderer>,
+        render_translation: bool,
+        render_background_vocal: bool,
+        lyrics_style: LyricsStyle,
+        excluded_lines: &[usize],
+    ) -> Result<Self> {
+        Self::with_scene_options_for_encoder(
+            width,
+            height,
+            fps,
+            lines,
+            background,
+            cover,
+            render_translation,
+            render_background_vocal,
+            lyrics_style,
+            excluded_lines,
+            crate::EncoderBackend::Pipe,
+        )
+    }
+
+    pub fn with_scene_options_for_encoder(
+        width: u32,
+        height: u32,
+        fps: u32,
         mut lines: Vec<LyricLine>,
         background: BackgroundRenderer,
         cover: Option<CoverRenderer>,
@@ -49,6 +76,7 @@ impl Renderer {
         render_background_vocal: bool,
         lyrics_style: LyricsStyle,
         excluded_lines: &[usize],
+        encoder: crate::EncoderBackend,
     ) -> Result<Self> {
         if width == 0 || height == 0 || fps == 0 {
             bail!("width, height, and fps must be positive");
@@ -79,7 +107,7 @@ impl Renderer {
             lyrics.group_gap(),
             lyrics.interlude_slot_height(),
         );
-        let surface = crate::surface::SurfaceRenderer::try_new()?;
+        let surface = crate::surface::SurfaceRenderer::try_new_for_encoder(encoder, width, height)?;
         Ok(Self {
             width,
             height,
@@ -131,42 +159,20 @@ impl Renderer {
     }
 
     pub fn render_frame(&mut self, t_ms: u64) -> Result<RenderedFrame> {
+        #[cfg(target_os = "linux")]
+        let mut frame = if self.surface.is_external_vulkan() {
+            RenderedFrame::new_gpu_only(self.width, self.height)
+        } else {
+            RenderedFrame::new(self.width, self.height)
+        };
+        #[cfg(not(target_os = "linux"))]
         let mut frame = RenderedFrame::new(self.width, self.height);
         self.render_frame_into(t_ms, &mut frame)?;
         Ok(frame)
     }
 
     pub fn render_frame_into(&mut self, t_ms: u64, frame: &mut RenderedFrame) -> Result<()> {
-        if frame.width() != self.width || frame.height() != self.height {
-            bail!(
-                "invalid frame dimensions: expected {}x{}, got {}x{}",
-                self.width,
-                self.height,
-                frame.width(),
-                frame.height()
-            );
-        }
-        if frame.row_bytes() != self.row_bytes
-            || frame.pixels().len() != self.height as usize * self.row_bytes
-        {
-            bail!("invalid frame pixel buffer");
-        }
-        self.layout.update(&self.lines, t_ms, self.fps);
-        let geometry = self.geometry;
-        let lines = &self.lines;
-        let layout = &self.layout;
-        let background = &mut self.background;
-        let cover = &mut self.cover;
-        let lyrics = &self.lyrics;
-        self.surface
-            .render_into(&self.info, self.row_bytes, frame.pixels_mut(), |canvas| {
-                canvas.clear(Color::BLACK);
-                background.draw(canvas, &geometry, t_ms)?;
-                if let Some(cover) = cover {
-                    cover.draw(canvas, &geometry)?;
-                }
-                lyrics.draw(canvas, lines, layout, t_ms, geometry.lyrics.height as u32)
-            })
+        self.render_frame_impl(t_ms, frame, true, false)
     }
 
     pub fn render_frame_into_opts(
@@ -174,6 +180,16 @@ impl Renderer {
         t_ms: u64,
         frame: &mut RenderedFrame,
         read_cpu_pixels: bool,
+    ) -> Result<()> {
+        self.render_frame_impl(t_ms, frame, read_cpu_pixels, true)
+    }
+
+    fn render_frame_impl(
+        &mut self,
+        t_ms: u64,
+        frame: &mut RenderedFrame,
+        read_cpu_pixels: bool,
+        gpu_frame: bool,
     ) -> Result<()> {
         if frame.width() != self.width || frame.height() != self.height {
             bail!(
@@ -185,7 +201,8 @@ impl Renderer {
             );
         }
         if frame.row_bytes() != self.row_bytes
-            || frame.pixels().len() != self.height as usize * self.row_bytes
+            || (!self.surface.is_external_vulkan()
+                && frame.pixels().len() != self.height as usize * self.row_bytes)
         {
             bail!("invalid frame pixel buffer");
         }
@@ -196,20 +213,25 @@ impl Renderer {
         let background = &mut self.background;
         let cover = &mut self.cover;
         let lyrics = &self.lyrics;
-        self.surface.render_into_frame(
-            &self.info,
-            self.row_bytes,
-            frame,
-            read_cpu_pixels,
-            |canvas| {
-                canvas.clear(Color::BLACK);
-                background.draw(canvas, &geometry, t_ms)?;
-                if let Some(cover) = cover {
-                    cover.draw(canvas, &geometry)?;
-                }
-                lyrics.draw(canvas, lines, layout, t_ms, geometry.lyrics.height as u32)
-            },
-        )
+        let draw = |canvas: &skia_safe::Canvas| {
+            canvas.clear(Color::BLACK);
+            background.draw(canvas, &geometry, t_ms)?;
+            if let Some(cover) = cover {
+                cover.draw(canvas, &geometry)?;
+            }
+            lyrics.draw(canvas, lines, layout, t_ms, geometry.lyrics.height as u32)
+        };
+        if gpu_frame || self.surface.is_external_vulkan() {
+            self.surface
+                .render_into_frame(&self.info, self.row_bytes, frame, read_cpu_pixels, draw)
+        } else {
+            #[cfg(target_os = "macos")]
+            frame.set_gpu_frame(None);
+            #[cfg(target_os = "linux")]
+            frame.clear_gpu_payload();
+            self.surface
+                .render_into(&self.info, self.row_bytes, frame.pixels_mut(), draw)
+        }
     }
 }
 
@@ -230,6 +252,7 @@ pub fn probe_renderer_initialization(width: u32, height: u32, fps: u32) -> Resul
         background_vocal: None,
         words: Vec::new(),
     }];
+    let mut renderer = Renderer::new(width, height, fps, lines)?;
     let mut frame = RenderedFrame::new(width, height);
     renderer.render_frame_into(0, &mut frame)?;
     Ok(())

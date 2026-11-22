@@ -12,3 +12,9 @@
 - `src/lrc.rs`、`src/ttml.rs`、`src/yrc.rs`：歌词解析
 - `src/video.rs`、`src/pdf_renderer.rs`：视频与 PDF 输出
 - `node/`、`python/`、`cpp/`、`include/`：绑定库
+
+## 视频导出
+
+macOS 的 `goosy render` 默认使用 `ffmpeg-next`，支持 `--codec h264` 和 `--codec hevc`。Metal 可用时，VideoToolbox 通过 GPU 帧编码。
+
+Linux 可用 `--encoder ffmpeg-next-nvenc-zero-copy --codec h264` 启用 Vulkan、CUDA 和 NVENC 零拷贝导出。该模式仅支持 H.264，导出期间仍报告进度。NVENC 预设可用 `--nvenc-preset p1` 至 `p7` 指定，默认为 `p5`。
