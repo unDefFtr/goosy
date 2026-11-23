@@ -1,0 +1,15 @@
+<RCC>
+    <qresource prefix="/goosy">
+        <file>Goosy.qml</file>
+        <file>pages/Home.qml</file>
+        <file>pages/Tasks.qml</file>
+        <file>pages/Settings.qml</file>
+        <file>components/NumberField.qml</file>
+        <file>components/PreviewPanel.qml</file>
+        <file>components/TaskPreview.qml</file>
+        <file>components/SectionCard.qml</file>
+        <file>components/SettingsPanel.qml</file>
+        <file>components/SliderRow.qml</file>
+        <file>js/ui.js</file>
+    </qresource>
+</RCC>

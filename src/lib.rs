@@ -15,6 +15,7 @@ pub mod pdf_renderer;
 pub mod renderer;
 pub mod spring;
 pub mod surface;
+pub mod task_manager;
 pub mod ttml;
 pub mod video;
 pub mod yrc;
@@ -298,11 +299,7 @@ where
         }
         render_seconds += phase_started.elapsed().as_secs_f64();
         progress.inc(1);
-        let callback_pixels: &[u8] = if read_cpu_pixels {
-            frame.pixels()
-        } else {
-            &[]
-        };
+        let callback_pixels: &[u8] = if read_cpu_pixels { frame.pixels() } else { &[] };
         on_frame(
             frame_index + 1,
             total_frames,
@@ -318,10 +315,16 @@ where
     finish_seconds = phase_started.elapsed().as_secs_f64();
     let elapsed_seconds = render_started.elapsed().as_secs_f64();
     if profile {
-        eprintln!("render profile: frames={} total={:.6}s render={:.6}s submit={:.6}s finish={:.6}s", total_frames, elapsed_seconds, render_seconds, submit_seconds, finish_seconds);
+        eprintln!(
+            "render profile: frames={} total={:.6}s render={:.6}s submit={:.6}s finish={:.6}s",
+            total_frames, elapsed_seconds, render_seconds, submit_seconds, finish_seconds
+        );
     }
     progress.finish_and_clear();
-    Ok(RenderStats { frames: total_frames, elapsed_seconds })
+    Ok(RenderStats {
+        frames: total_frames,
+        elapsed_seconds,
+    })
 }
 
 pub fn read_lyrics_file(

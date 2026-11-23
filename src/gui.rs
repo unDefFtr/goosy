@@ -1,8 +1,12 @@
+use crate::gui_shared::{
+    LYRIC_EXTENSIONS, PreviewFrame, STYLE_PREVIEW_MAX_HEIGHT, STYLE_PREVIEW_MAX_WIDTH,
+    StylePreviewScene, load_style_preview_assets, random_sample_range as random_sample_window,
+    render_style_preview as render_style_preview_frame, sample_output_path, scan_sibling_assets,
+};
 use eframe::egui;
 use libgoosy::{
-    EncoderBackend, LyricFormat, LyricsStyle, RenderControl, RenderOptions, VideoCodec, background,
-    cover_renderer, geometry::FrameGeometry, image_asset::ImageAsset, layout::Layout, lrc,
-    lyrics_renderer::LyricsRenderer, video,
+    EncoderBackend, LyricFormat, LyricsStyle, RenderControl, RenderOptions, VideoCodec,
+    image_asset::SceneImageAssets, lrc, video,
 };
 use rfd::FileDialog;
 use std::collections::VecDeque;
@@ -63,182 +67,30 @@ fn style_percent_slider(
     });
 }
 
-const STYLE_PREVIEW_MAX_WIDTH: u32 = 640;
-const STYLE_PREVIEW_MAX_HEIGHT: u32 = 360;
-const STYLE_PREVIEW_TIME_MS: u64 = 2_500;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct StylePreviewScene {
-    width: u32,
-    height: u32,
-    title: String,
-    cover_path: Option<PathBuf>,
-    embedded_cover_audio: Option<PathBuf>,
-    render_translation: bool,
-    render_background_vocal: bool,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StylePreviewKey {
     style: [u32; 10],
     scene: StylePreviewScene,
 }
 
-fn style_preview_dimensions(width: u32, height: u32) -> (u32, u32) {
-    let scale = (STYLE_PREVIEW_MAX_WIDTH as f64 / width.max(1) as f64)
-        .min(STYLE_PREVIEW_MAX_HEIGHT as f64 / height.max(1) as f64)
-        .min(1.0);
-    (
-        (width as f64 * scale).round().max(1.0) as u32,
-        (height as f64 * scale).round().max(1.0) as u32,
+fn preview_color_image(frame: PreviewFrame) -> egui::ColorImage {
+    egui::ColorImage::from_rgba_unmultiplied(
+        [frame.width as usize, frame.height as usize],
+        &frame.pixels,
     )
 }
 
-fn style_preview_lines() -> Vec<lrc::LyricLine> {
-    vec![
-        lrc::LyricLine {
-            start_ms: 0,
-            end_ms: 1_500,
-            text: "上一行歌词 · Previous line".to_owned(),
-            translation: None,
-            agent_id: None,
-            is_duet: false,
-            is_background: false,
-            background_vocal: None,
-            words: Vec::new(),
-        },
-        lrc::LyricLine {
-            start_ms: 1_500,
-            end_ms: 4_500,
-            text: "正在演唱的歌词，用于预览换行与行高".to_owned(),
-            translation: Some("Live style preview for spacing and line height".to_owned()),
-            agent_id: None,
-            is_duet: false,
-            is_background: false,
-            background_vocal: Some(lrc::BackgroundVocal {
-                start_ms: 2_000,
-                end_ms: 3_500,
-                text: "伴唱歌词 · Background vocal".to_owned(),
-                translation: None,
-                words: vec![lrc::LyricWord {
-                    start_ms: 2_000,
-                    end_ms: 3_500,
-                    text: "伴唱歌词 · Background vocal".to_owned(),
-                }],
-            }),
-            words: Vec::new(),
-        },
-        lrc::LyricLine {
-            start_ms: 4_500,
-            end_ms: 6_500,
-            text: "下一行歌词 · Next line".to_owned(),
-            translation: None,
-            agent_id: None,
-            is_duet: false,
-            is_background: false,
-            background_vocal: None,
-            words: Vec::new(),
-        },
-    ]
-}
-
-fn load_style_preview_cover(scene: &StylePreviewScene) -> Result<Option<ImageAsset>, String> {
-    if let Some(path) = scene.cover_path.as_deref() {
-        return ImageAsset::from_path(path)
-            .map(Some)
-            .map_err(|error| format!("读取预览封面 {} 失败：{error:#}", path.display()));
-    }
-    let Some(audio) = scene.embedded_cover_audio.as_deref() else {
-        return Ok(None);
-    };
-    video::embedded_cover_image(audio)
-        .map_err(|error| error.to_string())?
-        .as_deref()
-        .map(ImageAsset::from_bytes)
-        .transpose()
-        .map_err(|error| error.to_string())
-}
-
+#[cfg(test)]
 fn render_style_preview(
     style: LyricsStyle,
     scene: &StylePreviewScene,
-    cover_asset: Option<&ImageAsset>,
+    cover_asset: Option<&libgoosy::image_asset::ImageAsset>,
 ) -> Result<egui::ColorImage, String> {
-    use skia_safe::{AlphaType, ColorType, IPoint, ImageInfo, surfaces};
-
-    let output_width = scene.width.max(1);
-    let output_height = scene.height.max(1);
-    let preview_dimensions = style_preview_dimensions(output_width, output_height);
-    let preview_size = (preview_dimensions.0 as i32, preview_dimensions.1 as i32);
-    let geometry = FrameGeometry::for_frame(output_width, output_height);
-    let lines = style_preview_lines();
-    let renderer = LyricsRenderer::new_with_options(
-        &lines,
-        geometry.lyrics,
-        scene.render_translation,
-        scene.render_background_vocal,
-        style,
-    )
-    .map_err(|error| error.to_string())?;
-    let mut layout = Layout::new(
-        &lines,
-        geometry.lyrics.height,
-        renderer.group_heights(),
-        renderer.group_gap(),
-        renderer.interlude_slot_height(),
-    );
-    layout.update(&lines, STYLE_PREVIEW_TIME_MS, 30);
-    let mut background = if let Some(asset) = cover_asset {
-        background::BackgroundRenderer::from_image_asset(asset)
-            .map_err(|error| error.to_string())?
-    } else {
-        background::BackgroundRenderer::dynamic()
+    let assets = SceneImageAssets {
+        background: cover_asset.cloned(),
+        cover: cover_asset.cloned(),
     };
-    let mut cover = cover_asset
-        .map(|asset| {
-            cover_renderer::CoverRenderer::from_image_asset(asset, Some(scene.title.clone()))
-        })
-        .transpose()
-        .map_err(|error| error.to_string())?;
-
-    let mut surface = surfaces::raster_n32_premul(preview_size)
-        .ok_or_else(|| "无法创建样式预览画布".to_owned())?;
-    let canvas = surface.canvas();
-    canvas.clear(skia_safe::Color::BLACK);
-    let saved = canvas.save();
-    canvas.scale((
-        preview_dimensions.0 as f32 / output_width as f32,
-        preview_dimensions.1 as f32 / output_height as f32,
-    ));
-    background
-        .draw(canvas, &geometry, STYLE_PREVIEW_TIME_MS)
-        .map_err(|error| error.to_string())?;
-    if let Some(cover) = &mut cover {
-        cover
-            .draw(canvas, &geometry)
-            .map_err(|error| error.to_string())?;
-    }
-    renderer
-        .draw(
-            canvas,
-            &lines,
-            &layout,
-            STYLE_PREVIEW_TIME_MS,
-            output_height,
-        )
-        .map_err(|error| error.to_string())?;
-    canvas.restore_to_count(saved);
-
-    let info = ImageInfo::new(preview_size, ColorType::RGBA8888, AlphaType::Premul, None);
-    let row_bytes = preview_dimensions.0 as usize * 4;
-    let mut pixels = vec![0; info.compute_byte_size(row_bytes)];
-    if !surface.read_pixels(&info, &mut pixels, row_bytes, IPoint::new(0, 0)) {
-        return Err("读取样式预览像素失败".to_owned());
-    }
-    Ok(egui::ColorImage::from_rgba_unmultiplied(
-        [preview_dimensions.0 as usize, preview_dimensions.1 as usize],
-        &pixels,
-    ))
+    render_style_preview_frame(style, scene, &assets).map(preview_color_image)
 }
 
 struct StylePreviewRequest {
@@ -259,30 +111,34 @@ fn spawn_style_preview_worker() -> (
     let (request_sender, request_receiver) = mpsc::channel::<StylePreviewRequest>();
     let (output_sender, output_receiver) = mpsc::channel::<StylePreviewOutput>();
     thread::spawn(move || {
-        let mut cached_cover: Option<(
-            (Option<PathBuf>, Option<PathBuf>),
-            Result<Option<ImageAsset>, String>,
+        let mut cached_assets: Option<(
+            (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>),
+            Result<SceneImageAssets, String>,
         )> = None;
         while let Ok(mut request) = request_receiver.recv() {
             while let Ok(newer) = request_receiver.try_recv() {
                 request = newer;
             }
             let source = (
+                request.key.scene.background_path.clone(),
                 request.key.scene.cover_path.clone(),
                 request.key.scene.embedded_cover_audio.clone(),
             );
-            if cached_cover.as_ref().map(|cached| &cached.0) != Some(&source) {
-                cached_cover = Some((source, load_style_preview_cover(&request.key.scene)));
+            if cached_assets.as_ref().map(|cached| &cached.0) != Some(&source) {
+                cached_assets = Some((source, load_style_preview_assets(&request.key.scene)));
             }
-            let image = match cached_cover
+            let image = match cached_assets
                 .as_ref()
-                .expect("preview cover cache")
+                .expect("preview asset cache")
                 .1
                 .as_ref()
             {
-                Ok(cover) => {
-                    render_style_preview(request.style, &request.key.scene, cover.as_ref())
-                }
+                Ok(assets) => render_style_preview_frame(
+                    request.style,
+                    &request.key.scene,
+                    assets,
+                )
+                .map(preview_color_image),
                 Err(error) => Err(error.clone()),
             };
             let key = request.key;
@@ -319,10 +175,6 @@ fn configure_chinese_font(context: &egui::Context) {
     context.set_fonts(definitions);
 }
 
-const LYRIC_EXTENSIONS: &[&str] = &["lrc", "ttml", "xml", "yrc"];
-const COVER_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff", "avif", "heic", "heif",
-];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppPage {
     Render,
@@ -902,6 +754,7 @@ impl GoosyApp {
                 height: self.height,
                 title: self.title.clone(),
                 cover_path,
+                background_path: None,
                 embedded_cover_audio,
                 render_translation: self.render_translation,
                 render_background_vocal: self.render_background_vocal,
@@ -1056,49 +909,14 @@ impl GoosyApp {
     }
     fn render_output_path(&self, sample: Option<(u64, u64)>) -> Option<PathBuf> {
         let output = self.output.clone()?;
-        let Some((start_ms, _)) = sample else {
-            return Some(output);
-        };
-        let stem = output.file_stem()?.to_str()?;
-        let extension = output
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("mp4");
-        Some(output.with_file_name(format!("{stem}.sample-{start_ms}ms.{extension}")))
+        match sample {
+            Some((start_ms, _)) => sample_output_path(&output, start_ms),
+            None => Some(output),
+        }
     }
 
     fn random_sample_range(&self) -> Option<(u64, u64)> {
-        let end_ms = self
-            .lyric_lines
-            .iter()
-            .map(|line| line.end_ms)
-            .max()?
-            .saturating_add(1_000);
-        let duration_ms = 15_000.min(end_ms);
-        if duration_ms == 0 {
-            return None;
-        }
-        let max_start = end_ms.saturating_sub(duration_ms);
-        let eligible = self
-            .lyric_lines
-            .iter()
-            .enumerate()
-            .filter(|(index, line)| {
-                !line.text.trim().is_empty() && !self.excluded_line_indices().contains(index)
-            })
-            .collect::<Vec<_>>();
-        if eligible.is_empty() {
-            return None;
-        }
-        let (_, line) = eligible.get(
-            (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_nanos() as usize)
-                % eligible.len(),
-        )?;
-        let start = line.start_ms.saturating_sub(3_000).min(max_start);
-        Some((start, start.saturating_add(duration_ms)))
+        random_sample_window(&self.lyric_lines, &self.excluded_line_indices())
     }
 
     fn start_sample_render(&mut self) {
@@ -2057,50 +1875,6 @@ impl eframe::App for GoosyApp {
     }
 }
 
-fn scan_sibling_assets(audio: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let Some(parent) = audio.parent() else {
-        return (Vec::new(), Vec::new());
-    };
-    let Some(stem) = audio.file_stem().and_then(|stem| stem.to_str()) else {
-        return (Vec::new(), Vec::new());
-    };
-    let target_stem = stem.to_ascii_lowercase();
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return (Vec::new(), Vec::new());
-    };
-    let mut lyrics = Vec::new();
-    let mut covers = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() || path == audio {
-            continue;
-        }
-        let Some(candidate_stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        if candidate_stem.to_ascii_lowercase() != target_stem {
-            continue;
-        }
-        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-            continue;
-        };
-        if has_extension(extension, LYRIC_EXTENSIONS) {
-            lyrics.push(path);
-        } else if has_extension(extension, COVER_EXTENSIONS) {
-            covers.push(path);
-        }
-    }
-    lyrics.sort();
-    covers.sort();
-    (lyrics, covers)
-}
-
-fn has_extension(extension: &str, accepted: &[&str]) -> bool {
-    accepted
-        .iter()
-        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-}
-
 const CREDIT_MARKERS: &[&str] = &[
     "歌手", "作曲", "作词", "作詞", "演唱", "编曲", "制作", "原唱", "词：", "曲：", "词:", "曲:",
     "artist", "singer", "composer", "lyricist", "arranger", "producer",
@@ -2131,11 +1905,14 @@ fn detect_credit_lines(lines: &[lrc::LyricLine]) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COVER_EXTENSIONS, GoosyApp, LYRIC_EXTENSIONS, PreviewEvent, StylePreviewKey,
-        StylePreviewRequest, StylePreviewScene, codec_cli_args, detect_credit_lines,
-        encoder_cli_args, has_extension, new_preview_directory, parse_preview_event,
+        GoosyApp, PreviewEvent, StylePreviewKey, StylePreviewRequest, codec_cli_args,
+        detect_credit_lines, encoder_cli_args, new_preview_directory, parse_preview_event,
         render_page_uses_columns, render_style_preview, spawn_style_preview_worker,
-        style_preview_dimensions, terminate_render_child, write_internal_preview_frame,
+        terminate_render_child, write_internal_preview_frame,
+    };
+    use crate::gui_shared::{
+        COVER_EXTENSIONS, LYRIC_EXTENSIONS, StylePreviewScene, has_extension,
+        style_preview_dimensions,
     };
     use libgoosy::{
         EncoderBackend, LyricsStyle, VideoCodec, image_asset::ImageAsset, lrc::LyricLine,
@@ -2161,6 +1938,7 @@ mod tests {
             height,
             title: "Preview title".to_owned(),
             cover_path: None,
+            background_path: None,
             embedded_cover_audio: None,
             render_translation: true,
             render_background_vocal: true,

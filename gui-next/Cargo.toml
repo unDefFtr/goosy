@@ -1,0 +1,13 @@
+[package]
+name = "goosy-rinui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cxx = "1"
+cxx-qt = "0.10"
+rinui-host = "=0.1.0-alpha.2"
+
+[build-dependencies]
+cxx-qt-build = "0.10"

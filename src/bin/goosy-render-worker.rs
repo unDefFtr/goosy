@@ -198,6 +198,14 @@ fn emit_stage(enabled: bool, key: &str, message: &str) -> Result<()> {
     Ok(())
 }
 
+// Optional protocol events. Older clients ignore these lines and retain the same exit status.
+fn emit_control(enabled: bool, state: &str) {
+    if enabled {
+        println!("GOOSY_CONTROL {state}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn ensure_renderer_backend(width: u32, height: u32, fps: u32, progress_events: bool) -> Result<()> {
     let requested = std::env::var("GOOSY_RENDER_BACKEND")
@@ -470,6 +478,7 @@ fn main() -> Result<()> {
                 }
             });
             let mut paused = false;
+            let mut cancelled = false;
             #[cfg(target_os = "linux")]
             eprintln!(
                 "video encoder: {}",
@@ -477,7 +486,7 @@ fn main() -> Result<()> {
             );
             let has_preview = preview_dir.is_some();
             let preview_enabled = has_preview && !options.encoder.is_zero_copy();
-            let _stats = libgoosy::render_with_frame_progress_control_stats_lazy(
+            let result = libgoosy::render_with_frame_progress_control_stats_lazy(
                 &options,
                 move |done, total| {
                     preview_enabled && (done == 1 || done == total || done % preview_interval == 0)
@@ -519,15 +528,27 @@ fn main() -> Result<()> {
                 || loop {
                     if paused {
                         match control_receiver.recv() {
-                            Ok(command) if command == "resume" => paused = false,
-                            Ok(command) if command == "stop" => return RenderControl::Stop,
+                            Ok(command) if command == "resume" => {
+                                paused = false;
+                                emit_control(progress_events, "resumed");
+                            }
+                            Ok(command) if command == "stop" => {
+                                cancelled = true;
+                                return RenderControl::Stop;
+                            }
                             Ok(_) => {}
                             Err(_) => return RenderControl::Stop,
                         }
                     } else {
                         match control_receiver.try_recv() {
-                            Ok(command) if command == "pause" => paused = true,
-                            Ok(command) if command == "stop" => return RenderControl::Stop,
+                            Ok(command) if command == "pause" => {
+                                paused = true;
+                                emit_control(progress_events, "paused");
+                            }
+                            Ok(command) if command == "stop" => {
+                                cancelled = true;
+                                return RenderControl::Stop;
+                            }
                             Ok(_) | Err(mpsc::TryRecvError::Empty) => {
                                 return RenderControl::Continue;
                             }
@@ -537,7 +558,11 @@ fn main() -> Result<()> {
                         }
                     }
                 },
-            )?;
+            );
+            if cancelled && result.is_err() {
+                emit_control(progress_events, "cancelled");
+            }
+            let _stats = result?;
             #[cfg(target_os = "linux")]
             {
                 println!(
@@ -553,7 +578,9 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, WorkerCodec, WorkerEncoder, downscale_rgba_nearest, preview_dimensions};
+    use super::{
+        Cli, Command, WorkerCodec, WorkerEncoder, downscale_rgba_nearest, preview_dimensions,
+    };
     use clap::Parser;
 
     #[test]

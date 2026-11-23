@@ -1,4 +1,5 @@
 mod gui;
+mod gui_shared;
 
 #[cfg(not(target_os = "windows"))]
 use libgoosy::{
