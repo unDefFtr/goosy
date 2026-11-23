@@ -126,6 +126,68 @@ fn is_metadata_line(line: &str) -> bool {
         || line[1..end].starts_with("al:")
 }
 
+fn parse_eslrc(text: &str, line_start: u64) -> Option<(String, Vec<LyricWord>)> {
+    let mut plain = String::new();
+    let mut words = Vec::new();
+    let mut cursor = 0;
+    let mut word_start = line_start;
+    let mut found_timestamp = false;
+    while cursor < text.len() {
+        let Some(open_rel) = text[cursor..].find('[') else {
+            let segment = &text[cursor..];
+            plain.push_str(segment);
+            if found_timestamp && !segment.is_empty() {
+                words.push(LyricWord {
+                    start_ms: word_start,
+                    end_ms: 0,
+                    text: segment.to_owned(),
+                });
+            }
+            break;
+        };
+        let open = cursor + open_rel;
+        let Some(close_rel) = text[open..].find(']') else {
+            let segment = &text[cursor..];
+            plain.push_str(segment);
+            if found_timestamp && !segment.is_empty() {
+                words.push(LyricWord {
+                    start_ms: word_start,
+                    end_ms: 0,
+                    text: segment.to_owned(),
+                });
+            }
+            break;
+        };
+        let close = open + close_rel;
+        let Some(end_ms) = parse_timestamp(&text[open + 1..close]) else {
+            let segment = &text[cursor..=close];
+            plain.push_str(segment);
+            if found_timestamp {
+                words.push(LyricWord {
+                    start_ms: word_start,
+                    end_ms: 0,
+                    text: segment.to_owned(),
+                });
+            }
+            cursor = close + 1;
+            continue;
+        };
+        let segment = &text[cursor..open];
+        plain.push_str(segment);
+        if !segment.is_empty() {
+            words.push(LyricWord {
+                start_ms: word_start,
+                end_ms,
+                text: segment.to_owned(),
+            });
+            found_timestamp = true;
+        }
+        word_start = end_ms;
+        cursor = close + 1;
+    }
+    found_timestamp.then_some((plain, words))
+}
+
 pub fn parse_lrc(input: &str) -> Result<Vec<LyricLine>> {
     let mut lines = Vec::new();
     for raw_line in input.lines() {
@@ -137,7 +199,8 @@ pub fn parse_lrc(input: &str) -> Result<Vec<LyricLine>> {
             }
             continue;
         }
-        let (text, words) = parse_enhanced(text);
+        let (text, words) =
+            parse_eslrc(text, timestamps[0]).unwrap_or_else(|| parse_enhanced(text));
         for start_ms in timestamps {
             lines.push(LyricLine {
                 start_ms,
@@ -207,6 +270,18 @@ mod tests {
         assert_eq!(lines[0].words[1].start_ms, 4_500);
         assert_eq!(lines[0].words[0].end_ms, 4_500);
         assert_eq!(lines[0].words[1].end_ms, 9_000);
+    }
+    #[test]
+    fn parses_eslyric_word_end_timestamps() {
+        let lines = parse_lrc("[00:01.00]你[00:01.50]好[00:02.00]\n").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].start_ms, 1_000);
+        assert_eq!(lines[0].text, "你好");
+        assert_eq!(lines[0].words[0].start_ms, 1_000);
+        assert_eq!(lines[0].words[0].end_ms, 1_500);
+        assert_eq!(lines[0].words[1].start_ms, 1_500);
+        assert_eq!(lines[0].words[1].end_ms, 2_000);
+        assert_eq!(lines[0].end_ms, 2_000);
     }
 
     #[test]
