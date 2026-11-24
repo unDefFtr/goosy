@@ -413,16 +413,19 @@ impl LyricsRenderer {
                 continue;
             }
             let top_y = layout.pos_y[index].current_position() as f32;
-            let translation_height = self.translation_heights[index];
-            let extent = self.base_heights[index] + translation_height + self.main_font_size * 0.5;
-            if top_y + extent < -self.main_font_size || top_y > height as f32 + self.main_font_size
-            {
+            let group_height = self.group_heights[index] as f32;
+            let cull_margin = self.main_font_size.max(
+                lyric_blur_sigma(LYRIC_BLUR_LEVELS, self.style.lyric_blur_sigma_step as usize)
+                    as f32,
+            );
+            if top_y + group_height < -cull_margin || top_y > height as f32 + cull_margin {
                 self.blurred_group_cache.borrow_mut()[index] = None;
                 continue;
             }
             let scale = layout.scale[index].current_position() as f32;
             let is_active = layout.is_active(index);
-            let opacity = edge_opacity(top_y, height as f32, is_active);
+            let keep_edge_opaque = is_active && index >= focus_idx;
+            let opacity = edge_opacity(top_y, group_height, height as f32, keep_edge_opaque);
             let highlight_strength = highlight_strength(&lines[index], is_active, scale, t_ms);
             let render_highlight = is_active || highlight_strength > 0.0;
             let anchor_x = if lines[index].is_duet {
@@ -434,35 +437,27 @@ impl LyricsRenderer {
             canvas.translate((anchor_x, top_y));
             canvas.scale((scale, scale));
             canvas.translate((-anchor_x, -top_y));
-            let blur_distance = if layout.highlighted_indices().binary_search(&index).is_ok() {
-                0
-            } else if index < focus_idx {
-                focus_idx - index + 1
-            } else {
-                index.saturating_sub(
-                    layout
-                        .highlighted_indices()
-                        .iter()
-                        .copied()
-                        .max()
-                        .unwrap_or(focus_idx),
-                )
-            };
-            let blur_level = blur_distance.min(LYRIC_BLUR_LEVELS);
+            let blur_level_f =
+                (layout.blur[index].current_position() as f32).clamp(0.0, LYRIC_BLUR_LEVELS as f32);
+            let blur_sigma = blur_level_f * self.style.lyric_blur_sigma_step as f32;
+            let rounded_blur_level = blur_level_f.round() as usize;
+            let settled_blur_level = (rounded_blur_level >= 1
+                && rounded_blur_level <= LYRIC_BLUR_LEVELS
+                && (blur_level_f - rounded_blur_level as f32).abs() < 0.01)
+                .then_some(rounded_blur_level);
             if opacity <= 0.0 {
                 self.blurred_group_cache.borrow_mut()[index] = None;
                 canvas.restore_to_count(transform);
                 continue;
             }
-            if blur_level == 0 || render_highlight {
+            if settled_blur_level.is_none() || render_highlight {
                 self.blurred_group_cache.borrow_mut()[index] = None;
             }
-            if blur_level > 0 {
-                let blur_sigma =
-                    lyric_blur_sigma(blur_level, self.style.lyric_blur_sigma_step as usize) as f32;
+            if blur_sigma > 0.05 {
                 let is_ref_mode = BASELINE_REFERENCE_MODE.with(Cell::get);
                 if !is_ref_mode
                     && !render_highlight
+                    && let Some(blur_level) = settled_blur_level
                     && self.draw_cached_blurred_group(
                         canvas, lines, index, blur_level, blur_sigma, opacity, top_y,
                     )
@@ -470,22 +465,43 @@ impl LyricsRenderer {
                     canvas.restore_to_count(transform);
                     continue;
                 }
-                let mut layer_paint = self.lyric_blur_paints[blur_level - 1].borrow_mut();
-                layer_paint.set_alpha_f(opacity);
                 let bounds = self.group_bounds(index, top_y, blur_sigma);
-                let layer_rec = SaveLayerRec::default().bounds(&bounds).paint(&*layer_paint);
-                let layer = canvas.save_layer(&layer_rec);
-                self.draw_group(
-                    canvas,
-                    lines,
-                    index,
-                    render_highlight,
-                    true,
-                    highlight_strength,
-                    t_ms,
-                    top_y,
-                );
-                canvas.restore_to_count(layer);
+                if let Some(blur_level) = settled_blur_level {
+                    let mut layer_paint = self.lyric_blur_paints[blur_level - 1].borrow_mut();
+                    layer_paint.set_alpha_f(opacity);
+                    let layer_rec = SaveLayerRec::default().bounds(&bounds).paint(&*layer_paint);
+                    let layer = canvas.save_layer(&layer_rec);
+                    self.draw_group(
+                        canvas,
+                        lines,
+                        index,
+                        render_highlight,
+                        blur_sigma >= 1.0,
+                        highlight_strength,
+                        t_ms,
+                        top_y,
+                    );
+                    canvas.restore_to_count(layer);
+                } else {
+                    let filter = image_filters::blur((blur_sigma, blur_sigma), None, None, None)
+                        .context("create transitioning lyric blur filter")?;
+                    let mut layer_paint = Paint::default();
+                    layer_paint.set_image_filter(filter);
+                    layer_paint.set_alpha_f(opacity);
+                    let layer_rec = SaveLayerRec::default().bounds(&bounds).paint(&layer_paint);
+                    let layer = canvas.save_layer(&layer_rec);
+                    self.draw_group(
+                        canvas,
+                        lines,
+                        index,
+                        render_highlight,
+                        blur_sigma >= 1.0,
+                        highlight_strength,
+                        t_ms,
+                        top_y,
+                    );
+                    canvas.restore_to_count(layer);
+                }
             } else if opacity >= 0.999 {
                 self.draw_group(
                     canvas,
@@ -611,7 +627,9 @@ impl LyricsRenderer {
             self.viewport.width,
             self.viewport.height,
         );
-        bounds.intersect(&visible);
+        if !bounds.intersect(&visible) {
+            return Rect::new_empty();
+        }
         bounds
     }
 
@@ -654,7 +672,9 @@ impl LyricsRenderer {
             self.viewport.width,
             self.viewport.height,
         );
-        bounds.intersect(&visible);
+        if !bounds.intersect(&visible) {
+            return Rect::new_empty();
+        }
         bounds
     }
 
@@ -1747,11 +1767,12 @@ fn build_translation_paragraphs(
         .collect()
 }
 
-fn edge_opacity(top_y: f32, height: f32, active: bool) -> f32 {
-    if active {
+fn edge_opacity(top_y: f32, group_height: f32, height: f32, keep_opaque: bool) -> f32 {
+    if keep_opaque {
         return 1.0;
     }
-    let fade_top = ((top_y - 0.05 * height) / (0.10 * height)).clamp(0.0, 1.0);
+    let bottom_y = top_y + group_height.max(0.0);
+    let fade_top = ((bottom_y - 0.05 * height) / (0.10 * height)).clamp(0.0, 1.0);
     let fade_bottom = ((height - 0.05 * height - top_y) / (0.10 * height)).clamp(0.0, 1.0);
     fade_top.min(fade_bottom)
 }
@@ -2764,6 +2785,28 @@ mod tests {
     #[test]
     fn debug_overlays_are_opt_in() {
         assert!(!LyricsStyle::default().debug_overlays);
+    }
+
+    #[test]
+    fn edge_opacity_uses_group_bottom_for_top_fade_out() {
+        let height = 1_080.0;
+        let group_height = 220.0;
+
+        // Top is already above the 5% top line (54px), but the bilingual group's
+        // bottom (240px) is still well below the 15% line (162px), so it stays visible.
+        assert_eq!(edge_opacity(20.0, group_height, height, false), 1.0);
+        // As the group's bottom moves halfway through the 15%..5% band (108px), opacity is 0.5.
+        let mid_top = 0.10 * height - group_height;
+        assert!((edge_opacity(mid_top, group_height, height, false) - 0.5).abs() < 1e-5);
+        // Once the group's bottom crosses 5% (54px), opacity reaches 0.0.
+        let exit_top = 0.05 * height - group_height;
+        assert_eq!(edge_opacity(exit_top, group_height, height, false), 0.0);
+        // Bottom entry still fades based on top_y.
+        assert_eq!(edge_opacity(0.95 * height, group_height, height, false), 0.0);
+        assert!((edge_opacity(0.90 * height, group_height, height, false) - 0.5).abs() < 1e-5);
+        assert_eq!(edge_opacity(0.85 * height, group_height, height, false), 1.0);
+        // Focused active lines stay opaque regardless of position.
+        assert_eq!(edge_opacity(exit_top, group_height, height, true), 1.0);
     }
 }
 

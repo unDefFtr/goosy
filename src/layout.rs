@@ -3,6 +3,9 @@ use crate::spring::Spring;
 
 const POS_STIFFNESS: f64 = 90.0;
 const POS_DAMPING: f64 = 15.0;
+const BLUR_STIFFNESS: f64 = 144.0;
+const BLUR_DAMPING: f64 = 24.0;
+const MAX_BLUR_LEVEL: usize = 7;
 const MIN_ANTICIPATION_MS: u64 = 180;
 const MAX_ANTICIPATION_MS: u64 = 700;
 const MIN_INTERLUDE_MS: u64 = 4_000;
@@ -40,6 +43,7 @@ pub fn interlude_for(lines: &[LyricLine], t_ms: u64) -> Option<Interlude> {
 pub struct Layout {
     pub pos_y: Vec<Spring>,
     pub scale: Vec<Spring>,
+    pub blur: Vec<Spring>,
     active_idx: usize,
     focus_idx: usize,
     playing_indices: Vec<usize>,
@@ -89,9 +93,14 @@ impl Layout {
             .iter()
             .map(|_| Spring::with_parameters(0.97, 100.0, 25.0, 2.0, false))
             .collect();
+        let blur = lines
+            .iter()
+            .map(|_| Spring::with_parameters(0.0, BLUR_STIFFNESS, BLUR_DAMPING, 1.0, true))
+            .collect();
         Self {
             pos_y,
             scale,
+            blur,
             active_idx,
             focus_idx: active_idx,
             playing_indices: Vec::new(),
@@ -184,9 +193,13 @@ impl Layout {
         }
         let elapsed = t_ms.saturating_sub(self.transition_ms);
         for index in 0..lines.len() {
-            if elapsed >= self.stagger_delays_ms[index] {
+            let target_blur = self.target_blur(index);
+            if seeking {
+                self.blur[index].set_position(target_blur);
+            } else if elapsed >= self.stagger_delays_ms[index] {
                 let target_y = self.target_y(index);
                 self.pos_y[index].set_target_position(target_y);
+                self.blur[index].set_target_position(target_blur);
             }
         }
         let dt = if seeking {
@@ -201,6 +214,9 @@ impl Layout {
             spring.update(dt);
         }
         for spring in &mut self.scale {
+            spring.update(dt);
+        }
+        for spring in &mut self.blur {
             spring.update(dt);
         }
         self.previous_t_ms = Some(t_ms);
@@ -276,11 +292,36 @@ impl Layout {
         }
     }
 
+    fn target_blur(&self, index: usize) -> f64 {
+        let duet_overlap_playing = self.playing_indices.len() > 1
+            && self.playing_indices.binary_search(&index).is_ok();
+        let distance = if duet_overlap_playing || index == self.focus_idx {
+            0
+        } else if index < self.focus_idx {
+            self.focus_idx - index + 1
+        } else {
+            let reference_idx = if self.playing_indices.len() > 1 {
+                self.playing_indices
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(self.focus_idx)
+                    .max(self.focus_idx)
+            } else {
+                self.focus_idx
+            };
+            index.saturating_sub(reference_idx)
+        };
+        distance.min(MAX_BLUR_LEVEL) as f64
+    }
+
     fn set_targets(&mut self, lines: &[LyricLine]) {
         for index in 0..lines.len() {
             let target_y = self.target_y(index);
+            let target_blur = self.target_blur(index);
             self.pos_y[index].set_position(target_y);
             self.scale[index].set_position(if index == self.focus_idx { 1.0 } else { 0.97 });
+            self.blur[index].set_position(target_blur);
         }
     }
 }
