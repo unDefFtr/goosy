@@ -54,6 +54,13 @@ function progressPercent(done, total) {
     return (Math.round(progressValue(done, total) * 1000) / 10).toFixed(1) + "%"
 }
 
+function formatFps(done, elapsed) {
+    var frames = Number(done) || 0
+    var seconds = Number(elapsed) || 0
+    var fps = seconds > 0 ? frames / seconds : 0
+    return frames > 0 && isFinite(fps) && fps > 0 ? fps.toFixed(1) + " FPS" : "— FPS"
+}
+
 function formatCount(done, total) {
     var d = Number(done) || 0
     var t = Number(total) || 0

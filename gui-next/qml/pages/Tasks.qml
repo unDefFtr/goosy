@@ -45,6 +45,7 @@ Controls.Page {
                 taskState: String(task.state),
                 done: Number(task.done) || 0,
                 total: Number(task.total) || 0,
+                elapsed: Number(task.elapsed) || 0,
                 output: String(task.output || "")
             };
             var rowIndex = indexFor(values.taskId);
@@ -170,6 +171,7 @@ Controls.Page {
                         required property string taskState
                         required property real done
                         required property real total
+                        required property real elapsed
                         required property string output
                         required property int index
                         width: queue.width
@@ -205,7 +207,7 @@ Controls.Page {
                                     state: taskState === "failed" ? ProgressBar.Error : taskState === "paused" ? ProgressBar.Paused : ProgressBar.Running
                                 }
                                 Text {
-                                    text: Ui.progressPercent(done, total)
+                                    text: Ui.progressPercent(done, total) + " · " + Ui.formatFps(done, elapsed)
                                     typography: Typography.Caption
                                     color: Theme.currentTheme.colors.textSecondaryColor
                                 }
@@ -319,7 +321,7 @@ Controls.Page {
                         }
                         Text {
                             visible: Number(page.task.total) > 0
-                            text: Ui.formatCount(page.task.done, page.task.total) + " · " + Ui.progressPercent(page.task.done, page.task.total)
+                            text: Ui.formatCount(page.task.done, page.task.total) + " · " + Ui.progressPercent(page.task.done, page.task.total) + " · " + Ui.formatFps(page.task.done, page.task.elapsed)
                             typography: Typography.Body
                         }
                         Text {
