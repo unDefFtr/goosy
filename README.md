@@ -21,6 +21,10 @@ cargo run --no-default-features --features gui-next --bin goosy-gui-next
 cargo build --features gui-next --bins
 ```
 
+默认 egui 界面在 Windows 上使用 DirectX 12，避免初始化 Vulkan 时部分 Intel 驱动
+（`igvk64.dll`）触发 `0xc0000005` 访问冲突。排查图形问题时仍可通过 `WGPU_BACKEND`
+手动指定后端；通常无需设置该变量。
+
 新版需要同一构建产物目录中的 `goosy-render-worker`（Windows 下为 `.exe`）。QML 已嵌入，
 不需要工作目录中的源码，但部署仍需要 Qt 运行库、平台插件和 QML 模块。
 

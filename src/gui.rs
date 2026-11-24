@@ -268,7 +268,19 @@ fn terminate_render_child(child: &mut Option<Child>) -> std::io::Result<bool> {
 }
 
 pub fn run() -> eframe::Result<()> {
+    #[allow(unused_mut)] // Only Windows overrides the default setup.
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    #[cfg(target_os = "windows")]
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        // Limit instance creation itself: enumerating Vulkan adapters can crash
+        // inside Intel's igvk64.dll before an adapter is selected. A high-power
+        // preference alone cannot prevent that. Keep WGPU_BACKEND as an opt-in
+        // override for diagnostics.
+        setup.instance_descriptor.backends =
+            eframe::wgpu::Backends::from_env().unwrap_or(eframe::wgpu::Backends::DX12);
+    }
     let options = eframe::NativeOptions {
+        wgpu_options,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 620.0])
             .with_min_inner_size([700.0, 480.0]),
