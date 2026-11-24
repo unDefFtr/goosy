@@ -411,6 +411,8 @@ pub struct FfmpegNextEncoder {
     yuv420p: ffmpeg::util::frame::video::Video,
     #[cfg(target_os = "macos")]
     vt_worker: Option<MacosAsyncVtWorker>,
+    #[cfg(target_os = "windows")]
+    qsv_worker: Option<crate::win_qsv::WinQsvAsyncEncoder>,
     stream_index: usize,
     stream_time_base: ffmpeg::Rational,
     width: u32,
@@ -642,6 +644,19 @@ fn open_video_encoder(
             (*video.as_mut_ptr()).color_trc =
                 ffmpeg::ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
             if profile.name == "hevc_videotoolbox" {
+                (*video.as_mut_ptr()).codec_tag = u32::from_le_bytes(*b"hvc1");
+            }
+        }
+    } else if profile.name == "h264_qsv" || profile.name == "hevc_qsv" {
+        // Intel QSV software-surface input accepts NV12 (not YUV420P).
+        video.set_format(ffmpeg::format::Pixel::NV12);
+        unsafe {
+            (*video.as_mut_ptr()).color_range = ffmpeg::ffi::AVColorRange::AVCOL_RANGE_MPEG;
+            (*video.as_mut_ptr()).colorspace = ffmpeg::ffi::AVColorSpace::AVCOL_SPC_BT709;
+            (*video.as_mut_ptr()).color_primaries = ffmpeg::ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+            (*video.as_mut_ptr()).color_trc =
+                ffmpeg::ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+            if profile.name == "hevc_qsv" {
                 (*video.as_mut_ptr()).codec_tag = u32::from_le_bytes(*b"hvc1");
             }
         }
@@ -942,53 +957,169 @@ impl FfmpegNextEncoder {
         ffmpeg::init().context("initialize ffmpeg-next")?;
         let staging = audio.map(|_| staging_path(output)).transpose()?;
         let video_path = staging.as_deref().unwrap_or(output);
+        let profiles = encoder_profiles_for_codec(video_codec);
+
+        #[cfg(target_os = "windows")]
+        let mut preopened_hw: Option<(
+            &EncoderProfile,
+            (
+                ffmpeg::Codec,
+                ffmpeg::codec::encoder::video::Encoder,
+                Option<CudaFrames>,
+            ),
+        )> = None;
+
+        #[cfg(target_os = "windows")]
+        {
+            let disable_win_qsv_zc = std::env::var_os("GOOSY_QSV_DISABLE_ZEROCOPY").is_some();
+            // When Intel QSV is the first available hardware encoder (e.g. NVENC/AMF absent)
+            // or explicitly forced, prefer our direct D3D11 + oneVPL/MFX zero-copy pipeline.
+            // If a higher-priority hardware encoder (NVENC/AMF) opens, keep and reuse that
+            // exact instance below so we never initialize NVENC/AMF twice.
+            let force_qsv = std::env::var_os("GOOSY_QSV_FORCE").is_some();
+            let try_win_qsv = !zero_copy && !disable_win_qsv_zc;
+            if try_win_qsv {
+                if !force_qsv {
+                    for p in profiles
+                        .iter()
+                        .take_while(|p| p.name != "h264_qsv" && p.name != "hevc_qsv")
+                    {
+                        if let Some(c) = ffmpeg::encoder::find_by_name(p.name) {
+                            let cuda = (p.name == "h264_nvenc" || p.name == "hevc_nvenc")
+                                .then(|| CudaFrames::new(width, height).ok())
+                                .flatten();
+                            if let Ok(enc) = open_video_encoder(
+                                p,
+                                c,
+                                width,
+                                height,
+                                fps,
+                                true,
+                                cuda.as_ref(),
+                                nvenc_preset,
+                            ) {
+                                preopened_hw = Some((p, (c, enc, cuda)));
+                                break;
+                            }
+                        }
+                    }
+                }
+                if preopened_hw.is_none() {
+                    let qsv_cfg = crate::win_qsv::QsvEncodeConfig::from_env_defaults(
+                        video_codec,
+                        width,
+                        height,
+                        fps,
+                    );
+                    match crate::win_qsv::WinQsvAsyncEncoder::new(
+                        output,
+                        staging.clone(),
+                        audio,
+                        qsv_cfg,
+                    ) {
+                        Ok(qsv_worker) => {
+                            eprintln!(
+                                "ffmpeg-next selected video encoder: {} (D3D11/QSV zero-copy)",
+                                match video_codec {
+                                    VideoCodec::H264 => "h264_qsv",
+                                    VideoCodec::Hevc => "hevc_qsv",
+                                }
+                            );
+                            return Ok(Self {
+                                output: None,
+                                output_path: output.to_owned(),
+                                staging_path: None, // owned by WinQsvAsyncEncoder
+                                audio_path: None,
+                                hw_frame: None,
+                                encoder: None,
+                                cuda_frames: None,
+                                scaler: None,
+                                rgba: ffmpeg::util::frame::video::Video::empty(),
+                                yuv420p: ffmpeg::util::frame::video::Video::empty(),
+                                qsv_worker: Some(qsv_worker),
+                                stream_index: 0,
+                                stream_time_base: ffmpeg::Rational(1, fps as i32),
+                                width,
+                                height,
+                                row_bytes: width as usize * 4,
+                                pts: 0,
+                                finished: false,
+                                zero_copy: false,
+                            });
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "goosy: D3D11/QSV zero-copy unavailable ({err:#}); falling back to FFmpeg encoder chain"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let mut format = ffmpeg::format::output(video_path)
             .with_context(|| format!("open ffmpeg-next output {}", video_path.display()))?;
         let global_header = format
             .format()
             .flags()
             .contains(ffmpeg::format::Flags::GLOBAL_HEADER);
-        let profiles = encoder_profiles_for_codec(video_codec);
-        let (profile, (codec, encoder, cuda_frames)) = select_encoder(profiles, |profile| {
-            let Some(codec) = ffmpeg::encoder::find_by_name(profile.name) else {
-                return Ok(None);
-            };
-            if zero_copy && profile.name != "h264_nvenc" {
-                return Ok(None);
-            }
-            let cuda_frames = (profile.name == "h264_nvenc" || profile.name == "hevc_nvenc")
-                .then(|| {
-                    if zero_copy {
-                        CudaFrames::new_with_format_and_context(
-                            width,
-                            height,
-                            ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12,
-                            true,
-                        )
-                    } else {
-                        CudaFrames::new(width, height)
-                    }
-                })
-                .transpose()
-                .with_context(|| format!("initialize CUDA frames for {}", profile.name))?;
-            let encoder = open_video_encoder(
-                profile,
-                codec,
-                width,
-                height,
-                fps,
-                global_header,
-                cuda_frames.as_ref(),
-                nvenc_preset,
-            )?;
-            Ok(Some((codec, encoder, cuda_frames)))
-        })
-        .with_context(|| {
-            format!(
-                "select ffmpeg-next video encoder for {}",
-                video_path.display()
-            )
-        })?;
+
+        #[cfg(target_os = "windows")]
+        let preopened_hw = if global_header { preopened_hw } else { None };
+        #[cfg(not(target_os = "windows"))]
+        let preopened_hw: Option<(
+            &EncoderProfile,
+            (
+                ffmpeg::Codec,
+                ffmpeg::codec::encoder::video::Encoder,
+                Option<CudaFrames>,
+            ),
+        )> = None;
+
+        let (profile, (codec, encoder, cuda_frames)) = if let Some(opened) = preopened_hw {
+            opened
+        } else {
+            select_encoder(profiles, |profile| {
+                let Some(codec) = ffmpeg::encoder::find_by_name(profile.name) else {
+                    return Ok(None);
+                };
+                if zero_copy && profile.name != "h264_nvenc" {
+                    return Ok(None);
+                }
+                let cuda_frames = (profile.name == "h264_nvenc" || profile.name == "hevc_nvenc")
+                    .then(|| {
+                        if zero_copy {
+                            CudaFrames::new_with_format_and_context(
+                                width,
+                                height,
+                                ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                                true,
+                            )
+                        } else {
+                            CudaFrames::new(width, height)
+                        }
+                    })
+                    .transpose()
+                    .with_context(|| format!("initialize CUDA frames for {}", profile.name))?;
+                let encoder = open_video_encoder(
+                    profile,
+                    codec,
+                    width,
+                    height,
+                    fps,
+                    global_header,
+                    cuda_frames.as_ref(),
+                    nvenc_preset,
+                )?;
+                Ok(Some((codec, encoder, cuda_frames)))
+            })
+            .with_context(|| {
+                format!(
+                    "select ffmpeg-next video encoder for {}",
+                    video_path.display()
+                )
+            })?
+        };
         eprintln!("ffmpeg-next selected video encoder: {}", profile.name);
         let mut stream = format
             .add_stream(codec)
@@ -1044,20 +1175,44 @@ impl FfmpegNextEncoder {
                 zero_copy: false,
             });
         }
-        let scaler = (!zero_copy)
+        let is_qsv_sw = profile.name == "h264_qsv" || profile.name == "hevc_qsv";
+        let target_sw_pixel = if is_qsv_sw {
+            ffmpeg::format::Pixel::NV12
+        } else {
+            ffmpeg::format::Pixel::YUV420P
+        };
+        let mut scaler = (!zero_copy)
             .then(|| {
                 ffmpeg::software::scaling::Context::get(
                     ffmpeg::format::Pixel::RGBA,
                     width,
                     height,
-                    ffmpeg::format::Pixel::YUV420P,
+                    target_sw_pixel,
                     width,
                     height,
                     ffmpeg::software::scaling::flag::Flags::BILINEAR,
                 )
             })
             .transpose()
-            .context("create RGBA to YUV420P scaler")?;
+            .context("create RGBA to YUV scaler")?;
+        if is_qsv_sw
+            && let Some(ref mut sc) = scaler
+        {
+            // Match BT.709 limited-range VUI metadata set on h264_qsv / hevc_qsv.
+            unsafe {
+                let bt709 = ffmpeg::ffi::sws_getCoefficients(ffmpeg::ffi::SWS_CS_ITU709 as i32);
+                ffmpeg::ffi::sws_setColorspaceDetails(
+                    sc.as_mut_ptr(),
+                    bt709,
+                    1, // full-range RGB input
+                    bt709,
+                    0, // limited-range (MPEG) YUV output
+                    0,
+                    1 << 16,
+                    1 << 16,
+                );
+            }
+        }
         Ok(Self {
             output: Some(format),
             output_path: output.to_owned(),
@@ -1077,14 +1232,12 @@ impl FfmpegNextEncoder {
             yuv420p: if zero_copy {
                 ffmpeg::util::frame::video::Video::empty()
             } else {
-                ffmpeg::util::frame::video::Video::new(
-                    ffmpeg::format::Pixel::YUV420P,
-                    width,
-                    height,
-                )
+                ffmpeg::util::frame::video::Video::new(target_sw_pixel, width, height)
             },
             #[cfg(target_os = "macos")]
             vt_worker: None,
+            #[cfg(target_os = "windows")]
+            qsv_worker: None,
             stream_index,
             stream_time_base,
             width,
@@ -1380,13 +1533,24 @@ impl FrameSink for FfmpegNextEncoder {
         if self.vt_worker.is_some() {
             return false;
         }
+        #[cfg(target_os = "windows")]
+        if self.qsv_worker.is_some() {
+            return false;
+        }
         true
     }
 
-    fn submit(&mut self, mut frame: RenderedFrame) -> Result<RenderedFrame> {
+    fn submit(&mut self, frame: RenderedFrame) -> Result<RenderedFrame> {
         if self.finished {
             bail!("ffmpeg-next encoder is already finished");
         }
+        #[cfg(target_os = "windows")]
+        if let Some(qsv_worker) = self.qsv_worker.as_mut() {
+            self.pts += 1;
+            return qsv_worker.submit_frame(frame);
+        }
+        #[cfg(target_os = "macos")]
+        let mut frame = frame;
         if self.zero_copy {
             #[cfg(target_os = "linux")]
             return self.submit_zero_copy(frame);
@@ -1462,7 +1626,7 @@ impl FrameSink for FfmpegNextEncoder {
             .as_mut()
             .context("ordinary encoder has no RGBA scaler")?
             .run(&self.rgba, &mut self.yuv420p)
-            .context("convert RGBA frame to YUV420P")?;
+            .context("convert RGBA frame to YUV")?;
         self.yuv420p.set_pts(Some(frame_pts));
         if let (Some(cuda_frames), Some(hw_frame)) =
             (self.cuda_frames.as_ref(), self.hw_frame.as_mut())
@@ -1527,6 +1691,10 @@ impl FrameSink for FfmpegNextEncoder {
             }
             return Ok(());
         }
+        #[cfg(target_os = "windows")]
+        if let Some(mut qsv_worker) = self.qsv_worker.take() {
+            return qsv_worker.finish();
+        }
 
         self.encoder
             .as_mut()
@@ -1558,6 +1726,10 @@ impl Drop for FfmpegNextEncoder {
             if let Some(handle) = vt_worker.handle.take() {
                 let _ = handle.join();
             }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.qsv_worker.take();
         }
         self.output.take();
         if let Some(staging) = &self.staging_path {

@@ -7,6 +7,8 @@ pub mod frame;
 pub mod geometry;
 #[cfg(target_os = "linux")]
 pub mod gpu_interop;
+#[cfg(target_os = "windows")]
+pub mod win_qsv;
 pub mod image_asset;
 pub mod layout;
 pub mod lrc;
@@ -177,7 +179,9 @@ where
     F: FnMut(u64, u64, f64, &[u8]),
     C: FnMut() -> RenderControl,
 {
-    let need_cpu = !cfg!(target_os = "macos") || options.encoder == EncoderBackend::Pipe;
+    let need_cpu =
+        !(cfg!(target_os = "macos") || cfg!(target_os = "windows"))
+            || options.encoder == EncoderBackend::Pipe;
     render_with_frame_progress_control_stats_lazy(options, move |_, _| need_cpu, on_frame, control)
 }
 

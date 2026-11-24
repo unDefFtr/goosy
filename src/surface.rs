@@ -202,7 +202,19 @@ impl SurfaceRenderer {
             frame.set_gpu_frame(gpu_frame);
             return Ok(());
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        if let Backend::Direct3D(direct3d) = &mut self.backend {
+            let gpu_frame = direct3d.render_gpu_frame(
+                info,
+                row_bytes,
+                frame.pixels_mut(),
+                read_cpu_pixels,
+                draw,
+            )?;
+            frame.set_win_gpu_frame(gpu_frame);
+            return Ok(());
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = read_cpu_pixels;
         #[cfg(target_os = "linux")]
         {
@@ -1345,11 +1357,17 @@ impl Drop for VulkanBackend {
 
 #[cfg(target_os = "windows")]
 struct Direct3DBackend {
+    // Rust drops fields in declaration order. Skia-wrapped surfaces inside
+    // `nv12_ring` and `surface` MUST drop before `context`, `_backend`, and `device`.
+    nv12_ring: Option<crate::win_qsv::D3d12SharedRgbaRing>,
+    nv12_ring_failed: bool,
+    // Keeps the companion D3D11 device alive in SharedD3d11Context's Weak registry
+    // so QSV encoder initialization attaches to the exact same Intel adapter LUID.
+    _shared_d3d11: Option<std::sync::Arc<crate::win_qsv::SharedD3d11Context>>,
     surface: Option<Surface>,
-    // Rust drops fields in declaration order. Skia must release all D3D
-    // references before the client-owned backend context and device.
     context: skia_safe::gpu::DirectContext,
     _backend: skia_safe::gpu::d3d::BackendContext,
+    queue: windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
     device: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     adapter_name: String,
     vendor_id: u32,
@@ -1368,12 +1386,22 @@ impl Direct3DBackend {
             Flags: windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_QUEUE_FLAG_NONE,
             NodeMask: 0,
         };
-        let queue = unsafe { selection.device.CreateCommandQueue(&queue_desc) }
-            .context("create D3D12 direct command queue")?;
+        let queue: windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue =
+            unsafe { selection.device.CreateCommandQueue(&queue_desc) }
+                .context("create D3D12 direct command queue")?;
+        // Pre-register and retain the companion D3D11 device on the exact same adapter LUID
+        // when running on Intel graphics so QSV shares the identical D3D11 device.
+        let shared_d3d11 = if selection.vendor_id == crate::win_qsv::d3d11_pipeline::INTEL_VENDOR_ID
+        {
+            let luid = unsafe { selection.device.GetAdapterLuid() };
+            crate::win_qsv::SharedD3d11Context::get_or_create_for_luid(luid).ok()
+        } else {
+            None
+        };
         let backend = skia_safe::gpu::d3d::BackendContext {
             adapter: selection.adapter,
             device: selection.device.clone(),
-            queue,
+            queue: queue.clone(),
             memory_allocator: None,
             protected_context: Protected::No,
         };
@@ -1385,9 +1413,13 @@ impl Direct3DBackend {
             max_resource_bytes: GPU_RESOURCE_CACHE_BYTES,
         });
         Ok(Self {
+            nv12_ring: None,
+            nv12_ring_failed: false,
+            _shared_d3d11: shared_d3d11,
             surface: None,
             context,
             _backend: backend,
+            queue,
             device: selection.device,
             adapter_name: selection.name,
             vendor_id: selection.vendor_id,
@@ -1396,12 +1428,80 @@ impl Direct3DBackend {
     }
 
     fn details(&self) -> String {
+        let interop = self
+            .nv12_ring
+            .as_ref()
+            .map(|r| format!(", D3D11 NV12 {}", r.converter.mode.label()))
+            .unwrap_or_default();
         format!(
-            "D3D12 / {} (vendor 0x{:04X}, {} MiB VRAM)",
+            "D3D12 / {} (vendor 0x{:04X}, {} MiB VRAM{})",
             self.adapter_name,
             self.vendor_id,
-            self.dedicated_video_memory / (1024 * 1024)
+            self.dedicated_video_memory / (1024 * 1024),
+            interop
         )
+    }
+
+    fn ensure_nv12_ring(&mut self, width: u32, height: u32) -> Result<()> {
+        if self
+            .nv12_ring
+            .as_ref()
+            .is_some_and(|r| r.width == width && r.height == height)
+        {
+            return Ok(());
+        }
+        self.nv12_ring = None;
+        let ring = crate::win_qsv::D3d12SharedRgbaRing::new(
+            &self.device,
+            self.queue.clone(),
+            &mut self.context,
+            width,
+            height,
+        )?;
+        self.nv12_ring = Some(ring);
+        Ok(())
+    }
+
+    fn render_gpu_frame<F>(
+        &mut self,
+        info: &ImageInfo,
+        row_bytes: usize,
+        pixels: &mut Vec<u8>,
+        read_cpu_pixels: bool,
+        draw: F,
+    ) -> Result<Option<crate::win_qsv::WinGpuFrame>>
+    where
+        F: FnOnce(&Canvas) -> Result<()>,
+    {
+        let width = info.width() as u32;
+        let height = info.height() as u32;
+        // Zero-copy QSV handoff requires Skia's D3D12 device to be on an Intel adapter
+        // with even dimensions >= 64x64; otherwise populate CPU pixels cleanly for fallback.
+        if self.vendor_id != crate::win_qsv::d3d11_pipeline::INTEL_VENDOR_ID
+            || self.nv12_ring_failed
+            || width < 64
+            || height < 64
+            || !width.is_multiple_of(2)
+            || !height.is_multiple_of(2)
+        {
+            self.render_into(info, row_bytes, pixels, draw)?;
+            return Ok(None);
+        }
+        if let Err(err) = self.ensure_nv12_ring(width, height) {
+            self.nv12_ring_failed = true;
+            eprintln!("goosy: D3D12->D3D11 NV12 interop unavailable; falling back to CPU readback: {err:#}");
+            self.render_into(info, row_bytes, pixels, draw)?;
+            return Ok(None);
+        }
+        let ring = self.nv12_ring.as_mut().expect("D3D12 NV12 ring initialized");
+        let gpu_frame = ring.render_and_convert(
+            &mut self.context,
+            info,
+            row_bytes,
+            read_cpu_pixels.then_some(pixels),
+            draw,
+        )?;
+        Ok(Some(gpu_frame))
     }
 
     fn render_into<F>(
@@ -1416,7 +1516,11 @@ impl Direct3DBackend {
     {
         use skia_safe::gpu::{self, Budgeted, SurfaceOrigin};
 
-        if self.surface.is_none() {
+        if self
+            .surface
+            .as_ref()
+            .is_none_or(|s| s.image_info().dimensions() != info.dimensions())
+        {
             self.surface = Some(
                 gpu::surfaces::render_target(
                     &mut self.context,

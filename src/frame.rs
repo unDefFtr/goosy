@@ -13,6 +13,8 @@ pub struct RenderedFrame {
     pixels: Vec<u8>,
     #[cfg(target_os = "macos")]
     gpu_frame: Option<crate::surface::MacosGpuFrame>,
+    #[cfg(target_os = "windows")]
+    win_gpu_frame: Option<crate::win_qsv::WinGpuFrame>,
     #[cfg(target_os = "linux")]
     pub(crate) gpu_payload: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -26,6 +28,8 @@ impl Clone for RenderedFrame {
             pixels: self.pixels.clone(),
             #[cfg(target_os = "macos")]
             gpu_frame: None,
+            #[cfg(target_os = "windows")]
+            win_gpu_frame: None,
             #[cfg(target_os = "linux")]
             gpu_payload: self.gpu_payload.clone(),
         }
@@ -68,6 +72,8 @@ impl RenderedFrame {
             pixels: vec![0; pixel_len],
             #[cfg(target_os = "macos")]
             gpu_frame: None,
+            #[cfg(target_os = "windows")]
+            win_gpu_frame: None,
             #[cfg(target_os = "linux")]
             gpu_payload: None,
         }
@@ -109,6 +115,18 @@ impl RenderedFrame {
     #[cfg(target_os = "macos")]
     pub(crate) fn take_gpu_frame(&mut self) -> Option<crate::surface::MacosGpuFrame> {
         self.gpu_frame.take()
+    }
+
+    #[cfg(target_os = "windows")]
+    #[doc(hidden)]
+    pub fn set_win_gpu_frame(&mut self, gpu_frame: Option<crate::win_qsv::WinGpuFrame>) {
+        self.win_gpu_frame = gpu_frame;
+    }
+
+    #[cfg(target_os = "windows")]
+    #[doc(hidden)]
+    pub fn take_win_gpu_frame(&mut self) -> Option<crate::win_qsv::WinGpuFrame> {
+        self.win_gpu_frame.take()
     }
 
     #[cfg(target_os = "linux")]

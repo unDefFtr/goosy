@@ -227,6 +227,8 @@ impl Renderer {
         } else {
             #[cfg(target_os = "macos")]
             frame.set_gpu_frame(None);
+            #[cfg(target_os = "windows")]
+            frame.set_win_gpu_frame(None);
             #[cfg(target_os = "linux")]
             frame.clear_gpu_payload();
             self.surface
