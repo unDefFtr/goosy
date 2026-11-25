@@ -154,12 +154,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_repository_yrc_fixture() {
-        let lines = parse_yrc(include_str!("../testdata/Heal the World.yrc")).unwrap();
-        assert_eq!(lines.len(), 94);
-        assert_eq!(lines[0].start_ms, 21_950);
-        assert_eq!(lines[0].words[4].text, "Monologue");
-        assert_eq!(lines.last().unwrap().end_ms, 385_040);
-        assert!(lines.iter().all(|line| !line.words.is_empty()));
+    fn parses_multiline_yrc_with_metadata_and_late_words() {
+        let lines = parse_yrc(concat!(
+            "[by:test]\r\n",
+            "[2200,200](2200,100,0)末(2300,200,0)句\r\n",
+            "[1000,400](1000,150,0)First (1150,250,0)line",
+        )).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "First line");
+        let times: Vec<_> = lines[0].words.iter().map(|word| (word.start_ms, word.end_ms)).collect();
+        assert_eq!(times, [(1000, 1150), (1150, 1400)]);
+        assert_eq!(lines[1].text, "末句");
+        assert_eq!(lines[1].end_ms, 2500);
     }
 }

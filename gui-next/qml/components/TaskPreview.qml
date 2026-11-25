@@ -11,7 +11,7 @@ ColumnLayout {
     property real maximumImageHeight: 360
     property int mode: 0
     readonly property bool actual: mode === 0
-    readonly property string source: actual ? renderSource : styleSource
+    readonly property string source: actual ? (renderSource || task.savedPreview || "") : styleSource
     readonly property real aspect: {
         var c = (task && task.config) || {};
         return (c.width > 0 && c.height > 0) ? c.width / c.height : 16 / 9;
@@ -62,10 +62,12 @@ ColumnLayout {
         Text {
             anchors.centerIn: parent
             width: parent.width - 32
-            visible: !root.source
+            visible: !root.source || frame.status === Image.Error
             text: {
                 if (!root.actual)
                     return root.styleError ? qsTr("样式预览不可用") : qsTr("加载样式预览…");
+                if (frame.status === Image.Error)
+                    return qsTr("无法读取任务画面");
                 if (root.task.previewNote)
                     return root.task.previewNote;
                 if (root.task.state === "queued")

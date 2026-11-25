@@ -1,5 +1,8 @@
 #include "goosy-rinui/src/backend.cxxqt.h"
 
+#include <QDesktopServices>
+#include <QFileInfo>
+#include <QUrl>
 #include <QQmlApplicationEngine>
 #include <QQuickImageProvider>
 #include <mutex>
@@ -63,6 +66,11 @@ void PreviewImages::set_task(const QString &id, const QImage &image) const {
 
 void PreviewImages::install(QQmlApplicationEngine &engine) const {
     engine.addImageProvider(QStringLiteral("goosy"), new PreviewProvider(state));
+}
+
+bool open_directory(const QString &file_url) {
+    const QUrl url(file_url, QUrl::StrictMode);
+    return url.isLocalFile() && QFileInfo(url.toLocalFile()).isDir() && QDesktopServices::openUrl(url);
 }
 
 std::unique_ptr<Backend> make_backend() {

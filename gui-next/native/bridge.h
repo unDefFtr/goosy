@@ -21,6 +21,7 @@ private:
     std::shared_ptr<PreviewState> state;
 };
 
+bool open_directory(const QString &file_url);
 std::unique_ptr<Backend> make_backend();
 std::unique_ptr<PreviewImages> make_preview_images();
 }

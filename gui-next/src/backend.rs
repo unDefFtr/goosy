@@ -20,6 +20,7 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("bridge.h");
         type PreviewImages;
+        fn open_directory(path: &QString) -> bool;
         fn make_backend() -> UniquePtr<Backend>;
         fn make_preview_images() -> UniquePtr<PreviewImages>;
         fn install(self: &PreviewImages, engine: Pin<&mut QQmlApplicationEngine>);

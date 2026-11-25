@@ -16,8 +16,16 @@ FluentWindow {
     ]
     property var draft: JSON.parse(Backend.projectJson || "{}")
     property string lastCreatedId: ""
+    property double lastRedoRevision: 0
     onDraftChanged: {
-        var created = (draft.wizard || {}).createdId || ""
+        var wizard = draft.wizard || {}
+        var revision = Number(wizard.redoRevision || 0)
+        if (revision > lastRedoRevision) {
+            lastRedoRevision = revision
+            navigationView.push(Qt.resolvedUrl("pages/Home.qml"))
+            return
+        }
+        var created = wizard.createdId || ""
         if (created && created !== lastCreatedId) {
             lastCreatedId = created
             navigationView.push(Qt.resolvedUrl("pages/Tasks.qml"))

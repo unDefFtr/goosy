@@ -1,55 +1,26 @@
 use crate::gui_shared::{
-    LYRIC_EXTENSIONS, PreviewFrame, STYLE_PREVIEW_MAX_HEIGHT, STYLE_PREVIEW_MAX_WIDTH,
-    StylePreviewScene, load_style_preview_assets, random_sample_range as random_sample_window,
+    LYRIC_EXTENSIONS, PreviewFrame, StylePreviewScene, load_style_preview_assets,
+    random_sample_range as random_sample_window,
     render_style_preview as render_style_preview_frame, sample_output_path, scan_sibling_assets,
 };
 use eframe::egui;
 use libgoosy::{
-    EncoderBackend, LyricFormat, LyricsStyle, RenderControl, RenderOptions, VideoCodec,
-    image_asset::SceneImageAssets, lrc, video,
+    EncoderBackend, LyricFormat, LyricsStyle, RenderOptions, VideoCodec,
+    image_asset::SceneImageAssets,
+    lrc,
+    task_manager::{Control, TaskId, TaskManager, TaskState},
+    video,
 };
 use rfd::FileDialog;
 use std::collections::VecDeque;
-use std::io::Write;
-#[cfg(target_os = "windows")]
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::process::Command;
-#[cfg(target_os = "windows")]
-use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RenderLifecycle {
-    Idle,
-    Running,
-    Paused,
-    EmergencyStopped,
-}
-
-struct InternalRenderTask {
-    control: mpsc::Sender<String>,
-    done: mpsc::Receiver<anyhow::Result<()>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-const DEFAULT_PREVIEW_INTERVAL: u64 = 15;
-static PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const DEFAULT_PREVIEW_INTERVAL: u32 = 15;
 const RENDER_TWO_COLUMN_MIN_WIDTH: f32 = 760.0;
-
-#[cfg(any(target_os = "windows", test))]
-fn encoder_cli_args(backend: EncoderBackend) -> [&'static str; 2] {
-    ["--encoder", backend.cli_value()]
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn codec_cli_args(codec: VideoCodec) -> [&'static str; 2] {
-    ["--codec", codec.cli_value()]
-}
 
 fn render_page_uses_columns(available_width: f32) -> bool {
     available_width >= RENDER_TWO_COLUMN_MIN_WIDTH
@@ -181,91 +152,6 @@ enum AppPage {
     Lyrics,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PreviewEvent {
-    frame: u64,
-    width: usize,
-    height: usize,
-}
-
-fn parse_preview_event(line: &str) -> Option<PreviewEvent> {
-    let mut fields = line.split_whitespace();
-    (fields.next()? == "GOOSY_PREVIEW").then_some(())?;
-    let event = PreviewEvent {
-        frame: fields.next()?.parse().ok()?,
-        width: fields.next()?.parse().ok()?,
-        height: fields.next()?.parse().ok()?,
-    };
-    (event.width > 0 && event.height > 0 && fields.next().is_none()).then_some(event)
-}
-
-fn new_preview_directory() -> PathBuf {
-    let sequence = PREVIEW_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "goosy-render-preview-{}-{sequence}",
-        std::process::id()
-    ))
-}
-fn write_internal_preview_frame(
-    directory: &Path,
-    frame: u64,
-    source: &[u8],
-    width: u32,
-    height: u32,
-    preview: &mut Vec<u8>,
-) -> std::io::Result<(u32, u32)> {
-    let required_source_len = usize::try_from(width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "RGBA frame dimensions overflow",
-            )
-        })?;
-    if source.len() < required_source_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "RGBA frame source is smaller than the frame dimensions",
-        ));
-    }
-    let scale = (STYLE_PREVIEW_MAX_WIDTH as f32 / width.max(1) as f32)
-        .min(STYLE_PREVIEW_MAX_HEIGHT as f32 / height.max(1) as f32)
-        .min(1.0);
-    let preview_width = (width as f32 * scale).round().max(1.0) as u32;
-    let preview_height = (height as f32 * scale).round().max(1.0) as u32;
-    preview.resize(preview_width as usize * preview_height as usize * 4, 0);
-    for y in 0..preview_height as usize {
-        let source_y = y * height as usize / preview_height as usize;
-        for x in 0..preview_width as usize {
-            let source_x = x * width as usize / preview_width as usize;
-            let source_offset = (source_y * width as usize + source_x) * 4;
-            let preview_offset = (y * preview_width as usize + x) * 4;
-            preview[preview_offset..preview_offset + 4]
-                .copy_from_slice(&source[source_offset..source_offset + 4]);
-        }
-    }
-    std::fs::create_dir_all(directory)?;
-    std::fs::write(directory.join(format!("{frame}.rgba")), preview)?;
-    Ok((preview_width, preview_height))
-}
-
-fn terminate_render_child(child: &mut Option<Child>) -> std::io::Result<bool> {
-    let Some(mut child) = child.take() else {
-        return Ok(false);
-    };
-    if child.try_wait()?.is_some() {
-        return Ok(false);
-    }
-    child.kill()?;
-    child.wait()?;
-    Ok(true)
-}
 
 pub fn run() -> eframe::Result<()> {
     #[allow(unused_mut)] // Only Windows overrides the default setup.
@@ -291,7 +177,11 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(|creation_context| {
             configure_chinese_font(&creation_context.egui_ctx);
-            Ok(Box::new(GoosyApp::default()))
+            let manager = TaskManager::new()?;
+            Ok(Box::new(GoosyApp {
+                manager: Some(manager),
+                ..GoosyApp::default()
+            }))
         }),
     )
 }
@@ -322,27 +212,22 @@ struct GoosyApp {
     debug_overlays: bool,
     use_embedded_cover: bool,
     no_audio: bool,
-    render_child: Option<Child>,
-    internal_render: Option<InternalRenderTask>,
-    render_lifecycle: RenderLifecycle,
-    render_sample: bool,
-    progress_receiver: Option<mpsc::Receiver<String>>,
-    log_receiver: Option<mpsc::Receiver<String>>,
-    preview_interval: u64,
-    preview_directory: Option<PathBuf>,
+    manager: Option<TaskManager>,
+    selected_task: Option<TaskId>,
+    state: Option<TaskState>,
+    pending: Option<Control>,
+    settling: bool,
+    preview_interval: u32,
     preview_texture: Option<egui::TextureHandle>,
     preview_frame: u64,
     progress: f32,
     speed_history: VecDeque<(f32, f32)>,
     current_speed: f32,
-    last_progress_sample: Option<(f32, f32)>,
     style_preview_key: Option<StylePreviewKey>,
     style_preview_texture: Option<egui::TextureHandle>,
     style_preview_error: Option<String>,
     style_preview_sender: mpsc::Sender<StylePreviewRequest>,
     style_preview_receiver: mpsc::Receiver<StylePreviewOutput>,
-    render_stage: String,
-    render_log: String,
     status: String,
     page: AppPage,
     render_translation: bool,
@@ -383,27 +268,22 @@ impl Default for GoosyApp {
             nvenc_preset: "p5".to_owned(),
             use_embedded_cover: true,
             no_audio: false,
-            render_child: None,
-            internal_render: None,
-            render_lifecycle: RenderLifecycle::Idle,
-            render_sample: false,
-            progress_receiver: None,
-            log_receiver: None,
+            manager: None,
+            selected_task: None,
+            state: None,
+            pending: None,
+            settling: false,
             preview_interval: DEFAULT_PREVIEW_INTERVAL,
-            preview_directory: None,
             preview_texture: None,
             preview_frame: 0,
             progress: 0.0,
             speed_history: VecDeque::new(),
             current_speed: 0.0,
-            last_progress_sample: None,
             style_preview_key: None,
             style_preview_texture: None,
             style_preview_error: None,
             style_preview_sender,
             style_preview_receiver,
-            render_stage: String::new(),
-            render_log: String::new(),
             status: String::new(),
             page: AppPage::Render,
             render_translation: true,
@@ -547,7 +427,7 @@ impl GoosyApp {
         ui.add_space(6.0);
         if ui
             .add_enabled(
-                !self.lyric_lines.is_empty() && self.render_child.is_none(),
+                !self.lyric_lines.is_empty() && !self.blocks_new_work(),
                 egui::Button::new("导出可打印 PDF…"),
             )
             .clicked()
@@ -814,110 +694,27 @@ impl GoosyApp {
         }
     }
 
-    fn cleanup_preview_directory(&mut self) {
-        if let Some(directory) = self.preview_directory.take() {
-            let _ = std::fs::remove_dir_all(directory);
-        }
+    fn blocks_new_work(&self) -> bool {
+        matches!(
+            self.state,
+            Some(TaskState::Queued | TaskState::Starting | TaskState::Running | TaskState::Paused)
+        )
     }
 
-    fn preview_path(&self, frame: u64) -> Option<PathBuf> {
-        self.preview_directory
-            .as_ref()
-            .map(|directory| directory.join(format!("{frame}.rgba")))
-    }
-
-    fn discard_preview(&self, event: PreviewEvent) {
-        if let Some(path) = self.preview_path(event.frame) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    fn load_preview(&mut self, context: &egui::Context, event: PreviewEvent) {
-        let Some(path) = self.preview_path(event.frame) else {
-            return;
-        };
-        let expected_size = event.width.saturating_mul(event.height).saturating_mul(4);
-        let pixels = match std::fs::read(&path) {
-            Ok(pixels) if pixels.len() == expected_size => pixels,
-            Ok(pixels) => {
-                self.status = format!(
-                    "实时预览帧大小无效：应为 {expected_size} 字节，实际为 {} 字节",
-                    pixels.len()
-                );
-                let _ = std::fs::remove_file(path);
-                return;
-            }
-            Err(error) => {
-                self.status = format!("读取实时预览失败：{error}");
-                return;
-            }
-        };
-        let image = egui::ColorImage::from_rgba_unmultiplied([event.width, event.height], &pixels);
-        if let Some(texture) = &mut self.preview_texture {
-            texture.set(image, egui::TextureOptions::LINEAR);
-        } else {
-            self.preview_texture = Some(context.load_texture(
-                "goosy-live-preview",
-                image,
-                egui::TextureOptions::LINEAR,
-            ));
-        }
-        self.preview_frame = event.frame;
-        let _ = std::fs::remove_file(path);
-        context.request_repaint();
-    }
-
-    fn send_render_command(&mut self, command: &str) {
-        if let Some(task) = &self.internal_render {
-            let _ = task.control.send(command.to_owned());
-            return;
-        }
-        if let Some(child) = &mut self.render_child {
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = writeln!(stdin, "{command}");
-                let _ = stdin.flush();
+    fn send_render_command(&mut self, command: Control) {
+        if let (Some(manager), Some(id)) = (&self.manager, self.selected_task) {
+            if let Err(error) = manager.command(id, command) {
+                self.status = format!("{error:#}");
             }
         }
     }
 
-    fn pause_render(&mut self) {
-        if self.render_lifecycle != RenderLifecycle::Running {
-            return;
-        }
-        self.send_render_command("pause");
-        self.render_lifecycle = RenderLifecycle::Paused;
-        self.status = "渲染已暂停，可继续或重启".to_owned();
-    }
-
-    fn resume_render(&mut self) {
-        if self.render_lifecycle != RenderLifecycle::Paused {
-            return;
-        }
-        self.send_render_command("resume");
-        self.render_lifecycle = RenderLifecycle::Running;
-        self.status = "渲染继续进行".to_owned();
-    }
-
-    fn stop_render(&mut self) {
-        if self.render_child.is_none() && self.internal_render.is_none() {
-            return;
-        }
-        self.render_lifecycle = RenderLifecycle::EmergencyStopped;
-        self.send_render_command("stop");
-        if self.render_child.is_some() {
-            let result = terminate_render_child(&mut self.render_child);
-            self.progress_receiver = None;
-            self.log_receiver = None;
-            self.cleanup_preview_directory();
-            self.render_stage = "渲染已急停".to_owned();
-            self.status = match result {
-                Ok(true) => "渲染已急停；本次任务不可恢复".to_owned(),
-                Ok(false) => "渲染进程已经结束；本次任务不可恢复".to_owned(),
-                Err(error) => format!("急停渲染失败：{error}"),
-            };
-        } else {
-            self.status = "渲染急停请求已发送；本次任务不可恢复".to_owned();
-        }
+    fn select_task(&mut self, id: TaskId) {
+        self.selected_task = Some(id);
+        self.preview_texture = None;
+        self.preview_frame = 0;
+        self.progress = 0.0;
+        self.speed_history.clear();
     }
     fn render_output_path(&self, sample: Option<(u64, u64)>) -> Option<PathBuf> {
         let output = self.output.clone()?;
@@ -944,187 +741,6 @@ impl GoosyApp {
     }
 
     fn start_render_with_range(&mut self, sample: Option<(u64, u64)>) {
-        if self.render_child.is_some() || self.internal_render.is_some() {
-            return;
-        }
-        self.render_sample = sample.is_some();
-        #[cfg(target_os = "windows")]
-        self.start_external_render(sample);
-        #[cfg(not(target_os = "windows"))]
-        self.start_internal_render(sample);
-    }
-
-    #[cfg(target_os = "windows")]
-    fn start_external_render(&mut self, sample: Option<(u64, u64)>) {
-        let Some(audio) = self.audio.clone() else {
-            self.status = "请先选择音频和输出".to_owned();
-            return;
-        };
-        let Some(output) = self.render_output_path(sample) else {
-            self.status = "无法生成渲染输出路径".to_owned();
-            return;
-        };
-        let lyrics = self
-            .selected_lyrics
-            .and_then(|index| self.lyrics_candidates.get(index).cloned());
-        let Ok(mut executable) = std::env::current_exe() else {
-            let message = "无法定位 goosy 可执行文件".to_owned();
-            self.status = message;
-            return;
-        };
-        executable.set_file_name(if cfg!(windows) {
-            "goosy-render-worker.exe"
-        } else {
-            "goosy-render-worker"
-        });
-        if !executable.is_file() {
-            let message = format!("找不到独立渲染进程：{}", executable.display());
-            self.status = message;
-            return;
-        }
-        self.cleanup_preview_directory();
-        let preview_directory = new_preview_directory();
-        if let Err(error) = std::fs::create_dir_all(&preview_directory) {
-            self.status = format!("创建实时预览目录失败：{error}");
-            return;
-        }
-        let mut command = Command::new(executable);
-        command.arg("render").arg(audio);
-        if let Some(lyrics) = lyrics {
-            command.arg(lyrics);
-        }
-        command
-            .arg("--output")
-            .arg(output)
-            .arg("--width")
-            .arg(self.width.to_string())
-            .arg("--height")
-            .arg(self.height.to_string())
-            .arg("--fps")
-            .arg(self.fps.to_string())
-            .arg("--font-scale")
-            .arg(format!("{:.2}", self.font_scale_percent as f32 / 100.0))
-            .arg("--translation-font-scale")
-            .arg(format!(
-                "{:.2}",
-                self.translation_font_scale_percent as f32 / 100.0
-            ))
-            .arg("--background-font-scale")
-            .arg(format!(
-                "{:.2}",
-                self.background_font_scale_percent as f32 / 100.0
-            ))
-            .arg("--line-height-scale")
-            .arg(format!("{:.2}", self.line_height_percent as f32 / 100.0))
-            .arg("--line-spacing-scale")
-            .arg(format!("{:.2}", self.line_spacing_percent as f32 / 100.0))
-            .arg("--translation-gap-scale")
-            .arg(format!(
-                "{:.2}",
-                self.translation_gap_percent as f32 / 100.0
-            ))
-            .arg("--background-gap-scale")
-            .arg(format!("{:.2}", self.background_gap_percent as f32 / 100.0))
-            .arg("--horizontal-padding-scale")
-            .arg(format!(
-                "{:.2}",
-                self.horizontal_padding_percent as f32 / 100.0
-            ))
-            .arg("--lyric-blur-sigma-step")
-            .arg(self.lyric_blur_sigma_step.to_string())
-            .arg("--format")
-            .arg("auto")
-            .arg("--progress-events")
-            .arg("--preview-dir")
-            .arg(&preview_directory)
-            .arg("--preview-interval")
-            .arg(self.preview_interval.to_string());
-        let encoder_args = encoder_cli_args(self.encoder_backend);
-        command.args(encoder_args);
-        let codec_args = codec_cli_args(self.video_codec);
-        command.args(codec_args);
-        command.arg("--nvenc-preset").arg(&self.nvenc_preset);
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some((start_ms, end_ms)) = sample {
-            command
-                .arg("--sample-start-ms")
-                .arg(start_ms.to_string())
-                .arg("--sample-duration-ms")
-                .arg(end_ms.saturating_sub(start_ms).to_string())
-                .arg("--no-audio");
-        }
-        if self.debug_overlays {
-            command.arg("--debug-overlays");
-        }
-        if self.no_audio {
-            command.arg("--no-audio");
-        }
-        if !self.render_translation {
-            command.arg("--no-translation");
-        }
-        if !self.render_background_vocal {
-            command.arg("--no-background-vocal");
-        }
-        for index in self.excluded_line_indices() {
-            command.arg("--exclude-line").arg(index.to_string());
-        }
-        if !self.use_embedded_cover {
-            command.arg("--no-embedded-cover");
-        }
-        if let Some(index) = self.selected_cover {
-            if let Some(cover) = self.cover_candidates.get(index) {
-                command.arg("--cover").arg(cover);
-            }
-        }
-        if !self.title.trim().is_empty() {
-            command.arg("--title").arg(self.title.trim());
-        }
-        match command.spawn() {
-            Ok(mut child) => {
-                let (progress_sender, progress_receiver) = mpsc::channel();
-                let (log_sender, log_receiver) = mpsc::channel();
-                if let Some(stdout) = child.stdout.take() {
-                    thread::spawn(move || {
-                        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                            let _ = progress_sender.send(line);
-                        }
-                    });
-                }
-                if let Some(stderr) = child.stderr.take() {
-                    thread::spawn(move || {
-                        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                            let _ = log_sender.send(line);
-                        }
-                    });
-                }
-                self.render_child = Some(child);
-                self.render_lifecycle = RenderLifecycle::Running;
-                self.internal_render = None;
-                self.progress_receiver = Some(progress_receiver);
-                self.log_receiver = Some(log_receiver);
-                self.preview_directory = Some(preview_directory);
-                self.preview_texture = None;
-                self.preview_frame = 0;
-                self.progress = 0.0;
-                self.speed_history.clear();
-                self.current_speed = 0.0;
-                self.last_progress_sample = None;
-                self.render_stage = "启动渲染进程".to_owned();
-                self.render_log.clear();
-                self.status = "渲染进程已启动，等待首帧…".to_owned();
-            }
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(preview_directory);
-                let message = format!("启动渲染失败：{error}");
-                self.status = message;
-            }
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    fn start_internal_render(&mut self, sample: Option<(u64, u64)>) {
         let (Some(audio), Some(output)) = (self.audio.clone(), self.render_output_path(sample))
         else {
             self.status = "请先选择音频和输出".to_owned();
@@ -1136,13 +752,6 @@ impl GoosyApp {
         let cover = self
             .selected_cover
             .and_then(|index| self.cover_candidates.get(index).cloned());
-        self.cleanup_preview_directory();
-        let preview_directory = new_preview_directory();
-        if let Err(error) = std::fs::create_dir_all(&preview_directory) {
-            self.status = format!("创建实时预览目录失败：{error}");
-            return;
-        }
-        let thread_preview_directory = preview_directory.clone();
         let options = RenderOptions {
             song: audio,
             lyrics,
@@ -1166,241 +775,71 @@ impl GoosyApp {
             codec: self.video_codec,
             nvenc_preset: self.nvenc_preset.clone(),
         };
-        let preview_interval = self.preview_interval;
-        let width = self.width;
-        let height = self.height;
-        let (progress_sender, progress_receiver) = mpsc::channel();
-        let (log_sender, log_receiver) = mpsc::channel();
-        let (control_sender, control_receiver) = mpsc::channel::<String>();
-        let (done_sender, done_receiver) = mpsc::channel();
-        let thread = thread::spawn(move || {
-            let mut preview_dir = Some(thread_preview_directory);
-            let mut preview_pixels = Vec::new();
-            let mut paused = false;
-            let zero_copy = options.encoder.is_zero_copy();
-            let result = libgoosy::render_with_frame_progress_control_stats_lazy(
-                &options,
-                |done, total| {
-                    !zero_copy && (done == 1 || done == total || done % preview_interval == 0)
-                },
-                |done, total, elapsed, pixels| {
-                    let _ =
-                        progress_sender.send(format!("GOOSY_PROGRESS {done} {total} {elapsed:.3}"));
-                    let preview_due = !zero_copy
-                        && (done == 1 || done == total || done % preview_interval == 0);
-                    if preview_due {
-                        if let Some(directory) = preview_dir.as_deref() {
-                            match write_internal_preview_frame(
-                                directory,
-                                done,
-                                pixels,
-                                width,
-                                height,
-                                &mut preview_pixels,
-                            ) {
-                                Ok((preview_width, preview_height)) => {
-                                    let _ = progress_sender.send(format!(
-                                        "GOOSY_PREVIEW {done} {preview_width} {preview_height}"
-                                    ));
-                                }
-                                Err(error) => {
-                                    let _ = log_sender
-                                        .send(format!("写入实时预览失败，已停用预览：{error}"));
-                                    preview_dir = None;
-                                }
-                            }
-                        }
-                    }
-                },
-                || loop {
-                    if paused {
-                        match control_receiver.recv() {
-                            Ok(command) if command == "resume" => paused = false,
-                            Ok(command) if command == "stop" => return RenderControl::Stop,
-                            Ok(_) => {}
-                            Err(_) => return RenderControl::Stop,
-                        }
-                    } else {
-                        match control_receiver.try_recv() {
-                            Ok(command) if command == "pause" => paused = true,
-                            Ok(command) if command == "stop" => return RenderControl::Stop,
-                            Ok(_) | Err(mpsc::TryRecvError::Empty) => {
-                                return RenderControl::Continue;
-                            }
-                            Err(mpsc::TryRecvError::Disconnected) => return RenderControl::Stop,
-                        }
-                    }
-                },
-            )
-            .map(|_| ());
-            let _ = done_sender.send(result);
-        });
-        self.internal_render = Some(InternalRenderTask {
-            control: control_sender,
-            done: done_receiver,
-            thread: Some(thread),
-        });
-        self.render_child = None;
-        self.progress_receiver = Some(progress_receiver);
-        self.log_receiver = Some(log_receiver);
-        self.preview_directory = Some(preview_directory);
-        self.preview_texture = None;
-        self.preview_frame = 0;
-        self.progress = 0.0;
-        self.speed_history.clear();
-        self.current_speed = 0.0;
-        self.last_progress_sample = None;
-        self.render_lifecycle = RenderLifecycle::Running;
-        self.render_stage = "单进程渲染中".to_owned();
-        self.render_log.clear();
-        self.status = if sample.is_some() {
-            "随机 15 秒采样渲染已启动".to_owned()
-        } else {
-            "单进程渲染已启动，等待首帧…".to_owned()
-        };
+        if let Some(manager) = &self.manager {
+            match manager.enqueue(options, self.preview_interval) {
+                Ok(id) => {
+                    self.select_task(id);
+                    self.state = Some(TaskState::Queued);
+                }
+                Err(error) => self.status = format!("创建任务失败：{error:#}"),
+            }
+        }
     }
 
     fn poll_render(&mut self, context: &egui::Context) {
-        let mut latest_preview = None;
-        if let Some(receiver) = &self.progress_receiver {
-            let lines: Vec<_> = receiver.try_iter().collect();
-            for line in lines {
-                if let Some(event) = parse_preview_event(&line) {
-                    if let Some(previous) = latest_preview.replace(event) {
-                        self.discard_preview(previous);
-                    }
-                    continue;
-                }
-                let mut fields = line.split_whitespace();
-                match fields.next() {
-                    Some("GOOSY_STAGE") => {
-                        let _key = fields.next();
-                        let message = fields.collect::<Vec<_>>().join(" ");
-                        if !message.is_empty() {
-                            self.render_stage = message.clone();
-                            self.status = message;
-                        }
-                    }
-                    Some("GOOSY_PROGRESS") => {
-                        let done = fields.next().and_then(|value| value.parse::<f32>().ok());
-                        let total = fields.next().and_then(|value| value.parse::<f32>().ok());
-                        let elapsed = fields.next().and_then(|value| value.parse::<f32>().ok());
-                        if let (Some(done), Some(total), Some(elapsed)) = (done, total, elapsed) {
-                            self.progress = if total > 0.0 {
-                                (done / total).clamp(0.0, 1.0)
-                            } else {
-                                0.0
-                            };
-                            if elapsed > 0.0 {
-                                self.current_speed =
-                                    if let Some((previous_done, previous_elapsed)) =
-                                        self.last_progress_sample
-                                    {
-                                        (done - previous_done)
-                                            / (elapsed - previous_elapsed).max(0.001)
-                                    } else {
-                                        done / elapsed
-                                    };
-                                self.last_progress_sample = Some((done, elapsed));
-                                self.speed_history.push_back((elapsed, self.current_speed));
-                                while self.speed_history.len() > 120 {
-                                    self.speed_history.pop_front();
-                                }
-                            }
-                            self.status = format!(
-                                "正在渲染：{done:.0}/{total:.0} · {:.1} 帧/秒",
-                                self.current_speed
-                            );
-                        }
-                    }
-                    _ => {}
-                }
+        let (Some(manager), Some(id)) = (&self.manager, self.selected_task) else {
+            return;
+        };
+        let Some(task) = manager.task(id) else { return };
+        self.state = Some(task.state);
+        self.pending = task.pending;
+        self.settling = task.settling;
+        self.progress = if task.total == 0 {
+            0.0
+        } else {
+            task.done as f32 / task.total as f32
+        };
+        self.current_speed = task.fps as f32;
+        if task.fps > 0.0
+            && self
+                .speed_history
+                .back()
+                .is_none_or(|&(t, _)| t != task.elapsed as f32)
+        {
+            self.speed_history
+                .push_back((task.elapsed as f32, self.current_speed));
+            if self.speed_history.len() > 120 {
+                self.speed_history.pop_front();
             }
         }
-        if let Some(event) = latest_preview {
-            self.load_preview(context, event);
-        }
-        if let Some(receiver) = &self.log_receiver {
-            let lines: Vec<_> = receiver.try_iter().collect();
-            for line in lines {
-                if !line.trim().is_empty() {
-                    // The stderr reader thread already persisted this line synchronously.
-                    if !self.render_log.is_empty() {
-                        self.render_log.push('\n');
-                    }
-                    self.render_log.push_str(&line);
-                    if self.render_log.len() > 8_192 {
-                        let keep_from = self.render_log.len() - 8_192;
-                        let boundary = self.render_log.ceil_char_boundary(keep_from);
-                        self.render_log.drain(..boundary);
-                    }
-                }
+        self.status = format!(
+            "{} · {} · {}\n已渲染 {}/{} · 已提交分段 {} 帧\n{}\n{}",
+            task.options.output.display(),
+            task.state.name(),
+            task.stage,
+            task.done,
+            task.total,
+            task.committed,
+            task.detail,
+            task.log,
+        );
+        if let Some((number, frame)) = manager.take_preview(id) {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.pixels,
+            );
+            if let Some(texture) = &mut self.preview_texture {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.preview_texture = Some(context.load_texture(
+                    "goosy-live-preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
             }
+            self.preview_frame = number;
         }
-        if !self.render_log.is_empty() {
-            self.status = format!("{}：\n{}", self.render_stage, self.render_log);
-        }
-        let result = self.render_child.as_mut().map(|child| child.try_wait());
-        match result {
-            Some(Ok(Some(status))) => {
-                self.render_child = None;
-                self.progress_receiver = None;
-                self.log_receiver = None;
-                self.cleanup_preview_directory();
-                self.progress = if status.success() { 1.0 } else { self.progress };
-                if status.success() {
-                    self.render_lifecycle = RenderLifecycle::Idle;
-                    self.status = "渲染完成".to_owned();
-                } else if self.render_lifecycle != RenderLifecycle::EmergencyStopped {
-                    self.render_lifecycle = RenderLifecycle::Idle;
-                    if self.render_log.is_empty() {
-                        self.status = format!("渲染失败：{status}");
-                    }
-                }
-            }
-            Some(Ok(None)) => context.request_repaint_after(Duration::from_millis(100)),
-            Some(Err(error)) => {
-                self.render_child = None;
-                self.progress_receiver = None;
-                self.log_receiver = None;
-                self.cleanup_preview_directory();
-                let message = format!("读取渲染状态失败：{error}");
-                self.status = message;
-            }
-            None => {}
-        }
-        let internal_result = self
-            .internal_render
-            .as_ref()
-            .and_then(|task| task.done.try_recv().ok());
-        if let Some(result) = internal_result {
-            if let Some(mut task) = self.internal_render.take() {
-                if let Some(thread) = task.thread.take() {
-                    let _ = thread.join();
-                }
-            }
-            self.progress_receiver = None;
-            self.log_receiver = None;
-            self.cleanup_preview_directory();
-            match result {
-                Ok(()) if self.render_lifecycle == RenderLifecycle::EmergencyStopped => {}
-                Ok(()) => {
-                    self.progress = 1.0;
-                    self.render_lifecycle = RenderLifecycle::Idle;
-                    self.status = if self.render_sample {
-                        "随机 15 秒采样渲染完成".to_owned()
-                    } else {
-                        "渲染完成".to_owned()
-                    };
-                }
-                Err(_error) if self.render_lifecycle == RenderLifecycle::EmergencyStopped => {}
-                Err(error) => {
-                    self.render_lifecycle = RenderLifecycle::Idle;
-                    self.status = format!("渲染失败：{error}");
-                }
-            }
-        }
-        if self.internal_render.is_some() {
+        if self.blocks_new_work() || self.settling {
             context.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -1601,8 +1040,7 @@ impl GoosyApp {
             });
             ui.horizontal(|ui| {
                 ui.label("编码器");
-                let active = self.render_child.is_some() || self.internal_render.is_some();
-                ui.add_enabled_ui(!active, |ui| {
+                ui.add_enabled_ui(!self.blocks_new_work(), |ui| {
                     egui::ComboBox::from_id_salt("encoder_combo")
                         .selected_text(self.encoder_backend.label())
                         .show_ui(ui, |ui| {
@@ -1638,8 +1076,7 @@ impl GoosyApp {
                 EncoderBackend::FfmpegNextNvencZeroCopy => true,
             };
             if uses_nvenc {
-                let active = self.render_child.is_some() || self.internal_render.is_some();
-                ui.add_enabled_ui(!active, |ui| {
+                ui.add_enabled_ui(!self.blocks_new_work(), |ui| {
                     ui.horizontal(|ui| {
                         ui.label("NVENC Preset");
                         egui::ComboBox::from_id_salt("nvenc_preset_combo")
@@ -1714,28 +1151,59 @@ impl GoosyApp {
 
     fn draw_render_monitor(&mut self, ui: &mut egui::Ui) {
         ui.heading("渲染状态");
-        let active = self.render_child.is_some() || self.internal_render.is_some();
-        let paused = self.render_lifecycle == RenderLifecycle::Paused;
+        let mut selected = None;
+        egui::ComboBox::from_id_salt("render-task-history")
+            .selected_text("选择历史任务")
+            .show_ui(ui, |ui| {
+                if let Some(manager) = &self.manager {
+                    for task in manager.tasks().iter().rev() {
+                        if ui
+                            .selectable_label(
+                                self.selected_task == Some(task.id),
+                                format!(
+                                    "{} · {}",
+                                    task.options.output.display(),
+                                    task.state.name()
+                                ),
+                            )
+                            .clicked()
+                        {
+                            selected = Some(task.id);
+                        }
+                    }
+                }
+            });
+        if let Some(id) = selected {
+            self.select_task(id);
+            self.poll_render(ui.ctx());
+        }
+        let blocks_new_work = self.blocks_new_work();
+        let can_control = self.state.is_some_and(|state| !state.is_terminal());
+        let paused = matches!(self.state, Some(TaskState::Paused | TaskState::Interrupted));
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!active, egui::Button::new("开始渲染"))
+                .add_enabled(!blocks_new_work, egui::Button::new("开始渲染"))
                 .clicked()
             {
                 self.start_render();
+                ui.ctx().request_repaint();
             }
             if ui
                 .add_enabled(
-                    !active && !self.lyric_lines.is_empty(),
+                    !blocks_new_work && !self.lyric_lines.is_empty(),
                     egui::Button::new("随机采样 15 秒"),
                 )
                 .clicked()
             {
                 self.start_sample_render();
+                ui.ctx().request_repaint();
             }
-            if active
+            if can_control
                 && ui
                     .add_enabled(
-                        true,
+                        !self.settling
+                            && self.pending.is_none()
+                            && (paused || self.state == Some(TaskState::Running)),
                         egui::Button::new(if paused {
                             "继续渲染"
                         } else {
@@ -1744,17 +1212,15 @@ impl GoosyApp {
                     )
                     .clicked()
             {
-                if paused {
-                    self.resume_render();
-                } else {
-                    self.pause_render();
-                }
+                self.send_render_command(if paused { Control::Resume } else { Control::Pause });
+                ui.ctx().request_repaint();
             }
-            if active
+            if can_control
                 && ui
-                    .add(
+                    .add_enabled(
+                        !self.settling && self.pending != Some(Control::Cancel),
                         egui::Button::new(
-                            egui::RichText::new("急停")
+                            egui::RichText::new("取消任务")
                                 .strong()
                                 .color(egui::Color32::WHITE),
                         )
@@ -1762,13 +1228,14 @@ impl GoosyApp {
                     )
                     .clicked()
             {
-                self.stop_render();
+                self.send_render_command(Control::Cancel);
+                ui.ctx().request_repaint();
             }
-            if active {
+            if blocks_new_work || self.settling {
                 ui.spinner();
             }
         });
-        if active || self.progress > 0.0 {
+        if blocks_new_work || self.progress > 0.0 {
             ui.add(egui::ProgressBar::new(self.progress).show_percentage());
         }
         if let Some(texture) = &self.preview_texture {
@@ -1795,7 +1262,7 @@ impl GoosyApp {
             ui.weak("拖动左侧歌词样式参数，预览会立即更新。");
         } else if let Some(error) = &self.style_preview_error {
             ui.colored_label(egui::Color32::LIGHT_RED, format!("样式预览失败：{error}"));
-        } else if !active {
+        } else if !blocks_new_work {
             ui.weak("正在生成样式预览…");
         }
         if !self.speed_history.is_empty() {
@@ -1845,18 +1312,6 @@ impl GoosyApp {
     }
 }
 
-impl Drop for GoosyApp {
-    fn drop(&mut self) {
-        let _ = terminate_render_child(&mut self.render_child);
-        if let Some(mut task) = self.internal_render.take() {
-            let _ = task.control.send("stop".to_owned());
-            if let Some(thread) = task.thread.take() {
-                let _ = thread.join();
-            }
-        }
-        self.cleanup_preview_directory();
-    }
-}
 
 impl eframe::App for GoosyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1917,10 +1372,8 @@ fn detect_credit_lines(lines: &[lrc::LyricLine]) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GoosyApp, PreviewEvent, StylePreviewKey, StylePreviewRequest, codec_cli_args,
-        detect_credit_lines, encoder_cli_args, new_preview_directory, parse_preview_event,
+        GoosyApp, StylePreviewKey, StylePreviewRequest, detect_credit_lines,
         render_page_uses_columns, render_style_preview, spawn_style_preview_worker,
-        terminate_render_child, write_internal_preview_frame,
     };
     use crate::gui_shared::{
         COVER_EXTENSIONS, LYRIC_EXTENSIONS, StylePreviewScene, has_extension,
@@ -1997,35 +1450,6 @@ mod tests {
         assert!(!detect_credit_lines(&lines)[5]);
     }
 
-    #[test]
-    fn parses_complete_preview_events_only() {
-        assert_eq!(
-            parse_preview_event("GOOSY_PREVIEW 45 640 360"),
-            Some(PreviewEvent {
-                frame: 45,
-                width: 640,
-                height: 360,
-            })
-        );
-        assert_eq!(parse_preview_event("GOOSY_PREVIEW 45 0 360"), None);
-        assert_eq!(parse_preview_event("GOOSY_PREVIEW 45 640"), None);
-        assert_eq!(parse_preview_event("GOOSY_PROGRESS 45 300 1.0"), None);
-    }
-
-    #[test]
-    fn rejects_empty_preview_source_for_positive_frame_size() {
-        let mut preview = Vec::new();
-        let error = write_internal_preview_frame(
-            std::path::Path::new("unused"),
-            1,
-            &[],
-            2,
-            2,
-            &mut preview,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    }
 
     #[test]
     fn random_sample_selects_a_bounded_lyrics_window() {
@@ -2049,53 +1473,6 @@ mod tests {
         assert_eq!(app.random_sample_range(), None);
     }
 
-    #[test]
-    fn terminates_a_running_render_child() {
-        if std::env::var_os("GOOSY_TERMINATION_FIXTURE").is_some() {
-            std::thread::sleep(std::time::Duration::from_secs(30));
-            return;
-        }
-        let executable = std::env::current_exe().unwrap();
-        let child = std::process::Command::new(executable)
-            .args([
-                "--exact",
-                "gui::tests::terminates_a_running_render_child",
-                "--nocapture",
-            ])
-            .env("GOOSY_TERMINATION_FIXTURE", "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut child = Some(child);
-
-        assert!(terminate_render_child(&mut child).unwrap());
-        assert!(child.is_none());
-    }
-
-    #[test]
-    fn loads_preview_into_texture_and_removes_staging_frame() {
-        let directory = new_preview_directory();
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("7.rgba");
-        std::fs::write(&path, [255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
-        let mut app = GoosyApp::default();
-        app.preview_directory = Some(directory);
-        let context = eframe::egui::Context::default();
-
-        app.load_preview(
-            &context,
-            PreviewEvent {
-                frame: 7,
-                width: 2,
-                height: 1,
-            },
-        );
-
-        assert_eq!(app.preview_frame, 7);
-        assert_eq!(app.preview_texture.as_ref().unwrap().size(), [2, 1]);
-        assert!(!path.exists());
-    }
 
     #[test]
     fn render_page_switches_to_a_scrollable_single_column_on_narrow_windows() {
@@ -2266,6 +1643,51 @@ mod tests {
         assert!(bright_neutral_pixels(&low_resolution) > bright_neutral_pixels(&full_hd));
     }
     #[test]
+    fn interrupted_history_allows_draft_and_task_actions() {
+        use eframe::egui;
+        use super::TaskState;
+
+        // Probe the actual widgets by hovering each painted label. This also works on
+        // backends without accessibility support and never opens a native file dialog.
+        fn button_enabled(mut draw: impl FnMut(&mut egui::Ui), label: &str) -> bool {
+            let context = egui::Context::default();
+            let mut layout = context.run_ui(Default::default(), &mut draw);
+            layout.textures_delta.clear();
+            let center = layout.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            }).unwrap_or_else(|| panic!("missing button: {label}"));
+            context.run_ui(egui::RawInput {
+                events: vec![egui::Event::PointerMoved(center)],
+                ..Default::default()
+            }, draw).textures_delta.clear();
+            let hovered = context.interaction_snapshot(|snapshot| snapshot.hovered.clone());
+            hovered.iter().any(|id| context.read_response(*id).is_some_and(|response| {
+                response.enabled() && response.sense.senses_click()
+            }))
+        }
+
+        let mut app = GoosyApp {
+            selected_task: Some("00000000-0000-0000-0000-000000000001".parse().unwrap()),
+            state: Some(TaskState::Interrupted),
+            lyric_lines: vec![line("one line")],
+            manual_excluded_lines: vec![false],
+            auto_excluded_lines: vec![false],
+            ..Default::default()
+        };
+        for label in ["开始渲染", "随机采样 15 秒", "继续渲染", "取消任务"] {
+            assert!(button_enabled(|ui| app.draw_render_monitor(ui), label), "{label}");
+        }
+        assert!(button_enabled(|ui| app.draw_lyrics_page(ui), "导出可打印 PDF…"));
+        app.settling = true;
+        assert!(button_enabled(|ui| app.draw_render_monitor(ui), "开始渲染"));
+        assert!(!button_enabled(|ui| app.draw_render_monitor(ui), "继续渲染"));
+        assert!(!button_enabled(|ui| app.draw_render_monitor(ui), "取消任务"));
+    }
+
+    #[test]
     fn default_app_uses_pipe_encoder() {
         assert_eq!(GoosyApp::default().encoder_backend, EncoderBackend::Pipe);
     }
@@ -2291,25 +1713,10 @@ mod tests {
             EncoderBackend::ALL[1].label(),
             "ffmpeg-next Encoder（自动选择）"
         );
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            encoder_cli_args(EncoderBackend::FfmpegNextNvencZeroCopy),
-            ["--encoder", "ffmpeg-next-nvenc-zero-copy"]
-        );
-        assert_eq!(
-            encoder_cli_args(EncoderBackend::Pipe),
-            ["--encoder", "pipe"]
-        );
-        assert_eq!(
-            encoder_cli_args(EncoderBackend::FfmpegNext),
-            ["--encoder", "ffmpeg-next"]
-        );
         assert_eq!(GoosyApp::default().video_codec, VideoCodec::H264);
         assert_eq!(GoosyApp::default().nvenc_preset, "p5");
         assert_eq!(VideoCodec::ALL, [VideoCodec::H264, VideoCodec::Hevc]);
         assert_eq!(VideoCodec::H264.label(), "H.264 (AVC)");
         assert_eq!(VideoCodec::Hevc.label(), "HEVC (H.265)");
-        assert_eq!(codec_cli_args(VideoCodec::H264), ["--codec", "h264"]);
-        assert_eq!(codec_cli_args(VideoCodec::Hevc), ["--codec", "hevc"]);
     }
 }

@@ -22,7 +22,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Render {
-        song: PathBuf,
+        #[arg(required_unless_present = "workspace")]
+        song: Option<PathBuf>,
+        /// Resume a managed task using the options saved in its workspace.
+        #[arg(long, value_name = "DIRECTORY")]
+        workspace: Option<PathBuf>,
         #[arg(value_name = "LYRICS")]
         lyrics: Option<PathBuf>,
         #[arg(short, long, default_value = "out.mp4")]
@@ -192,7 +196,7 @@ impl From<WorkerCodec> for VideoCodec {
 
 fn emit_stage(enabled: bool, key: &str, message: &str) -> Result<()> {
     if enabled {
-        println!("GOOSY_STAGE {key} {message}");
+        writeln!(std::io::stdout(), "GOOSY_STAGE {key} {message}")?;
         std::io::stdout().flush()?;
     }
     Ok(())
@@ -201,7 +205,7 @@ fn emit_stage(enabled: bool, key: &str, message: &str) -> Result<()> {
 // Optional protocol events. Older clients ignore these lines and retain the same exit status.
 fn emit_control(enabled: bool, state: &str) {
     if enabled {
-        println!("GOOSY_CONTROL {state}");
+        let _ = writeln!(std::io::stdout(), "GOOSY_CONTROL {state}");
         let _ = std::io::stdout().flush();
     }
 }
@@ -347,6 +351,190 @@ fn write_preview_frame(
     Ok(dimensions)
 }
 
+enum RenderSource {
+    Direct(RenderOptions),
+    Managed(libgoosy::workspace::Workspace),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WorkerControl {
+    Continue,
+    Cancel,
+    Interrupted,
+}
+
+// Managed callers poll only at committed boundaries. The same stdin protocol
+// remains frame-granular for direct renders, where running without stdin is valid.
+fn poll_control(
+    input: &mpsc::Receiver<String>,
+    managed: bool,
+    mut acknowledge: impl FnMut(&str),
+) -> WorkerControl {
+    let mut paused = false;
+    loop {
+        let command = if paused {
+            input.recv().ok()
+        } else {
+            match input.try_recv() {
+                Ok(value) => Some(value),
+                Err(mpsc::TryRecvError::Empty) => return WorkerControl::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        match command.as_deref() {
+            Some("pause") if !paused => {
+                paused = true;
+                acknowledge("paused");
+            }
+            Some("resume") if paused => {
+                paused = false;
+                acknowledge("resumed");
+            }
+            Some("stop") => return WorkerControl::Cancel,
+            None if managed || paused => return WorkerControl::Interrupted,
+            None => return WorkerControl::Continue,
+            Some(_) => {}
+        }
+    }
+}
+
+fn run_worker(
+    mut source: RenderSource,
+    progress_events: bool,
+    mut preview_dir: Option<PathBuf>,
+    preview_interval: u64,
+) -> Result<()> {
+    let (options, needs_renderer) = match &source {
+        RenderSource::Direct(options) => (options, true),
+        RenderSource::Managed(work) => (
+            work.options(),
+            work.range().is_none() || work.committed() < work.total(),
+        ),
+    };
+    let (width, height) = (options.width, options.height);
+    if needs_renderer {
+        ensure_renderer_backend(width, height, options.fps, progress_events)?;
+        emit_stage(
+            progress_events,
+            "initializing-renderer",
+            "正在初始化图形后端",
+        )?;
+    } else {
+        emit_stage(progress_events, "checking-publication", "正在检查最终输出")?;
+    }
+    let preview_enabled = preview_dir.is_some() && !options.encoder.is_zero_copy();
+    let preview_due = |done, total| {
+        preview_enabled && (done == 1 || done == total || done % preview_interval == 0)
+    };
+    let mut preview_pixels = Vec::new();
+    let on_frame = |done, total, elapsed, pixels: &[u8]| {
+        // The preview is best effort. A crashed supervisor may have closed both
+        // pipes while a managed segment still needs to drain and commit.
+        if progress_events {
+            let _ = writeln!(
+                std::io::stdout(),
+                "GOOSY_PROGRESS {done} {total} {elapsed:.3}"
+            );
+        }
+        if preview_due(done, total) {
+            if let Some(directory) = preview_dir.as_deref() {
+                match write_preview_frame(
+                    directory,
+                    done,
+                    pixels,
+                    width,
+                    height,
+                    &mut preview_pixels,
+                ) {
+                    Ok((w, h)) => {
+                        let _ = writeln!(std::io::stdout(), "GOOSY_PREVIEW {done} {w} {h}");
+                    }
+                    Err(error) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "goosy: disable live preview after write failure: {error}"
+                        );
+                        preview_dir = None;
+                    }
+                }
+            }
+        }
+        if progress_events || preview_due(done, total) {
+            let _ = std::io::stdout().flush();
+        }
+    };
+    let (send, input) = mpsc::channel();
+    thread::spawn(move || {
+        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+            if send.send(line.trim().to_owned()).is_err() {
+                break;
+            }
+        }
+    });
+    let managed = matches!(source, RenderSource::Managed(_));
+    let mut last_control = WorkerControl::Continue;
+    let mut keep_running = || {
+        last_control = poll_control(&input, managed, |state| {
+            emit_control(progress_events, state)
+        });
+        last_control == WorkerControl::Continue
+    };
+    let result = match &mut source {
+        RenderSource::Direct(options) => libgoosy::render_with_frame_progress_control_stats_lazy(
+            options,
+            preview_due,
+            on_frame,
+            || {
+                if keep_running() {
+                    RenderControl::Continue
+                } else {
+                    RenderControl::Stop
+                }
+            },
+        )
+        .map(Some),
+        RenderSource::Managed(work) => libgoosy::render_workspace(
+            work,
+            preview_due,
+            on_frame,
+            |phase, done, total, elapsed| {
+                if progress_events {
+                    let event = match phase {
+                        libgoosy::EncoderProgress::Submitted => "GOOSY_SUBMITTED",
+                        libgoosy::EncoderProgress::Committed => "GOOSY_COMMITTED",
+                    };
+                    let _ = writeln!(std::io::stdout(), "{event} {done} {total} {elapsed:.3}");
+                    let _ = std::io::stdout().flush();
+                }
+            },
+            keep_running,
+        ),
+    };
+    match last_control {
+        WorkerControl::Cancel => {
+            emit_control(progress_events, "cancelled");
+            anyhow::bail!("render stopped by user");
+        }
+        WorkerControl::Interrupted if managed => {
+            emit_control(progress_events, "interrupted");
+            return Ok(());
+        }
+        _ => {}
+    }
+    if let Some(stats) = result? {
+        if progress_events || cfg!(target_os = "linux") {
+            writeln!(
+                std::io::stdout(),
+                "GOOSY_COMPLETE {} {:.3}",
+                stats.frames,
+                stats.elapsed_seconds
+            )?;
+            std::io::stdout().flush()?;
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         #[cfg(target_os = "windows")]
@@ -394,6 +582,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Render {
+            workspace,
             song,
             lyrics,
             output,
@@ -428,14 +617,17 @@ fn main() -> Result<()> {
             codec,
             nvenc_preset,
         } => {
-            ensure_renderer_backend(width, height, fps, progress_events)?;
-            emit_stage(
-                progress_events,
-                "initializing-renderer",
-                "正在初始化图形后端",
-            )?;
+            if let Some(directory) = workspace {
+                let result = libgoosy::workspace::Workspace::open(&directory).and_then(|work| {
+                    run_worker(RenderSource::Managed(work), progress_events, preview_dir, preview_interval)
+                });
+                if result.is_err() {
+                    emit_control(progress_events, "failed");
+                }
+                return result;
+            }
             let options = RenderOptions {
-                song,
+                song: song.ok_or_else(|| anyhow::anyhow!("render requires a song or --workspace"))?,
                 lyrics,
                 output,
                 width,
@@ -468,110 +660,7 @@ fn main() -> Result<()> {
                 codec: codec.into(),
                 nvenc_preset,
             };
-            let mut preview_dir = preview_dir;
-            let mut preview_pixels = Vec::new();
-            let (control_sender, control_receiver) = mpsc::channel();
-            thread::spawn(move || {
-                let stdin = std::io::stdin();
-                for command in stdin.lock().lines().map_while(Result::ok) {
-                    let _ = control_sender.send(command.trim().to_owned());
-                }
-            });
-            let mut paused = false;
-            let mut cancelled = false;
-            #[cfg(target_os = "linux")]
-            eprintln!(
-                "video encoder: {}",
-                libgoosy::video::preferred_video_encoder_name()
-            );
-            let has_preview = preview_dir.is_some();
-            let preview_enabled = has_preview && !options.encoder.is_zero_copy();
-            let result = libgoosy::render_with_frame_progress_control_stats_lazy(
-                &options,
-                move |done, total| {
-                    preview_enabled && (done == 1 || done == total || done % preview_interval == 0)
-                },
-                |done, total, elapsed, pixels| {
-                    if progress_events {
-                        println!("GOOSY_PROGRESS {done} {total} {elapsed:.3}");
-                    }
-                    let preview_due = preview_enabled
-                        && (done == 1 || done == total || done % preview_interval == 0);
-                    if preview_due {
-                        let result = preview_dir.as_deref().map(|directory| {
-                            write_preview_frame(
-                                directory,
-                                done,
-                                pixels,
-                                width,
-                                height,
-                                &mut preview_pixels,
-                            )
-                        });
-                        match result {
-                            Some(Ok((preview_width, preview_height))) => {
-                                println!("GOOSY_PREVIEW {done} {preview_width} {preview_height}");
-                            }
-                            Some(Err(error)) => {
-                                eprintln!(
-                                    "goosy: disable live preview after write failure: {error}"
-                                );
-                                preview_dir = None;
-                            }
-                            None => {}
-                        }
-                    }
-                    if progress_events || preview_due {
-                        let _ = std::io::stdout().flush();
-                    }
-                },
-                || loop {
-                    if paused {
-                        match control_receiver.recv() {
-                            Ok(command) if command == "resume" => {
-                                paused = false;
-                                emit_control(progress_events, "resumed");
-                            }
-                            Ok(command) if command == "stop" => {
-                                cancelled = true;
-                                return RenderControl::Stop;
-                            }
-                            Ok(_) => {}
-                            Err(_) => return RenderControl::Stop,
-                        }
-                    } else {
-                        match control_receiver.try_recv() {
-                            Ok(command) if command == "pause" => {
-                                paused = true;
-                                emit_control(progress_events, "paused");
-                            }
-                            Ok(command) if command == "stop" => {
-                                cancelled = true;
-                                return RenderControl::Stop;
-                            }
-                            Ok(_) | Err(mpsc::TryRecvError::Empty) => {
-                                return RenderControl::Continue;
-                            }
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                return RenderControl::Continue;
-                            }
-                        }
-                    }
-                },
-            );
-            if cancelled && result.is_err() {
-                emit_control(progress_events, "cancelled");
-            }
-            let _stats = result?;
-            #[cfg(target_os = "linux")]
-            {
-                println!(
-                    "GOOSY_COMPLETE {} {:.3}",
-                    _stats.frames, _stats.elapsed_seconds
-                );
-                std::io::stdout().flush()?;
-            }
-            Ok(())
+            run_worker(RenderSource::Direct(options), progress_events, preview_dir, preview_interval)
         }
     }
 }
@@ -582,6 +671,152 @@ mod tests {
         Cli, Command, WorkerCodec, WorkerEncoder, downscale_rgba_nearest, preview_dimensions,
     };
     use clap::Parser;
+
+    #[test]
+    fn managed_render_needs_only_a_workspace() {
+        let cli = Cli::try_parse_from(["worker", "render", "--workspace", "saved"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Render {
+                workspace: Some(_),
+                song: None,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["worker", "render"]).is_err());
+    }
+
+    #[test]
+    fn boundary_pauses_then_resumes_or_exits_on_disconnect() {
+        use super::{WorkerControl, poll_control};
+        let (send, input) = std::sync::mpsc::channel();
+        send.send("pause".into()).unwrap();
+        send.send("resume".into()).unwrap();
+        let mut states = Vec::new();
+        assert_eq!(
+            poll_control(&input, true, |s| states.push(s.to_owned())),
+            WorkerControl::Continue
+        );
+        assert_eq!(states, ["paused", "resumed"]);
+        send.send("pause".into()).unwrap();
+        drop(send);
+        assert_eq!(
+            poll_control(&input, true, |s| assert_eq!(s, "paused")),
+            WorkerControl::Interrupted
+        );
+        assert_eq!(poll_control(&input, false, |_| {}), WorkerControl::Continue);
+        assert_eq!(
+            poll_control(&input, true, |_| {}),
+            WorkerControl::Interrupted
+        );
+    }
+
+    #[test]
+    fn resume_matches_continuous_frames_and_can_pause_before_publication() -> anyhow::Result<()> {
+        use libgoosy::{
+            EncoderBackend, EncoderProgress, RenderControl, RenderOptions, workspace::Workspace,
+        };
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir()?;
+        let song = dir.path().join("song.wav");
+        let lyrics = dir.path().join("song.lrc");
+        let audio = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono",
+                "-t",
+                "2",
+            ])
+            .arg(&song)
+            .output()?;
+        anyhow::ensure!(
+            audio.status.success(),
+            "ffmpeg: {}",
+            String::from_utf8_lossy(&audio.stderr)
+        );
+        std::fs::write(
+            &lyrics,
+            "[00:00.00]First\n[00:00.50]Second\n[00:01.25]Third\n[00:03.00]End\n",
+        )?;
+        let mut options = RenderOptions::new(song, dir.path().join("continuous.mp4"));
+        options.lyrics = Some(lyrics);
+        options.encoder = EncoderBackend::Pipe;
+        options.no_audio = true;
+        options.no_embedded_cover = true;
+        options.width = 160;
+        options.height = 96;
+        options.fps = 4;
+        options.sample_start_ms = Some(125);
+        options.sample_duration_ms = Some(1_750);
+        let mut reference = Vec::new();
+        libgoosy::render_with_frame_progress_control_stats_lazy(
+            &options,
+            |_, _| true,
+            |done, _, _, rgba| reference.push((done, blake3::hash(rgba))),
+            || RenderControl::Continue,
+        )?;
+
+        options.output = dir.path().join("resumed.mp4");
+        let workspace = dir.path().join(uuid::Uuid::new_v4().to_string());
+        drop(Workspace::create(&workspace, &options, 1)?);
+        let mut resumed = Vec::new();
+        for (pause_on_rendered, expected_end) in [(1, 4), (7, 7)] {
+            let mut work = Workspace::open(&workspace)?;
+            let start = work.committed();
+            let pause = Cell::new(false);
+            let rendered = Cell::new(start);
+            let submitted = Cell::new(start);
+            let mut commits = Vec::new();
+            let result = libgoosy::render_workspace(
+                &mut work,
+                |_, _| true,
+                |done, total, _, rgba| {
+                    assert_eq!(total, 7);
+                    assert_eq!(done, submitted.get() + 1);
+                    rendered.set(done);
+                    resumed.push((done, blake3::hash(rgba)));
+                    if done == pause_on_rendered {
+                        pause.set(true);
+                    }
+                },
+                |phase, done, _, _| match phase {
+                    EncoderProgress::Submitted => {
+                        assert_eq!(rendered.get(), done);
+                        submitted.set(done);
+                    }
+                    EncoderProgress::Committed => {
+                        assert_eq!(submitted.get(), done);
+                        commits.push(done);
+                    }
+                },
+                || !pause.get(),
+            )?;
+            assert!(result.is_none());
+            assert_eq!(commits, [expected_end]);
+            assert_eq!(work.committed(), expected_end);
+            assert!(!options.output.exists());
+        }
+        assert_eq!(resumed, reference);
+        let mut work = Workspace::open(&workspace)?;
+        let published = libgoosy::render_workspace(
+            &mut work,
+            |_, _| false,
+            |_, _, _, _| panic!("finalization rerendered a committed frame"),
+            |_, _, _, _| panic!("finalization resubmitted a committed frame"),
+            || true,
+        )?;
+        assert_eq!(published.unwrap().frames, 7);
+        assert_eq!(
+            work.published_size()?,
+            Some(options.output.metadata()?.len())
+        );
+        Ok(())
+    }
 
     #[test]
     fn preview_dimensions_fit_within_bounds_and_preserve_aspect_ratio() {

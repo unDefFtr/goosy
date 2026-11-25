@@ -5,7 +5,7 @@ use skia_safe::{AlphaType, Color, ColorSpace, ColorType, ISize, ImageInfo};
 use crate::background::BackgroundRenderer;
 use crate::cover_renderer::CoverRenderer;
 use crate::geometry::FrameGeometry;
-use crate::layout::Layout;
+use crate::layout::{Layout, LayoutCheckpoint};
 use crate::lrc::LyricLine;
 use crate::lyrics_renderer::{LyricsRenderer, LyricsStyle};
 
@@ -151,11 +151,59 @@ impl Renderer {
         )
     }
 
+    /// Hash the actual shaped font runs, including system fallback and cover text.
+    /// Skia typeface IDs are process-local and only deduplicate reads within this pass.
+    pub(crate) fn resume_environment(&mut self) -> Result<String> {
+        use skia_safe::typeface::SerializeBehavior;
+        let mut faces = std::collections::HashMap::new();
+        let mut hash = blake3::Hasher::new();
+        let title = match self.cover.as_mut() {
+            Some(cover) => cover.title_for_geometry(&self.geometry)?,
+            None => None,
+        };
+        for paragraph in self.lyrics.paragraphs().chain(title) {
+            let runs = paragraph.get_fonts();
+            hash.update(&(runs.len() as u64).to_le_bytes());
+            for run in runs {
+                let face = run.font.typeface();
+                let fingerprint = faces.entry(face.unique_id()).or_insert_with(|| {
+                    let mut content = blake3::Hasher::new();
+                    face.serialize_stream(&mut content, SerializeBehavior::DoIncludeData);
+                    content.finalize()
+                });
+                hash.update(fingerprint.as_bytes());
+                hash.update(&(run.text_range.start as u64).to_le_bytes());
+                hash.update(&(run.text_range.end as u64).to_le_bytes());
+            }
+        }
+        Ok(format!("{};fonts={}", self.backend_name(), hash.finalize()))
+    }
+
     pub fn backend_details(&self) -> String {
         self.surface.backend_details()
     }
     pub fn backend_name(&self) -> &'static str {
         self.surface.backend_name()
+    }
+
+    pub fn save_checkpoint(&self) -> LayoutCheckpoint {
+        let mut checkpoint = self.layout.save_checkpoint();
+        checkpoint.width = self.width;
+        checkpoint.height = self.height;
+        checkpoint.fps = self.fps;
+        checkpoint
+    }
+
+    pub fn restore_checkpoint(&mut self, checkpoint: &LayoutCheckpoint) -> Result<()> {
+        checkpoint.validate_schema()?;
+        if checkpoint.width != self.width
+            || checkpoint.height != self.height
+            || checkpoint.fps != self.fps
+            || checkpoint.line_count != self.lines.len()
+        {
+            bail!("renderer checkpoint dimensions do not match renderer");
+        }
+        self.layout.restore_checkpoint(checkpoint)
     }
 
     pub fn render_frame(&mut self, t_ms: u64) -> Result<RenderedFrame> {

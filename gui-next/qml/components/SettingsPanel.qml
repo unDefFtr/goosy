@@ -10,6 +10,7 @@ ColumnLayout {
     property var project: ({})
     property int step: 0
     readonly property var issues: (root.project.wizard || {}).issues || []
+    readonly property bool redo: (root.project.wizard || {}).redo === true
     function errorFor(field) {
         return root.issues.filter(function(issue) { return issue.field === field }).map(function(issue) { return issue.message }).join("\n")
     }
@@ -74,7 +75,7 @@ ColumnLayout {
 
         function onProjectChanged() {
             root.syncCandidateIndexes()
-            if (titleField && !titleField.activeFocus) {
+            if (titleField && titleField.text !== (root.project.title || "")) {
                 titleField.text = root.project.title ? String(root.project.title) : ""
             }
         }
@@ -92,6 +93,16 @@ ColumnLayout {
         visible: root.step === 0
         showHeading: false
         contentSpacing: 14
+
+        Repeater {
+            model: root.issues.filter(function(issue) { return issue.canAccept === true })
+            Button {
+                required property var modelData
+                readonly property var roleNames: ({ audio: qsTr("音频"), lyrics: qsTr("歌词"), cover: qsTr("封面"), background: qsTr("背景") })
+                text: qsTr("使用当前%1文件").arg(roleNames[modelData.field])
+                onClicked: Backend.command("acceptAsset:" + modelData.field)
+            }
+        }
 
         RowLayout {
             Layout.fillWidth: true
@@ -359,11 +370,7 @@ ColumnLayout {
                 Layout.preferredHeight: 36
                 text: root.project.title ? String(root.project.title) : ""
                 placeholderText: qsTr("使用音频元数据")
-                onTextChanged: {
-                    if (activeFocus) {
-                        Backend.setText("title", text)
-                    }
-                }
+                onTextEdited: Backend.setText("title", text)
             }
         }
 
@@ -507,7 +514,7 @@ ColumnLayout {
                 id: encoderCombo
                 objectName: "encoderCombo"
                 Layout.fillWidth: true
-                model: root.defaults.encoders || []
+                model: root.cfg("encoders", [])
                 currentIndex: root.cfg("encoder", 0)
                 onCurrentIndexChanged: root.refreshZeroCopy()
                 onActivated: function(index) {
@@ -538,7 +545,7 @@ ColumnLayout {
                 id: codecCombo
                 objectName: "codecCombo"
                 Layout.fillWidth: true
-                model: root.defaults.codecs || []
+                model: root.cfg("codecs", [])
                 currentIndex: root.cfg("codec", 0)
                 enabled: !root.zeroCopySelected
                 onActivated: function(index) {
@@ -586,12 +593,13 @@ ColumnLayout {
         ComboBox {
             objectName: "renderModeCombo"
             Layout.fillWidth: true
-            model: [qsTr("完整渲染"), qsTr("范围采样（不输出音频）"), qsTr("随机采样（不输出音频）")]
+            model: [qsTr("完整渲染"), root.redo ? qsTr("范围采样") : qsTr("范围采样（不输出音频）"), qsTr("随机采样（不输出音频）")]
             currentIndex: (root.project.wizard || {}).mode || 0
             onActivated: function(index) { Backend.setNumber("renderMode", index) }
         }
 
         NumberField {
+            enabled: !root.redo || (root.project.wizard || {}).mode === 1
             Layout.fillWidth: true
             label: qsTr("采样起点")
             suffix: qsTr("ms")
@@ -606,17 +614,23 @@ ColumnLayout {
         }
 
         NumberField {
+            enabled: !root.redo || (root.project.wizard || {}).mode === 1
             Layout.fillWidth: true
             label: qsTr("采样时长")
             suffix: qsTr("ms")
             from: 1
             to: 86400000
             stepSize: 1000
-            value: root.cfg("sampleDuration", 15000)
+            value: root.cfg("sampleDuration", 15000) ?? 15000
             controlObjectName: "sampleDurationSpin"
             onEdited: function(value) {
                 Backend.setNumber("sampleDuration", value)
             }
+        }
+        Text {
+            visible: root.redo && (root.project.wizard || {}).mode === 1 && root.cfg("sampleDuration", null) === null
+            text: qsTr("当前范围延续至结束，修改时长可设置截止时间。")
+            color: Theme.currentTheme.colors.textSecondaryColor
         }
         Text {
             Layout.fillWidth: true

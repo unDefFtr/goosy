@@ -1,5 +1,7 @@
 use crate::lrc::{LyricLine, scan_end_ms};
-use crate::spring::Spring;
+use crate::spring::{Spring, SpringCheckpoint};
+use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 
 const POS_STIFFNESS: f64 = 90.0;
 const POS_DAMPING: f64 = 15.0;
@@ -11,11 +13,91 @@ const MAX_ANTICIPATION_MS: u64 = 700;
 const MIN_INTERLUDE_MS: u64 = 4_000;
 const INTERLUDE_FLOAT_DELAY_MS: u64 = 70;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interlude {
     pub next_idx: usize,
     pub start_ms: u64,
     pub end_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutCheckpoint {
+    pub schema_version: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub layout_height: f64,
+    pub line_count: usize,
+    pub pos_y: Vec<SpringCheckpoint>,
+    pub scale: Vec<SpringCheckpoint>,
+    pub blur: Vec<SpringCheckpoint>,
+    pub active_idx: usize,
+    pub focus_idx: usize,
+    pub playing_indices: Vec<usize>,
+    pub highlighted_indices: Vec<usize>,
+    pub previous_t_ms: Option<u64>,
+    pub transition_ms: u64,
+    pub stagger_delays_ms: Vec<u64>,
+    pub group_heights: Vec<f64>,
+    pub group_gap: f64,
+    pub interlude_slot_height: f64,
+    pub initialized: bool,
+    pub interlude: Option<Interlude>,
+}
+
+impl LayoutCheckpoint {
+    pub fn validate_schema(&self) -> Result<()> {
+        if self.schema_version != 1 {
+            bail!("unsupported layout checkpoint schema version {}", self.schema_version);
+        }
+        if !self.layout_height.is_finite() || self.layout_height <= 0.0 {
+            bail!("invalid checkpoint layout height");
+        }
+        let unbound = self.width == 0 && self.height == 0 && self.fps == 0;
+        if !unbound && (self.width == 0 || self.height == 0 || self.fps == 0) {
+            bail!("checkpoint renderer dimensions must be positive");
+        }
+        let n = self.line_count;
+        if self.pos_y.len() != n
+            || self.scale.len() != n
+            || self.blur.len() != n
+            || self.stagger_delays_ms.len() != n
+            || self.group_heights.len() != n
+        {
+            bail!("checkpoint vector lengths do not match line count");
+        }
+        if n == 0 {
+            if self.active_idx != 0 || self.focus_idx != 0 {
+                bail!("empty checkpoint has nonzero active index");
+            }
+        } else if self.active_idx >= n || self.focus_idx >= n {
+            bail!("checkpoint index out of range");
+        }
+        for indices in [&self.playing_indices, &self.highlighted_indices] {
+            if indices.iter().any(|index| *index >= n)
+                || indices.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                bail!("checkpoint indices are not sorted and unique");
+            }
+        }
+        for spring in self.pos_y.iter().chain(&self.scale).chain(&self.blur) {
+            spring.validate()?;
+        }
+        if self.group_heights.iter().any(|value| !value.is_finite() || *value < 0.0)
+            || !self.group_gap.is_finite()
+            || self.group_gap < 0.0
+            || !self.interlude_slot_height.is_finite()
+            || self.interlude_slot_height < 0.0
+        {
+            bail!("checkpoint has invalid layout dimensions");
+        }
+        if let Some(interlude) = self.interlude {
+            if interlude.next_idx >= n || interlude.start_ms > interlude.end_ms {
+                bail!("checkpoint has invalid interlude");
+            }
+        }
+        Ok(())
+    }
 }
 
 fn interlude_between(lines: &[LyricLine], next_idx: usize) -> Option<Interlude> {
@@ -245,6 +327,63 @@ impl Layout {
 
     pub fn focus_idx(&self) -> usize {
         self.focus_idx
+    }
+
+    pub fn save_checkpoint(&self) -> LayoutCheckpoint {
+        LayoutCheckpoint {
+            schema_version: 1,
+            width: 0,
+            height: 0,
+            fps: 0,
+            layout_height: self.height,
+            line_count: self.pos_y.len(),
+            pos_y: self.pos_y.iter().map(Spring::save_checkpoint).collect(),
+            scale: self.scale.iter().map(Spring::save_checkpoint).collect(),
+            blur: self.blur.iter().map(Spring::save_checkpoint).collect(),
+            active_idx: self.active_idx,
+            focus_idx: self.focus_idx,
+            playing_indices: self.playing_indices.clone(),
+            highlighted_indices: self.highlighted_indices.clone(),
+            previous_t_ms: self.previous_t_ms,
+            transition_ms: self.transition_ms,
+            stagger_delays_ms: self.stagger_delays_ms.clone(),
+            group_heights: self.group_heights.clone(),
+            group_gap: self.group_gap,
+            interlude_slot_height: self.interlude_slot_height,
+            initialized: self.initialized,
+            interlude: self.interlude,
+        }
+    }
+
+    pub fn restore_checkpoint(&mut self, checkpoint: &LayoutCheckpoint) -> Result<()> {
+        checkpoint.validate_schema()?;
+        if checkpoint.line_count != self.pos_y.len()
+            || (checkpoint.layout_height - self.height).abs() > 1e-9
+        {
+            bail!("layout checkpoint dimensions do not match renderer");
+        }
+        for (spring, saved) in self.pos_y.iter_mut().zip(&checkpoint.pos_y) {
+            spring.restore_checkpoint(saved)?;
+        }
+        for (spring, saved) in self.scale.iter_mut().zip(&checkpoint.scale) {
+            spring.restore_checkpoint(saved)?;
+        }
+        for (spring, saved) in self.blur.iter_mut().zip(&checkpoint.blur) {
+            spring.restore_checkpoint(saved)?;
+        }
+        self.active_idx = checkpoint.active_idx;
+        self.focus_idx = checkpoint.focus_idx;
+        self.playing_indices = checkpoint.playing_indices.clone();
+        self.highlighted_indices = checkpoint.highlighted_indices.clone();
+        self.previous_t_ms = checkpoint.previous_t_ms;
+        self.transition_ms = checkpoint.transition_ms;
+        self.stagger_delays_ms = checkpoint.stagger_delays_ms.clone();
+        self.group_heights = checkpoint.group_heights.clone();
+        self.group_gap = checkpoint.group_gap;
+        self.interlude_slot_height = checkpoint.interlude_slot_height;
+        self.initialized = checkpoint.initialized;
+        self.interlude = checkpoint.interlude;
+        Ok(())
     }
 
     fn group_height(&self, index: usize) -> f64 {
@@ -489,6 +628,39 @@ mod tests {
         layout.update(&lines, 6_000, 30);
         assert_eq!(layout.focus_idx, 1);
         assert_eq!(layout.active_idx(), 1);
+    }
+
+    #[test]
+    fn checkpoint_resume_preserves_animated_layout() {
+        let lines = lines();
+        let mut continuous = Layout::new(&lines, 1_080.0, &[70.0, 70.0, 70.0], 0.0, 40.0);
+        let mut resumed = Layout::new(&lines, 1_080.0, &[70.0, 70.0, 70.0], 0.0, 40.0);
+        for timestamp in [0, 33, 66, 99, 132, 1_800, 1_833] {
+            continuous.update(&lines, timestamp, 30);
+        }
+        let checkpoint = continuous.save_checkpoint();
+        checkpoint.validate_schema().unwrap();
+        resumed.restore_checkpoint(&checkpoint).unwrap();
+        for timestamp in [1_866, 1_899, 2_000, 2_033, 2_500, 5_000, 6_000] {
+            continuous.update(&lines, timestamp, 30);
+            resumed.update(&lines, timestamp, 30);
+            for (left, right) in continuous.pos_y.iter().zip(&resumed.pos_y) {
+                assert_eq!(left.current_position(), right.current_position());
+                assert_eq!(left.current_velocity(), right.current_velocity());
+            }
+            for (left, right) in continuous.blur.iter().zip(&resumed.blur) {
+                assert_eq!(left.current_position(), right.current_position());
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_rejects_future_schema() {
+        let lines = lines();
+        let mut checkpoint = Layout::new(&lines, 1_080.0, &[70.0, 70.0, 70.0], 0.0, 0.0)
+            .save_checkpoint();
+        checkpoint.schema_version = 2;
+        assert!(checkpoint.validate_schema().is_err());
     }
 }
 

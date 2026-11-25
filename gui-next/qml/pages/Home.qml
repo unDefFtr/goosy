@@ -16,6 +16,7 @@ Controls.Page {
     readonly property var wizard: project.wizard || {}
     readonly property var cfg: project.settings || {}
     readonly property int step: wizard.step || 0
+    readonly property double redoRevision: wizard.redoRevision || 0
     readonly property var titles: [qsTr("素材"), qsTr("样式"), qsTr("输出"), qsTr("确认")]
     readonly property bool navigating: stepTransition.running
     property int navigationDirection: 1
@@ -35,7 +36,7 @@ Controls.Page {
         var mock = MockRecentTasks.preset(page.mockPreset)
         if (mock !== null)
             return mock
-        return page.task.recentTasks || page.task.tasks || []
+        return page.task.recentTasks || []
     }
 
     ListModel {
@@ -43,23 +44,14 @@ Controls.Page {
     }
 
     function syncRecentRows() {
-        var snapshot = page.recentSource || []
-        var maxCount = Math.min(snapshot.length, 20)
-        var keepIds = {}
-        for (var k = 0; k < maxCount; ++k)
-            keepIds[String(snapshot[k].id || "")] = true
-        for (var r = recentRows.count - 1; r >= 0; --r) {
-            if (!keepIds[recentRows.get(r).taskId])
-                recentRows.remove(r)
-        }
-        for (var i = 0; i < maxCount; ++i) {
-            var item = snapshot[i]
+        if (!recentRows) return
+        Ui.reconcileTaskRows(recentRows, page.recentSource || [], function(item) {
             var itemCfg = item.config || {}
-            var values = {
+            return {
                 taskId: String(item.id || ""),
                 title: String(item.title || ""),
                 taskState: String(item.state || "idle"),
-                done: Number(item.done) || 0,
+                done: Ui.displayedFrames(item),
                 total: Number(item.total) || 0,
                 outputWidth: Number(itemCfg.width) || 0,
                 outputHeight: Number(itemCfg.height) || 0,
@@ -68,25 +60,7 @@ Controls.Page {
                 thumbnail: String(item.thumbnail || ""),
                 detail: String(item.detail || "")
             }
-            var existing = -1
-            for (var j = i; j < recentRows.count; ++j) {
-                if (recentRows.get(j).taskId === values.taskId) {
-                    existing = j
-                    break
-                }
-            }
-            if (existing < 0) {
-                recentRows.insert(i, values)
-            } else {
-                if (existing !== i)
-                    recentRows.move(existing, i, 1)
-                var row = recentRows.get(i)
-                for (var key in values) {
-                    if (row[key] !== values[key])
-                        recentRows.setProperty(i, key, values[key])
-                }
-            }
-        }
+        })
     }
 
     function openTasksPage() {
@@ -115,6 +89,14 @@ Controls.Page {
         repeat: true
         running: page.greetingHour < 0
         onTriggered: page.greeting = Ui.greetingText(page.greetingHour)
+    }
+
+    onRedoRevisionChanged: {
+        if (stepTransition && stepTransition.running) {
+            stepTransition.stop()
+            form.x = 0
+            form.opacity = 1
+        }
     }
 
     function navigate(target, action) {
@@ -411,7 +393,7 @@ Controls.Page {
             spacing: 10
             Text {
                 objectName: "createTaskTitle"
-                text: qsTr("创建任务")
+                text: page.wizard.redo ? qsTr("重做任务") : qsTr("创建任务")
                 typography: Typography.Title
                 Layout.bottomMargin: 6
             }
@@ -478,7 +460,7 @@ Controls.Page {
                             model: [
                                 { heading: qsTr("素材"), target: 0, body: qsTr("音频：%1\n歌词：%2\n封面：%3\n背景：%4\n歌曲名称：%5").arg(page.project.audio || qsTr("未选择")).arg(page.project.lyricsPath || qsTr("内嵌歌词")).arg(page.project.coverPath || qsTr("无外部封面")).arg(page.project.background || qsTr("自动背景")).arg(page.project.title || qsTr("音频元数据标题")) },
                                 { heading: qsTr("样式"), target: 1, body: qsTr("字号 %1% · 行高 %2% · 行间距 %3%\n翻译 %4 · 伴唱 %5").arg(page.cfg.fontScale).arg(page.cfg.lineHeight).arg(page.cfg.lineSpacing).arg(page.cfg.translation ? "开" : "关").arg(page.cfg.backgroundVocal ? "开" : "关"), details: qsTr("翻译字号 %1% · 伴唱字号 %2% · 左右留白 %3%\n翻译间距 %4% · 伴唱间距 %5% · 模糊步长 %6\n内嵌封面 %7 · 调试框 %8").arg(page.cfg.translationFontScale).arg(page.cfg.backgroundFontScale).arg(page.cfg.horizontalPadding).arg(page.cfg.translationGap).arg(page.cfg.backgroundGap).arg(page.cfg.blurStep).arg(page.cfg.embeddedCover ? "开" : "关").arg(page.cfg.debugOverlays ? "开" : "关") },
-                                { heading: qsTr("输出"), target: 2, body: qsTr("%1 × %2 · %3 fps\n%4 · %5\n%6\n%7 · 音频%8").arg(page.cfg.width).arg(page.cfg.height).arg(page.cfg.fps).arg((page.cfg.encoders || [])[page.cfg.encoder] || "").arg((page.cfg.codecs || [])[page.cfg.codec] || "").arg(page.wizard.effectiveOutput || page.project.output || qsTr("未选择路径")).arg(["完整渲染", "范围采样", "随机采样"][page.wizard.mode || 0]).arg(page.wizard.mode ? "关" : (page.cfg.includeAudio ? "开" : "关")), details: qsTr("采样起点 %1 ms · 时长 %2 ms\n预览间隔 %3 帧 · NVENC p%4").arg(page.cfg.sampleStart).arg(page.cfg.sampleDuration).arg(page.cfg.previewInterval).arg(Number(page.cfg.nvencPreset) + 1) }
+                                { heading: qsTr("输出"), target: 2, body: qsTr("%1 × %2 · %3 fps\n%4 · %5\n%6\n%7 · 音频%8").arg(page.cfg.width).arg(page.cfg.height).arg(page.cfg.fps).arg((page.cfg.encoders || [])[page.cfg.encoder] || "").arg((page.cfg.codecs || [])[page.cfg.codec] || "").arg(page.wizard.effectiveOutput || page.project.output || qsTr("未选择路径")).arg(["完整渲染", "范围采样", "随机采样"][page.wizard.mode || 0]).arg((page.wizard.mode === 2 || (!page.wizard.redo && page.wizard.mode)) ? "关" : (page.cfg.includeAudio ? "开" : "关")), details: qsTr("采样起点 %1 ms · 时长 %2\n预览间隔 %3 帧 · NVENC p%4").arg(page.cfg.sampleStart).arg(page.cfg.sampleDuration == null ? qsTr("至结束") : page.cfg.sampleDuration + " ms").arg(page.cfg.previewInterval).arg(Number(page.cfg.nvencPreset) + 1) }
                             ]
                             SectionCard {
                                 required property var modelData
@@ -508,7 +490,15 @@ Controls.Page {
                                         color: Theme.currentTheme.colors.systemCriticalColor
                                         wrapMode: Text.WordWrap
                                     }
-                                    Button { text: qsTr("修改"); onClicked: page.navigate(modelData.step) }
+                                    Button {
+                                        visible: modelData.canAccept === true
+                                        text: qsTr("使用当前文件")
+                                        onClicked: Backend.command("acceptAsset:" + modelData.field)
+                                    }
+                                    Button {
+                                        text: modelData.canAccept !== undefined ? qsTr("重新定位…") : qsTr("修改")
+                                        onClicked: page.navigate(modelData.step)
+                                    }
                                 }
                                 Expander {
                                     Layout.fillWidth: true

@@ -160,17 +160,34 @@ impl CoverRenderer {
         Ok(())
     }
 
+    fn dimensions(viewport: crate::geometry::Viewport) -> (f32, f32) {
+        let side = (viewport.width * 0.78).min(viewport.height * 0.62);
+        let font_size = (viewport.width * 0.048)
+            .min(viewport.height * 0.034)
+            .max(16.0);
+        (side, font_size)
+    }
+
+    pub(crate) fn title_for_geometry(
+        &mut self,
+        geometry: &FrameGeometry,
+    ) -> Result<Option<&Paragraph>> {
+        let Some(viewport) = geometry.cover else {
+            return Ok(None);
+        };
+        let (side, font_size) = Self::dimensions(viewport);
+        self.ensure_title(side, font_size)?;
+        Ok(self.title_paragraph.as_ref())
+    }
+
     fn draw_contents(&mut self, canvas: &Canvas, geometry: &FrameGeometry) -> Result<()> {
         let Some(viewport) = geometry.cover else {
             return Ok(());
         };
-        let side = (viewport.width * 0.78).min(viewport.height * 0.62);
+        let (side, font_size) = Self::dimensions(viewport);
         if side <= 0.0 {
             return Ok(());
         }
-        let font_size = (viewport.width * 0.048)
-            .min(viewport.height * 0.034)
-            .max(16.0);
         self.ensure_title(side, font_size)?;
         self.ensure_shadow(side)?;
         self.ensure_scaled_image(side)?;

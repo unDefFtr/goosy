@@ -21,10 +21,9 @@ Controls.AbstractButton {
     property bool keyboardFocused: false
 
     readonly property bool isActiveState: Ui.isActive(root.taskState)
-    readonly property bool isRunningState: root.taskState === "running" || root.taskState === "starting"
-    readonly property bool showProgress: root.isActiveState && root.total > 0
+    readonly property bool showProgress: (root.isActiveState || root.taskState === "interrupted") && root.total > 0
     readonly property string outputSpec: Ui.formatOutputSpec(root.outputWidth, root.outputHeight, root.outputFps)
-    readonly property string statusText: root.isRunningState && root.total > 0
+    readonly property string statusText: root.showProgress
         ? (Ui.stateLabel(root.taskState) + " " + Ui.progressPercent(root.done, root.total))
         : Ui.stateLabel(root.taskState)
 
@@ -238,7 +237,7 @@ Controls.AbstractButton {
                 from: 0
                 to: 1
                 value: Ui.progressValue(root.done, root.total)
-                state: root.taskState === "paused" ? ProgressBar.Paused : ProgressBar.Running
+                state: root.taskState === "paused" || root.taskState === "interrupted" ? ProgressBar.Paused : ProgressBar.Running
             }
         }
     }

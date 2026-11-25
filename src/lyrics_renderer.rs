@@ -82,7 +82,7 @@ fn make_blur_paint(sigma: f32) -> Result<RefCell<Paint>> {
     Ok(RefCell::new(paint))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LyricsStyle {
     pub font_scale: f32,
     pub translation_font_scale: f32,
@@ -178,6 +178,15 @@ pub struct LyricsRenderer {
 }
 
 impl LyricsRenderer {
+    pub(crate) fn paragraphs(&self) -> impl Iterator<Item = &Paragraph> {
+        self.base_paragraphs.iter()
+            .chain(&self.solid_paragraphs)
+            .chain(self.translation_paragraphs.iter().flatten())
+            .chain(self.background_paragraphs.iter().flatten())
+            .chain(self.background_solid_paragraphs.iter().flatten())
+            .chain(self.background_translation_paragraphs.iter().flatten())
+    }
+
     pub fn new(lines: &[LyricLine], viewport: Viewport) -> Result<Self> {
         Self::new_with_options(lines, viewport, true, true, LyricsStyle::default())
     }

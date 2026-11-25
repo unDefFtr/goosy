@@ -3,8 +3,9 @@ mod gui_shared;
 
 #[cfg(not(target_os = "windows"))]
 use libgoosy::{
-    LyricsStyle, RenderedFrame, background, cover_renderer, image_asset, lrc, pdf_renderer,
-    renderer, ttml, video, yrc,
+    LyricsStyle, lrc, pdf_renderer,
+    task_manager::{Control, TaskId, TaskManager, TaskState},
+    ttml, video, yrc,
 };
 
 use anyhow::Result;
@@ -22,7 +23,7 @@ use std::io::Write;
 #[cfg(not(target_os = "windows"))]
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(not(target_os = "windows"))]
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -177,6 +178,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = CliVideoCodec::H264)]
         codec: CliVideoCodec,
     },
+    /// Continue a previously interrupted render from its last verified segment.
+    Resume {
+        task: TaskId,
+    },
     Pdf {
         song: PathBuf,
         #[arg(value_name = "LYRICS")]
@@ -208,6 +213,11 @@ fn main() -> Result<()> {
     };
     match command {
         Command::Gui => gui::run().map_err(|error| anyhow::anyhow!(error.to_string())),
+        Command::Resume { task } => {
+            let manager = TaskManager::new()?;
+            manager.command(task, Control::Resume)?;
+            wait_for_render(&manager, task, false)
+        }
         Command::Pdf {
             song,
             lyrics,
@@ -364,159 +374,102 @@ fn render(
     format: LyricFormat,
     codec: libgoosy::VideoCodec,
 ) -> Result<()> {
-    if width == 0 || height == 0 || fps == 0 {
-        bail!("width, height, and fps must be positive");
-    }
-    encoder.validate_codec(codec)?;
-    emit_render_stage(progress_events, "probing-audio", "正在读取音频信息")?;
-    let metadata = video::audio_metadata(&song)
-        .with_context(|| format!("读取音频信息：{}", song.display()))?;
-    emit_render_stage(progress_events, "loading-lyrics", "正在读取歌词")?;
-    let title = title.or(metadata.title.clone());
-    let text = if let Some(lyrics) = lyrics.as_deref() {
-        fs::read_to_string(lyrics).with_context(|| format!("read lyrics {}", lyrics.display()))?
-    } else {
-        metadata
-            .lyrics
-            .clone()
-            .context("no external lyrics path and no embedded lyrics metadata")?
+    let extension = lyrics
+        .as_deref()
+        .and_then(Path::extension)
+        .and_then(|ext| ext.to_str());
+    let format = match format {
+        LyricFormat::Auto if extension.is_some_and(|ext| ext.eq_ignore_ascii_case("ttml")) => {
+            libgoosy::LyricFormat::Ttml
+        }
+        LyricFormat::Auto if extension.is_some_and(|ext| ext.eq_ignore_ascii_case("yrc")) => {
+            libgoosy::LyricFormat::Yrc
+        }
+        LyricFormat::Auto => libgoosy::LyricFormat::Auto,
+        LyricFormat::Ttml => libgoosy::LyricFormat::Ttml,
+        LyricFormat::Yrc => libgoosy::LyricFormat::Yrc,
+        LyricFormat::Lrc => libgoosy::LyricFormat::Lrc,
     };
-    let lines = parse_lyrics_text(&text, lyrics.as_deref(), format)?;
-    let last_line_end_ms = lines.iter().map(|line| line.end_ms).max().unwrap_or(0);
-    let audio_duration = if no_audio {
-        0.0
-    } else {
-        metadata.duration_seconds
-    };
-    let duration_seconds = if no_audio {
-        last_line_end_ms as f64 / 1_000.0 + 1.0
-    } else {
-        audio_duration
-    };
-    let total_frames = (duration_seconds * fps as f64).ceil() as u64;
-    emit_render_stage(progress_events, "loading-cover", "正在提取封面")?;
-    let embedded_cover = if cover.is_none() && !no_embedded_cover {
-        video::embedded_cover_image(&song)
-            .with_context(|| format!("提取音频内嵌封面：{}", song.display()))?
-    } else {
-        None
-    };
-    let image_assets = image_asset::load_scene_image_assets(
-        background.as_deref(),
-        cover.as_deref(),
-        embedded_cover.as_deref(),
-    )?;
-    let background_layer = match image_assets.background.as_ref() {
-        Some(asset) => background::BackgroundRenderer::from_image_asset(asset)?,
-        None => background::BackgroundRenderer::dynamic(),
-    };
-    #[cfg(target_os = "windows")]
-    ensure_windows_backend_is_healthy(width, height, progress_events)?;
-    let cover_layer = image_assets
-        .cover
-        .as_ref()
-        .map(|asset| cover_renderer::CoverRenderer::from_image_asset(asset, title))
-        .transpose()?;
-    #[cfg(target_os = "windows")]
-    ensure_windows_renderer_is_healthy(width, height, fps, progress_events)?;
-    emit_render_stage(
-        progress_events,
-        "initializing-renderer",
-        "正在初始化图形后端",
-    )?;
-    let mut renderer = renderer::Renderer::with_scene_options_for_encoder(
-        width,
-        height,
-        fps,
-        lines,
-        background_layer,
-        cover_layer,
-        !no_translation,
-        !no_background_vocal,
-        LyricsStyle {
-            font_scale,
-            translation_font_scale,
-            background_font_scale,
-            line_height_scale,
-            group_gap_scale: line_spacing_scale,
-            translation_gap_scale,
-            background_gap_scale,
-            horizontal_padding_scale,
-            lyric_blur_sigma_step,
-            debug_overlays,
+    let manager = TaskManager::new()?;
+    let task = manager.enqueue(
+        libgoosy::RenderOptions {
+            song,
+            lyrics,
+            output,
+            width,
+            height,
+            fps,
+            background,
+            cover,
+            title,
+            no_embedded_cover,
+            no_audio,
+            render_translation: !no_translation,
+            render_background_vocal: !no_background_vocal,
+            excluded_lines: exclude_lines,
+            format,
+            sample_start_ms: None,
+            sample_duration_ms: None,
+            encoder,
+            codec,
+            nvenc_preset,
+            lyrics_style: LyricsStyle {
+                font_scale,
+                translation_font_scale,
+                background_font_scale,
+                line_height_scale,
+                group_gap_scale: line_spacing_scale,
+                translation_gap_scale,
+                background_gap_scale,
+                horizontal_padding_scale,
+                lyric_blur_sigma_step,
+                debug_overlays,
+            },
         },
-        &exclude_lines,
-        encoder,
-    )
-    .context("初始化图形渲染器")?;
-    eprintln!(
-        "render backend: {} ({})",
-        renderer.backend_name(),
-        renderer.backend_details()
-    );
-    emit_render_stage(progress_events, "starting-ffmpeg", "正在启动 FFmpeg")?;
-    #[cfg(target_os = "linux")]
-    eprintln!("video encoder: {}", video::preferred_video_encoder_name());
-    let mut sink = video::create_encoder_with_codec_and_preset(
-        encoder,
-        codec,
-        &output,
-        width,
-        height,
-        fps,
-        (!no_audio).then_some(song.as_path()),
-        libgoosy::NvencPreset::from_value(&nvenc_preset),
-    )
-    .with_context(|| format!("启动 FFmpeg 输出：{}", output.display()))?;
-    emit_render_stage(progress_events, "rendering-first-frame", "正在渲染首帧")?;
-    let progress = ProgressBar::new(total_frames);
-    progress.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} {msg} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {percent:>3}% ETA {eta}",
-        )
-        .context("configure render progress bar")?
-        .progress_chars("━━╸"),
-    );
-    progress.set_message(format!("Rendering {}", output.display()));
-    progress.enable_steady_tick(Duration::from_millis(100));
-    let zero_copy = encoder.is_zero_copy();
-    let require_cpu_pixels = sink.requires_cpu_pixels();
-    let render_started = Instant::now();
-    let mut frame_buffer = if zero_copy && total_frames > 0 {
-        renderer.render_frame(0).context("渲染首帧")?
-    } else {
-        RenderedFrame::new(width, height)
-    };
-    let progress_interval = (fps as u64 / 10).max(1);
-    for frame_index in 0..total_frames {
-        let t_ms = frame_index * 1_000 / fps as u64;
-        if !(zero_copy && frame_index == 0) {
-            if require_cpu_pixels {
-                renderer.render_frame_into(t_ms, &mut frame_buffer)
-            } else {
-                renderer.render_frame_into_opts(t_ms, &mut frame_buffer, false)
+        u32::MAX,
+    )?;
+    eprintln!("Task {task}");
+    wait_for_render(&manager, task, progress_events)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wait_for_render(manager: &TaskManager, id: TaskId, progress_events: bool) -> Result<()> {
+    let progress = ProgressBar::new(0);
+    progress.set_style(ProgressStyle::with_template(
+        "{msg} [{wide_bar}] {pos}/{len}",
+    )?);
+    let mut previous = None;
+    loop {
+        let task = manager.task(id).context("task missing from queue")?;
+        if previous != Some((task.done, task.state)) {
+            progress.set_length(task.total);
+            progress.set_position(task.done);
+            progress.set_message(task.stage.clone());
+            emit_render_stage(progress_events, task.state.name(), &task.stage)?;
+            if progress_events && task.total != 0 {
+                println!(
+                    "GOOSY_PROGRESS {} {} {:.3}",
+                    task.done, task.total, task.elapsed
+                );
+                std::io::stdout().flush()?;
             }
-            .with_context(|| format!("渲染第 {} 帧（{} ms）", frame_index + 1, t_ms))?;
+            previous = Some((task.done, task.state));
         }
-        frame_buffer = sink
-            .submit(frame_buffer)
-            .with_context(|| format!("向 FFmpeg 提交第 {} 帧", frame_index + 1))?;
-        progress.inc(1);
-        if progress_events
-            && ((frame_index + 1) % progress_interval == 0 || frame_index + 1 == total_frames)
-        {
-            println!(
-                "GOOSY_PROGRESS {} {} {:.3}",
-                frame_index + 1,
-                total_frames,
-                render_started.elapsed().as_secs_f64()
-            );
-            std::io::stdout().flush()?;
+        match task.state {
+            TaskState::Completed => {
+                progress.finish();
+                return Ok(());
+            }
+            TaskState::Failed
+            | TaskState::Cancelled
+            | TaskState::Deleting
+            | TaskState::Interrupted
+            | TaskState::Paused => {
+                bail!("task {id} {}: {}", task.state.name(), task.detail)
+            }
+            _ => std::thread::sleep(Duration::from_millis(100)),
         }
     }
-    sink.finish()?;
-    progress.finish_with_message(format!("Rendered {}", output.display()));
-    Ok(())
 }
 #[cfg(not(target_os = "windows"))]
 fn export_pdf(
@@ -556,7 +509,7 @@ fn export_pdf(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::*;
 

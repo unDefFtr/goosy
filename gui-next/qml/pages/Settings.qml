@@ -23,7 +23,7 @@ FluentPage {
         }
         Text {
             Layout.fillWidth: true
-            text: qsTr("暂停任务仍占用名额。仅本次会话有效。")
+            text: qsTr("并发上限将保存到用户设置，下次启动时继续生效。")
             color: Theme.currentTheme.colors.textSecondaryColor
             wrapMode: Text.WordWrap
         }

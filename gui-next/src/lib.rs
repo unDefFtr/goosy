@@ -4,6 +4,11 @@ use rinui_host::{AppIdentity, HostConfig, HostError, QmlSource, ResourceMode, Ri
 
 use std::path::PathBuf;
 
+/// Request the desktop's file manager for a validated local directory.
+pub fn open_directory(file_url: &str) -> bool {
+    backend::ffi::open_directory(&file_url.into())
+}
+
 pub struct RgbaFrame {
     pub width: u32,
     pub height: u32,

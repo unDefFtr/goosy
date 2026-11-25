@@ -9,10 +9,12 @@ pub mod geometry;
 pub mod gpu_interop;
 #[cfg(target_os = "windows")]
 pub mod win_qsv;
+mod history;
 pub mod image_asset;
 pub mod layout;
 pub mod lrc;
 pub mod lyrics_renderer;
+mod media;
 pub mod pdf_renderer;
 pub mod renderer;
 pub mod spring;
@@ -20,6 +22,7 @@ pub mod surface;
 pub mod task_manager;
 pub mod ttml;
 pub mod video;
+pub mod workspace;
 pub mod yrc;
 
 // Prefer the discrete adapter on Windows hybrid-GPU systems. NVIDIA Optimus and
@@ -36,7 +39,6 @@ pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 pub use anyhow::Result;
 pub use encoder::{EncoderBackend, NvencPreset, VideoCodec};
 pub use frame::{FrameSink, RenderedFrame};
-use indicatif::{ProgressBar, ProgressStyle};
 pub use lrc::{BackgroundVocal, LyricLine, LyricWord};
 pub use lyrics_renderer::LyricsStyle;
 pub use pdf_renderer::{PdfOptions, render_lyrics_pdf};
@@ -45,7 +47,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LyricFormat {
     #[default]
     Auto,
@@ -53,7 +55,7 @@ pub enum LyricFormat {
     Ttml,
     Yrc,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RenderOptions {
     pub song: PathBuf,
     pub lyrics: Option<PathBuf>,
@@ -187,36 +189,145 @@ where
 
 pub fn render_with_frame_progress_control_stats_lazy<P, F, C>(
     options: &RenderOptions,
-    mut need_pixels: P,
-    mut on_frame: F,
-    mut control: C,
+    need_pixels: P,
+    on_frame: F,
+    control: C,
 ) -> anyhow::Result<RenderStats>
 where
     P: FnMut(u64, u64) -> bool,
     F: FnMut(u64, u64, f64, &[u8]),
     C: FnMut() -> RenderControl,
 {
+    let mut scene = prepare_scene(options)?;
+    let mut events = FrameEvents::new(need_pixels, on_frame, |_, _, _, _| {});
+    let total = scene.total_frames;
+    let frame = new_frame(options);
+    events.encode(
+        &mut scene,
+        options,
+        0..total,
+        create_sink(
+            options,
+            &options.output,
+            (!options.no_audio).then_some(&options.song),
+        )?,
+        frame,
+        control,
+    )?;
+    Ok(events.stats(total))
+}
+
+/// Encoder-side progress. The existing frame callback still runs before submission,
+/// while its pixel slice belongs to the renderer. Only `Committed` is durable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncoderProgress {
+    Submitted,
+    Committed,
+}
+
+/// Drive a managed render from its verified workspace. `at_boundary` may block for
+/// pause/resume, or return false to leave with all previous commits intact. `None`
+/// denotes such a controlled exit; a completed render always has a publication receipt.
+pub fn render_workspace(
+    work: &mut workspace::Workspace,
+    need_pixels: impl FnMut(u64, u64) -> bool,
+    on_frame: impl FnMut(u64, u64, f64, &[u8]),
+    encoder_progress: impl FnMut(EncoderProgress, u64, u64, f64),
+    mut at_boundary: impl FnMut() -> bool,
+) -> Result<Option<RenderStats>> {
+    let mut events = FrameEvents::new(need_pixels, on_frame, encoder_progress);
+    if work.published_size()?.is_some() {
+        return Ok(Some(events.stats(work.total())));
+    }
+    if !events.boundary(&mut at_boundary) {
+        return Ok(None);
+    }
+    // Finalization can be retried without opening any renderer or GPU device.
+    if let Some((start_ms, duration_ms, total)) = work.range() {
+        if work.committed() == total {
+            media::finalize(work, start_ms, duration_ms, total)?;
+            return Ok(Some(events.stats(total)));
+        }
+    }
+    let mut scene = prepare_scene(work.options())?;
+    work.set_render_backend(&scene.renderer.resume_environment()?)?;
+    let Scene {
+        start_ms,
+        duration_ms,
+        total_frames,
+        ..
+    } = scene;
+    work.set_range(start_ms, duration_ms, total_frames)?;
+    if let Some(checkpoint) = work.checkpoint()? {
+        scene.renderer.restore_checkpoint(&checkpoint)?;
+    }
+    let mut frame = new_frame(work.options());
+    while work.committed() < total_frames {
+        if !events.boundary(&mut at_boundary) {
+            return Ok(None);
+        }
+        let start = work.committed();
+        let end = start
+            .saturating_add(work.segment_frames())
+            .min(total_frames);
+        anyhow::ensure!(end > start, "empty render segment at frame {start}");
+        let path = work.segment_path(start);
+        let options = work.options();
+        let sink = create_sink(options, &path, None)?;
+        frame = events.encode(&mut scene, options, start..end, sink, frame, || {
+            RenderControl::Continue
+        })?;
+        let signature = media::validate_segment(&path, options, end - start)?;
+        work.commit(start, end, &scene.renderer.save_checkpoint(), &signature)?;
+        (events.encoder_progress)(
+            EncoderProgress::Committed,
+            end,
+            total_frames,
+            events.started.elapsed().as_secs_f64(),
+        );
+    }
+    if !events.boundary(&mut at_boundary) {
+        return Ok(None);
+    }
+    drop((frame, scene));
+    media::finalize(work, start_ms, duration_ms, total_frames)?;
+    Ok(Some(events.stats(total_frames)))
+}
+
+struct Scene {
+    renderer: Renderer,
+    start_ms: u64,
+    duration_ms: u64,
+    total_frames: u64,
+}
+
+/// Full render timeline before applying a sample range, in milliseconds.
+pub fn render_duration_ms(no_audio: bool, audio_duration_seconds: f64, last_lyric_end_ms: u64) -> u64 {
+    if no_audio {
+        last_lyric_end_ms.saturating_add(1_000)
+    } else {
+        (audio_duration_seconds * 1_000.0).ceil() as u64
+    }
+}
+
+fn prepare_scene(options: &RenderOptions) -> Result<Scene> {
     if options.width == 0 || options.height == 0 || options.fps == 0 {
         anyhow::bail!("width, height, and fps must be positive");
     }
     options.encoder.validate_codec(options.codec)?;
     let metadata = video::audio_metadata(&options.song)?;
-    let title = options.title.clone().or(metadata.title.clone());
+    let title = options.title.clone().or(metadata.title);
     let text = if let Some(lyrics) = options.lyrics.as_deref() {
         fs::read_to_string(lyrics)
             .map_err(|error| anyhow::anyhow!("read lyrics {}: {error}", lyrics.display()))?
     } else {
-        metadata.lyrics.clone().ok_or_else(|| {
+        metadata.lyrics.ok_or_else(|| {
             anyhow::anyhow!("no external lyrics path and no embedded lyrics metadata")
         })?
     };
     let lines = parse_lyrics(&text, options.format)?;
     let last_line_end_ms = lines.iter().map(|line| line.end_ms).max().unwrap_or(0);
-    let full_duration_ms = if options.no_audio {
-        last_line_end_ms.saturating_add(1_000)
-    } else {
-        (metadata.duration_seconds * 1_000.0).ceil() as u64
-    };
+    let full_duration_ms = render_duration_ms(options.no_audio, metadata.duration_seconds, last_line_end_ms);
     let render_start_ms = options.sample_start_ms.unwrap_or(0).min(full_duration_ms);
     let render_duration_ms = options
         .sample_duration_ms
@@ -225,7 +336,8 @@ where
     if render_duration_ms == 0 {
         anyhow::bail!("render duration must be positive");
     }
-    let total_frames = (render_duration_ms as f64 / 1_000.0 * options.fps as f64).ceil() as u64;
+    let total_frames =
+        u64::try_from((u128::from(render_duration_ms) * u128::from(options.fps)).div_ceil(1_000))?;
     let embedded_cover = if options.cover.is_none() && !options.no_embedded_cover {
         video::embedded_cover_image(&options.song)?
     } else {
@@ -245,7 +357,7 @@ where
         .as_ref()
         .map(|asset| cover_renderer::CoverRenderer::from_image_asset(asset, title))
         .transpose()?;
-    let mut renderer = Renderer::with_scene_options_for_encoder(
+    let renderer = Renderer::with_scene_options_for_encoder(
         options.width,
         options.height,
         options.fps,
@@ -258,77 +370,148 @@ where
         &options.excluded_lines,
         options.encoder,
     )?;
-    let mut sink = video::create_encoder_with_codec_and_preset(
+    Ok(Scene {
+        renderer,
+        start_ms: render_start_ms,
+        duration_ms: render_duration_ms,
+        total_frames,
+    })
+}
+
+fn create_sink(
+    options: &RenderOptions,
+    path: &Path,
+    audio: Option<&Path>,
+) -> Result<Box<dyn FrameSink>> {
+    video::create_encoder_with_codec_and_preset(
         options.encoder,
         options.codec,
-        &options.output,
+        path,
         options.width,
         options.height,
         options.fps,
-        (!options.no_audio).then_some(options.song.as_path()),
+        audio,
         NvencPreset::from_value(&options.nvenc_preset),
-    )?;
-    let require_cpu_pixels = sink.requires_cpu_pixels();
-    let profile = std::env::var_os("GOOSY_PROFILE").is_some();
-    let mut render_seconds = 0.0;
-    let mut submit_seconds = 0.0;
-    let finish_seconds;
-    let progress = ProgressBar::hidden();
-    progress.set_style(ProgressStyle::default_bar());
+    )
+}
+
+fn new_frame(options: &RenderOptions) -> RenderedFrame {
     #[cfg(target_os = "linux")]
-    let mut frame = if options.encoder.is_zero_copy() {
-        RenderedFrame::new_gpu_only(options.width, options.height)
-    } else {
-        RenderedFrame::new(options.width, options.height)
-    };
-    #[cfg(not(target_os = "linux"))]
-    let mut frame = RenderedFrame::new(options.width, options.height);
-    let render_started = Instant::now();
-    for frame_index in 0..total_frames {
-        loop {
-            match control() {
-                RenderControl::Continue => break,
-                RenderControl::Pause => std::thread::sleep(std::time::Duration::from_millis(40)),
-                RenderControl::Stop => anyhow::bail!("render stopped by user"),
+    if options.encoder.is_zero_copy() {
+        return RenderedFrame::new_gpu_only(options.width, options.height);
+    }
+    RenderedFrame::new(options.width, options.height)
+}
+
+struct FrameEvents<P, F, S> {
+    need_pixels: P,
+    on_frame: F,
+    encoder_progress: S,
+    started: Instant,
+    profile: bool,
+}
+
+impl<P, F, S> FrameEvents<P, F, S>
+where
+    P: FnMut(u64, u64) -> bool,
+    F: FnMut(u64, u64, f64, &[u8]),
+    S: FnMut(EncoderProgress, u64, u64, f64),
+{
+    fn new(need_pixels: P, on_frame: F, encoder_progress: S) -> Self {
+        Self {
+            need_pixels,
+            on_frame,
+            encoder_progress,
+            started: Instant::now(),
+            profile: std::env::var_os("GOOSY_PROFILE").is_some(),
+        }
+    }
+
+    fn stats(&self, frames: u64) -> RenderStats {
+        RenderStats {
+            frames,
+            elapsed_seconds: self.started.elapsed().as_secs_f64(),
+        }
+    }
+
+    fn boundary(&mut self, control: &mut impl FnMut() -> bool) -> bool {
+        let before = Instant::now();
+        let keep_running = control();
+        self.started += before.elapsed(); // Exclude time spent paused from active render time.
+        keep_running
+    }
+
+    /// Own the sink until its encoder has drained and the muxer has closed. Return
+    /// the recycled buffer so segment changes need no fresh full-resolution allocation.
+    fn encode(
+        &mut self,
+        scene: &mut Scene,
+        options: &RenderOptions,
+        frames: std::ops::Range<u64>,
+        mut sink: Box<dyn FrameSink>,
+        mut frame: RenderedFrame,
+        mut control: impl FnMut() -> RenderControl,
+    ) -> Result<RenderedFrame> {
+        let require_cpu_pixels = sink.requires_cpu_pixels();
+        let total = scene.total_frames;
+        let count = frames.end - frames.start;
+        let mut render_seconds = 0.0;
+        let mut submit_seconds = 0.0;
+        for index in frames {
+            loop {
+                match control() {
+                    RenderControl::Continue => break,
+                    RenderControl::Pause => {
+                        std::thread::sleep(std::time::Duration::from_millis(40))
+                    }
+                    RenderControl::Stop => anyhow::bail!("render stopped by user"),
+                }
             }
+            let tick = self.profile.then(Instant::now);
+            let done = index + 1;
+            let t_ms =
+                scene.start_ms + (u128::from(index) * 1_000 / u128::from(options.fps)) as u64;
+            let read_pixels = require_cpu_pixels
+                || (!options.encoder.is_zero_copy() && (self.need_pixels)(done, total));
+            if require_cpu_pixels {
+                scene.renderer.render_frame_into(t_ms, &mut frame)?;
+            } else {
+                scene
+                    .renderer
+                    .render_frame_into_opts(t_ms, &mut frame, read_pixels)?;
+            }
+            if let Some(tick) = tick {
+                render_seconds += tick.elapsed().as_secs_f64();
+            }
+            (self.on_frame)(
+                done,
+                total,
+                self.started.elapsed().as_secs_f64(),
+                if read_pixels { frame.pixels() } else { &[] },
+            );
+            let tick = self.profile.then(Instant::now);
+            frame = sink.submit(frame)?;
+            if let Some(tick) = tick {
+                submit_seconds += tick.elapsed().as_secs_f64();
+            }
+            (self.encoder_progress)(
+                EncoderProgress::Submitted,
+                done,
+                total,
+                self.started.elapsed().as_secs_f64(),
+            );
         }
-        let phase_started = Instant::now();
-        let t_ms = render_start_ms + frame_index * 1_000 / options.fps as u64;
-        let read_cpu_pixels = require_cpu_pixels
-            || (!options.encoder.is_zero_copy() && need_pixels(frame_index + 1, total_frames));
-        if require_cpu_pixels {
-            renderer.render_frame_into(t_ms, &mut frame)?;
-        } else {
-            renderer.render_frame_into_opts(t_ms, &mut frame, read_cpu_pixels)?;
+        let tick = self.profile.then(Instant::now);
+        sink.finish()?;
+        if let Some(tick) = tick {
+            eprintln!(
+                "render profile: frames={count} total={:.6}s render={render_seconds:.6}s submit={submit_seconds:.6}s finish={:.6}s",
+                self.started.elapsed().as_secs_f64(),
+                tick.elapsed().as_secs_f64()
+            );
         }
-        render_seconds += phase_started.elapsed().as_secs_f64();
-        progress.inc(1);
-        let callback_pixels: &[u8] = if read_cpu_pixels { frame.pixels() } else { &[] };
-        on_frame(
-            frame_index + 1,
-            total_frames,
-            render_started.elapsed().as_secs_f64(),
-            callback_pixels,
-        );
-        let phase_started = Instant::now();
-        frame = sink.submit(frame)?;
-        submit_seconds += phase_started.elapsed().as_secs_f64();
+        Ok(frame)
     }
-    let phase_started = Instant::now();
-    sink.finish()?;
-    finish_seconds = phase_started.elapsed().as_secs_f64();
-    let elapsed_seconds = render_started.elapsed().as_secs_f64();
-    if profile {
-        eprintln!(
-            "render profile: frames={} total={:.6}s render={:.6}s submit={:.6}s finish={:.6}s",
-            total_frames, elapsed_seconds, render_seconds, submit_seconds, finish_seconds
-        );
-    }
-    progress.finish_and_clear();
-    Ok(RenderStats {
-        frames: total_frames,
-        elapsed_seconds,
-    })
 }
 
 pub fn read_lyrics_file(

@@ -1,3 +1,51 @@
+use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpringCheckpoint {
+    pub current_position: f64,
+    pub target_position: f64,
+    pub stiffness: f64,
+    pub damping: f64,
+    pub mass: f64,
+    pub soft: bool,
+    pub time: f64,
+    pub from: f64,
+    pub velocity: f64,
+    pub initial_velocity: f64,
+    pub overdamped: bool,
+    pub delta: f64,
+    pub af: f64,
+    pub leftover: f64,
+    pub dfm: f64,
+    pub dm: f64,
+}
+
+impl SpringCheckpoint {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let values = [
+            self.current_position, self.target_position, self.stiffness, self.damping,
+            self.mass, self.time, self.from, self.velocity, self.initial_velocity,
+            self.delta, self.af, self.leftover, self.dfm, self.dm,
+        ];
+        if values.iter().any(|value| !value.is_finite()) {
+            bail!("spring checkpoint contains non-finite state");
+        }
+        if self.stiffness <= 0.0 || self.damping < 0.0 || self.mass <= 0.0 || self.time < 0.0 {
+            bail!("spring checkpoint has invalid parameters");
+        }
+        let expected_overdamped = self.soft
+            || self.damping >= 2.0 * (self.stiffness * self.mass).sqrt();
+        if self.overdamped != expected_overdamped {
+            bail!("spring checkpoint has inconsistent damping mode");
+        }
+        if (self.delta - (self.target_position - self.from)).abs() > 1e-9 {
+            bail!("spring checkpoint has inconsistent displacement");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Spring {
     current_position: f64,
@@ -19,6 +67,48 @@ pub struct Spring {
 }
 
 impl Spring {
+    pub fn save_checkpoint(&self) -> SpringCheckpoint {
+        SpringCheckpoint {
+            current_position: self.current_position,
+            target_position: self.target_position,
+            stiffness: self.stiffness,
+            damping: self.damping,
+            mass: self.mass,
+            soft: self.soft,
+            time: self.time,
+            from: self.from,
+            velocity: self.velocity,
+            initial_velocity: self.initial_velocity,
+            overdamped: self.overdamped,
+            delta: self.delta,
+            af: self.af,
+            leftover: self.leftover,
+            dfm: self.dfm,
+            dm: self.dm,
+        }
+    }
+
+    pub fn restore_checkpoint(&mut self, checkpoint: &SpringCheckpoint) -> Result<()> {
+        checkpoint.validate()?;
+        self.current_position = checkpoint.current_position;
+        self.target_position = checkpoint.target_position;
+        self.stiffness = checkpoint.stiffness;
+        self.damping = checkpoint.damping;
+        self.mass = checkpoint.mass;
+        self.soft = checkpoint.soft;
+        self.time = checkpoint.time;
+        self.from = checkpoint.from;
+        self.velocity = checkpoint.velocity;
+        self.initial_velocity = checkpoint.initial_velocity;
+        self.overdamped = checkpoint.overdamped;
+        self.delta = checkpoint.delta;
+        self.af = checkpoint.af;
+        self.leftover = checkpoint.leftover;
+        self.dfm = checkpoint.dfm;
+        self.dm = checkpoint.dm;
+        Ok(())
+    }
+
     fn recompute_solution(&mut self) {
         self.delta = self.target_position - self.from;
         self.overdamped = self.soft || self.damping >= 2.0 * (self.stiffness * self.mass).sqrt();
@@ -107,6 +197,7 @@ impl Spring {
         self.velocity = 0.0;
         self.initial_velocity = 0.0;
         self.time = 0.0;
+        self.recompute_solution();
     }
 
     pub fn set_target_position(&mut self, position: f64) {

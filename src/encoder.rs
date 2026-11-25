@@ -137,7 +137,7 @@ impl CudaFrames {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum VideoCodec {
     #[default]
     H264,
@@ -162,7 +162,7 @@ impl VideoCodec {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EncoderBackend {
     #[default]
     Pipe,
@@ -1134,6 +1134,9 @@ impl FfmpegNextEncoder {
             }
         }
         stream.set_time_base((1, fps as i32));
+        // Some encoders leave packet duration unset. The muxer needs this even
+        // for a one-frame segment, where no neighboring timestamps exist.
+        stream.set_avg_frame_rate((fps as i32, 1));
         let stream_index = stream.index();
         format
             .write_header()

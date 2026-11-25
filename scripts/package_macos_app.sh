@@ -23,7 +23,7 @@ case "$(uname -s)" in
 esac
 
 printf '%s\n' "Building GoosyRenderer release binary..."
-cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" --bin goosy
+cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" --bin goosy --bin goosy-render-worker
 
 if [ ! -x "$BINARY_PATH" ]; then
     printf '%s\n' "Release binary not found: $BINARY_PATH" >&2
@@ -33,6 +33,7 @@ fi
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BINARY_PATH" "$APP_DIR/Contents/MacOS/$APP_NAME"
+cp "$ROOT_DIR/target/release/goosy-render-worker" "$APP_DIR/Contents/MacOS/"
 chmod 755 "$APP_DIR/Contents/MacOS/$APP_NAME"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF

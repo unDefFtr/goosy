@@ -1,5 +1,50 @@
 .pragma library
 
+// Rust supplies the order. Move existing delegates so focus and selection follow each UUID.
+function reconcileTaskRows(model, items, project) {
+    for (var i = 0; i < items.length; ++i) {
+        var values = project(items[i], i)
+        var index = i
+        while (index < model.count && model.get(index).taskId !== values.taskId)
+            ++index
+        if (index === model.count) {
+            model.insert(i, values)
+            continue
+        }
+        if (index !== i)
+            model.move(index, i, 1)
+        var row = model.get(i)
+        for (var key in values) {
+            if (row[key] !== values[key])
+                model.setProperty(i, key, values[key])
+        }
+    }
+    if (model.count > items.length)
+        model.remove(items.length, model.count - items.length)
+}
+
+function formatTimestamp(ms) {
+    return Number(ms) > 0 ? Qt.formatDateTime(new Date(Number(ms)), "yyyy-MM-dd HH:mm:ss") : "—"
+}
+
+function formatBytes(bytes) {
+    var size = Number(bytes) || 0
+    if (size < 1024) return size + " B"
+    var units = ["KiB", "MiB", "GiB", "TiB"]
+    var i = 0
+    size /= 1024
+    while (size >= 1024 && i < units.length - 1) {
+        size /= 1024
+        ++i
+    }
+    return size.toFixed(1) + " " + units[i]
+}
+
+function displayedFrames(task) {
+    var live = task.state === "running" || task.state === "starting"
+    return Number(live ? task.done : task.committed) || 0
+}
+
 function greetingText(hour) {
     var h = (hour === undefined || hour === null || hour < 0)
         ? new Date().getHours()
@@ -20,10 +65,12 @@ function stateLabel(state) {
     case "starting": return "启动中"
     case "running": return "渲染中"
     case "paused": return "已暂停"
+    case "interrupted": return "已中断"
     case "done":
     case "completed": return "已完成"
     case "cancelled": return "已取消"
     case "failed": return "失败"
+    case "deleting": return "待完成删除"
     default: return "空闲"
     }
 }
@@ -33,11 +80,13 @@ function stateIcon(state) {
     case "queued": return "ic_fluent_clock_20_regular"
     case "starting":
     case "running": return "ic_fluent_play_20_regular"
+    case "interrupted": return "ic_fluent_clock_20_regular"
     case "paused": return "ic_fluent_pause_20_regular"
     case "done":
     case "completed": return "ic_fluent_checkmark_circle_20_regular"
     case "failed": return "ic_fluent_error_circle_20_regular"
     case "cancelled": return "ic_fluent_dismiss_circle_20_regular"
+    case "deleting": return "ic_fluent_delete_20_regular"
     default: return "ic_fluent_circle_20_regular"
     }
 }
@@ -46,6 +95,8 @@ function stateColor(state, colors) {
     switch (String(state)) {
     case "failed": return colors.systemCriticalColor
     case "cancelled":
+    case "deleting":
+    case "interrupted":
     case "paused": return colors.systemCautionColor
     case "done":
     case "completed": return colors.systemSuccessColor
@@ -59,6 +110,8 @@ function stateBackgroundColor(state, colors) {
     switch (String(state)) {
     case "failed": return colors.systemCriticalBackgroundColor
     case "cancelled":
+    case "deleting":
+    case "interrupted":
     case "paused": return colors.systemCautionBackgroundColor
     case "done":
     case "completed": return colors.systemSuccessBackgroundColor

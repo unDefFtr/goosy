@@ -10,12 +10,13 @@ Controls.Page {
     objectName: "tasksPage"
     padding: 24
     background: Item {}
-    property var task: JSON.parse(Backend.taskJson || "{}")
+    property var backend: Backend
+    property var task: JSON.parse(backend.taskJson || "{}")
     readonly property var tasks: page.task.tasks || []
     readonly property string state: String(page.task.state || "idle")
-    readonly property bool canPause: page.state === "running" && !page.task.pending
-    readonly property bool canResume: page.state === "paused" && !page.task.pending
-    readonly property bool canCancel: ["queued", "starting", "running", "paused"].indexOf(page.state) >= 0 && page.task.pending !== "cancel"
+    readonly property real displayedFrames: Ui.displayedFrames(page.task)
+    readonly property var selectedActions: page.task.actions || []
+    readonly property bool recoverable: page.state === "paused" || page.state === "interrupted"
     readonly property string selectedId: String(page.task.selectedId || "")
     onSelectedIdChanged: {
         detailScroll.contentY = 0;
@@ -28,41 +29,38 @@ Controls.Page {
         id: taskRows
     }
 
-    function indexFor(id) {
-        for (var i = 0; i < taskRows.count; ++i)
-            if (taskRows.get(i).taskId === String(id))
-                return i;
-        return -1;
-    }
-
     function syncTaskRows() {
+        if (!queue || !taskRows) return;
         var snapshot = page.task.tasks || [];
-        for (var i = 0; i < snapshot.length; ++i) {
-            var task = snapshot[i];
-            var values = {
+        var selectedIndex = -1;
+        Ui.reconcileTaskRows(taskRows, snapshot, function(task, index) {
+            if (task.id === page.task.selectedId) selectedIndex = index;
+            return {
                 taskId: String(task.id),
                 title: String(task.title || ""),
                 taskState: String(task.state),
-                done: Number(task.done) || 0,
+                done: Ui.displayedFrames(task),
                 total: Number(task.total) || 0,
-                elapsed: Number(task.elapsed) || 0,
                 output: String(task.output || ""),
                 detail: String(task.detail || "")
             };
-            var rowIndex = indexFor(values.taskId);
-            if (rowIndex < 0) {
-                taskRows.append(values);
-                continue;
-            }
-            for (var key in values)
-                if (taskRows.get(rowIndex)[key] !== values[key])
-                    taskRows.setProperty(rowIndex, key, values[key]);
-        }
-        for (var index = taskRows.count - 1; index >= 0; --index) {
-            if (!snapshot.some(function (task) {
-                return String(task.id) === taskRows.get(index).taskId;
-            }))
-                taskRows.remove(index);
+        });
+        queue.currentIndex = selectedIndex;
+    }
+
+    function rowForId(id) {
+        return id ? page.tasks.find(row => row.id === id) : null;
+    }
+
+    function requestAction(action, id) {
+        const row = rowForId(id);
+        if (!row || row.actions.indexOf(action) < 0) return;
+        if (action === "delete" || action === "cancel") {
+            confirmDialog.targetId = id;
+            confirmDialog.operation = action;
+            confirmDialog.open();
+        } else {
+            page.backend.command(action + ":" + id);
         }
     }
 
@@ -121,10 +119,13 @@ Controls.Page {
                         var running = page.stateCount(["starting", "running"]);
                         var paused = page.stateCount(["paused"]);
                         var queued = page.stateCount(["queued"]);
+                        var interrupted = page.stateCount(["interrupted"]);
                         if (running)
                             parts.push(qsTr("%1 运行中").arg(running));
                         if (paused)
                             parts.push(qsTr("%1 已暂停").arg(paused));
+                        if (interrupted)
+                            parts.push(qsTr("%1 已中断").arg(interrupted));
                         if (queued)
                             parts.push(qsTr("%1 排队中").arg(queued));
                         return parts.join(" · ");
@@ -142,28 +143,23 @@ Controls.Page {
                     clip: true
                     boundsBehavior: Flickable.StopAtBounds
                     model: taskRows
-                    currentIndex: {
-                        for (var i = 0; i < taskRows.count; ++i)
-                            if (taskRows.get(i).taskId === String(page.task.selectedId || ""))
-                                return i;
-                        return -1;
-                    }
+                    currentIndex: -1
                     onCurrentIndexChanged: {
                         if (currentIndex >= 0)
                             positionViewAtIndex(currentIndex, ListView.Contain);
                     }
                     onItemClicked: function (index) {
                         if (index >= 0 && index < taskRows.count)
-                            Backend.command("select:" + taskRows.get(index).taskId);
+                            page.backend.command("select:" + taskRows.get(index).taskId);
                     }
                     Keys.onUpPressed: function(event) {
                         keyboardNavigation = true
-                        if (currentIndex > 0) Backend.command("select:" + taskRows.get(currentIndex - 1).taskId)
+                        if (currentIndex > 0) page.backend.command("select:" + taskRows.get(currentIndex - 1).taskId)
                         event.accepted = true
                     }
                     Keys.onDownPressed: function(event) {
                         keyboardNavigation = true
-                        if (currentIndex + 1 < taskRows.count) Backend.command("select:" + taskRows.get(currentIndex + 1).taskId)
+                        if (currentIndex + 1 < taskRows.count) page.backend.command("select:" + taskRows.get(currentIndex + 1).taskId)
                         event.accepted = true
                     }
                     delegate: ListViewDelegate {
@@ -173,7 +169,6 @@ Controls.Page {
                         required property string taskState
                         required property real done
                         required property real total
-                        required property real elapsed
                         required property string output
                         required property string detail
                         required property int index
@@ -190,6 +185,13 @@ Controls.Page {
                         keyboardNavigation: queue.keyboardNavigation && highlighted
                         focusPolicy: Qt.StrongFocus
                         Accessible.name: title + "，" + Ui.stateLabel(taskState)
+
+                        TapHandler {
+                            acceptedButtons: Qt.RightButton
+                            onTapped: function(eventPoint) {
+                                taskMenu.openFor(taskCard, eventPoint.position);
+                            }
+                        }
 
                         TextMetrics {
                             id: percentMetrics
@@ -249,7 +251,7 @@ Controls.Page {
                                 from: 0
                                 to: 1
                                 value: Ui.progressValue(taskCard.done, taskCard.total)
-                                state: taskCard.isFailed ? ProgressBar.Error : taskCard.taskState === "paused" ? ProgressBar.Paused : ProgressBar.Running
+                                state: taskCard.isFailed ? ProgressBar.Error : ["paused", "interrupted"].indexOf(taskCard.taskState) >= 0 ? ProgressBar.Paused : ProgressBar.Running
                                 opacity: taskCard.isCompleted ? 0 : 1
                             }
 
@@ -257,7 +259,7 @@ Controls.Page {
                                 Layout.fillWidth: true
                                 text: taskCard.isFailed
                                     ? (taskCard.detail ? taskCard.detail.replace(/[\r\n]+/g, " ").trim() : qsTr("渲染失败"))
-                                    : taskCard.output.split(/[\\/]/).pop()
+                                    : Ui.stateLabel(taskCard.taskState) + " · " + taskCard.output.split(/[\\/]/).pop()
                                 typography: Typography.Caption
                                 color: taskCard.isFailed
                                     ? Theme.currentTheme.colors.systemCriticalColor
@@ -323,29 +325,26 @@ Controls.Page {
                             text: qsTr("暂停")
                             icon.name: "ic_fluent_pause_20_regular"
                             highlighted: true
-                            visible: page.state === "running"
-                            enabled: page.canPause
-                            onClicked: Backend.command("pause:" + page.task.id)
+                            enabled: page.selectedActions.indexOf("pause") >= 0
+                            visible: enabled || page.task.pending === "pause"
+                            onClicked: page.requestAction("pause", page.selectedId)
                         }
                         Button {
                             objectName: "resumeButton"
-                            text: qsTr("继续")
+                            text: page.state === "interrupted" ? qsTr("恢复渲染") : qsTr("继续")
                             icon.name: "ic_fluent_play_20_regular"
                             highlighted: true
-                            visible: page.state === "paused"
-                            enabled: page.canResume
-                            onClicked: Backend.command("resume:" + page.task.id)
+                            enabled: page.selectedActions.indexOf("resume") >= 0
+                            visible: enabled || page.task.pending === "resume"
+                            onClicked: page.requestAction("resume", page.selectedId)
                         }
                         Button {
                             objectName: "cancelButton"
                             text: qsTr("取消")
                             icon.name: "ic_fluent_dismiss_20_regular"
-                            visible: ["queued", "starting", "running", "paused"].indexOf(page.state) >= 0
-                            enabled: page.canCancel
-                            onClicked: {
-                                cancelConfirmDialog.targetTaskId = String(page.task.id || "");
-                                cancelConfirmDialog.open();
-                            }
+                            enabled: page.selectedActions.indexOf("cancel") >= 0
+                            visible: enabled || page.task.pending === "cancel"
+                            onClicked: page.requestAction("cancel", page.selectedId)
                         }
                     }
 
@@ -372,7 +371,7 @@ Controls.Page {
                         }
                         Text {
                             visible: Number(page.task.total) > 0
-                            text: Ui.formatCount(page.task.done, page.task.total) + " · " + Ui.progressPercent(page.task.done, page.task.total) + " · " + Ui.formatFps(page.task.fps)
+                            text: Ui.formatCount(page.displayedFrames, page.task.total) + " · " + Ui.progressPercent(page.displayedFrames, page.task.total) + " · " + Ui.formatFps(page.task.fps)
                             typography: Typography.Body
                         }
                         Text {
@@ -387,8 +386,8 @@ Controls.Page {
                         visible: Number(page.task.total) > 0
                         from: 0
                         to: 1
-                        value: Ui.progressValue(page.task.done, page.task.total)
-                        state: page.state === "failed" ? ProgressBar.Error : page.state === "paused" ? ProgressBar.Paused : ProgressBar.Running
+                        value: Ui.progressValue(page.displayedFrames, page.task.total)
+                        state: page.state === "failed" ? ProgressBar.Error : page.recoverable ? ProgressBar.Paused : ProgressBar.Running
                     }
 
                     Text {
@@ -446,6 +445,19 @@ Controls.Page {
                                 typography: Typography.Caption
                                 color: Theme.currentTheme.colors.textSecondaryColor
                             }
+                            Text {
+                                visible: Number(page.task.outputSize) > 0
+                                text: qsTr("文件大小 %1").arg(Ui.formatBytes(page.task.outputSize))
+                                typography: Typography.Caption
+                                color: Theme.currentTheme.colors.textSecondaryColor
+                            }
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: qsTr("创建 %1 · 更新 %2").arg(Ui.formatTimestamp(page.task.createdAt)).arg(Ui.formatTimestamp(page.task.updatedAt))
+                            typography: Typography.Caption
+                            wrapMode: Text.WordWrap
+                            color: Theme.currentTheme.colors.textSecondaryColor
                         }
                     }
 
@@ -455,8 +467,8 @@ Controls.Page {
                         Layout.fillWidth: true
                         maximumImageHeight: Math.max(180, detailScroll.height - 265)
                         task: page.task
-                        renderSource: Backend.renderSource
-                        styleSource: Backend.styleSource
+                        renderSource: page.backend.renderSource
+                        styleSource: page.backend.styleSource
                         styleError: page.task.styleError || ""
                     }
 
@@ -467,9 +479,26 @@ Controls.Page {
                         expanded: false
                         Text {
                             Layout.fillWidth: true
-                            text: qsTr("输出：%1\n音频：%2").arg(page.task.output || "").arg((page.task.config || {}).audio || "") + (page.task.detail ? "\n" + page.task.detail : "")
+                            text: qsTr("任务 ID：%1\n输出：%2\n音频：%3").arg(page.task.id || "")
+                                .arg(page.task.output || "").arg((page.task.config || {}).audio || "")
+                                + (page.task.detail ? "\n" + page.task.detail : "")
                             wrapMode: Text.WrapAnywhere
                             textFormat: Text.PlainText
+                            typography: Typography.Caption
+                        }
+                    }
+
+                    Expander {
+                        id: taskOptions
+                        Layout.fillWidth: true
+                        implicitWidth: 0
+                        text: qsTr("渲染配置快照")
+                        expanded: false
+                        Text {
+                            Layout.fillWidth: true
+                            text: taskOptions.expanded && page.task.options ? JSON.stringify(page.task.options, null, 2) : ""
+                            textFormat: Text.PlainText
+                            wrapMode: Text.WrapAnywhere
                             typography: Typography.Caption
                         }
                     }
@@ -531,22 +560,87 @@ Controls.Page {
         }
     }
 
+    Menu {
+        id: taskMenu
+        objectName: "taskContextMenu"
+        parent: page.Controls.Overlay.overlay
+        popupType: Controls.Popup.Item
+        position: Position.None
+        margins: 4
+        leftPadding: 0
+        rightPadding: 0
+        property string targetId: ""
+        readonly property var targetRow: page.rowForId(targetId)
+        readonly property var allowed: targetRow ? targetRow.actions : []
+        property point pointer
+        property rect screenBounds
+        readonly property real rightEdge: Math.min(parent ? parent.width : 0, screenBounds.x + screenBounds.width) - margins
+        readonly property real bottomEdge: Math.min(parent ? parent.height : 0, screenBounds.y + screenBounds.height) - margins
+        width: Math.min(implicitWidth, Math.max(0, rightEdge - Math.max(0, screenBounds.x) - margins))
+        height: Math.min(implicitHeight, Math.max(0, bottomEdge - Math.max(0, screenBounds.y) - margins))
+        x: Math.max(margins + Math.max(0, screenBounds.x), Math.min(pointer.x, rightEdge - width))
+        y: Math.max(margins + Math.max(0, screenBounds.y), Math.min(pointer.y, bottomEdge - height))
+        // RinUI's default enter animation repositions anchored drop-down menus.
+        enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Utils.appearanceSpeed } }
+        onAllowedChanged: if (visible && !allowed.length) close()
+        onClosed: targetId = ""
+
+        function openFor(card, point) {
+            targetId = card.taskId;
+            if (!parent || !allowed.length) return;
+            pointer = card.mapToItem(parent, point.x, point.y);
+            const globalPoint = card.mapToGlobal(point.x, point.y);
+            const screen = Qt.application.screens.find(s => globalPoint.x >= s.virtualX && globalPoint.x < s.virtualX + s.width
+                && globalPoint.y >= s.virtualY && globalPoint.y < s.virtualY + s.height);
+            if (screen) {
+                const origin = parent.mapFromGlobal(screen.virtualX, screen.virtualY);
+                screenBounds = Qt.rect(origin.x, origin.y, screen.width, screen.height);
+            } else {
+                screenBounds = Qt.rect(0, 0, parent.width, parent.height);
+            }
+            open();
+        }
+
+        component TaskAction: MenuItem {
+            required property string operation
+            // Center the RinUI menu column, which is laid out with x: -5.
+            transform: Translate { x: 5 }
+            objectName: "taskMenu_" + operation
+            visible: taskMenu.allowed.indexOf(operation) >= 0
+            enabled: visible
+            onTriggered: page.requestAction(operation, taskMenu.targetId)
+        }
+        TaskAction { operation: "pause"; text: qsTr("暂停"); icon.name: "ic_fluent_pause_20_regular" }
+        TaskAction { operation: "resume"; text: qsTr("继续"); icon.name: "ic_fluent_play_20_regular" }
+        TaskAction { operation: "cancel"; text: qsTr("取消"); icon.name: "ic_fluent_dismiss_20_regular" }
+        TaskAction { operation: "redo"; text: qsTr("重做"); icon.name: "ic_fluent_arrow_repeat_all_20_regular" }
+        TaskAction { operation: "openOutput"; text: qsTr("打开输出目录"); icon.name: "ic_fluent_folder_open_20_regular" }
+        TaskAction { operation: "delete"; text: qsTr("删除"); icon.name: "ic_fluent_delete_20_regular" }
+    }
+
     Dialog {
-        id: cancelConfirmDialog
-        objectName: "cancelTaskConfirmDialog"
-        property string targetTaskId: ""
-        title: qsTr("取消任务")
+        id: confirmDialog
+        readonly property bool deleting: operation === "delete"
+        objectName: deleting ? "deleteTaskConfirmDialog" : "cancelTaskConfirmDialog"
+        property string targetId: ""
+        property string operation: ""
+        readonly property var targetRow: page.rowForId(targetId)
+        readonly property bool allowed: !!targetRow && (targetRow.actions || []).indexOf(operation) >= 0
+        title: deleting ? qsTr("删除任务") : qsTr("取消任务")
         modal: true
         closePolicy: Controls.Popup.CloseOnEscape
         onOpened: dismissCancelButton.forceActiveFocus()
-        onAccepted: {
-            if (page.canCancel && String(page.task.id || "") === cancelConfirmDialog.targetTaskId)
-                Backend.command("cancel:" + cancelConfirmDialog.targetTaskId);
-        }
+        onAllowedChanged: if (visible && !allowed) close()
+        onAccepted: if (allowed) page.backend.command(operation + ":" + targetId)
+        onClosed: targetId = ""
 
         Text {
             Layout.fillWidth: true
-            text: qsTr("确定取消该任务吗？已渲染的进度将被丢弃。")
+            text: (confirmDialog.deleting
+                ? qsTr("确定删除“%1”吗？将删除任务历史、缩略图、检查点、分段视频和临时文件。保留导出的视频和原始素材。如任务仍在运行，请先取消并等待渲染停止。")
+                : qsTr("确定取消“%1”吗？取消后将无法继续渲染，历史记录会保留。"))
+                .arg(confirmDialog.targetRow ? confirmDialog.targetRow.title : "")
+            textFormat: Text.PlainText
             typography: Typography.Body
             color: Theme.currentTheme.colors.textColor
             wrapMode: Text.WordWrap
@@ -556,43 +650,27 @@ Controls.Page {
             id: cancelDialogFooter
             Button {
                 id: confirmCancelButton
-                objectName: "confirmCancelTaskButton"
+                objectName: confirmDialog.deleting ? "confirmDeleteTaskButton" : "confirmCancelTaskButton"
                 Layout.fillWidth: true
                 Layout.preferredWidth: 1
-                text: qsTr("取消任务")
+                text: confirmDialog.title
                 highlighted: true
                 primaryColor: Theme.currentTheme.colors.systemCriticalColor
                 focusPolicy: Qt.StrongFocus
-                onClicked: cancelConfirmDialog.accept()
+                onClicked: confirmDialog.accept()
                 Keys.onReturnPressed: confirmCancelButton.click()
                 Keys.onEnterPressed: confirmCancelButton.click()
             }
             Button {
                 id: dismissCancelButton
-                objectName: "dismissCancelTaskButton"
+                objectName: confirmDialog.deleting ? "dismissDeleteTaskButton" : "dismissCancelTaskButton"
                 Layout.fillWidth: true
                 Layout.preferredWidth: 1
                 text: qsTr("返回")
                 focusPolicy: Qt.StrongFocus
-                onClicked: cancelConfirmDialog.reject()
+                onClicked: confirmDialog.reject()
                 Keys.onReturnPressed: dismissCancelButton.click()
                 Keys.onEnterPressed: dismissCancelButton.click()
-            }
-        }
-
-        Connections {
-            target: page
-            function onStateChanged() {
-                if (cancelConfirmDialog.opened && !page.canCancel)
-                    cancelConfirmDialog.close();
-            }
-            function onCanCancelChanged() {
-                if (cancelConfirmDialog.opened && !page.canCancel)
-                    cancelConfirmDialog.close();
-            }
-            function onSelectedIdChanged() {
-                if (cancelConfirmDialog.opened && String(page.task.id || "") !== cancelConfirmDialog.targetTaskId)
-                    cancelConfirmDialog.close();
             }
         }
     }

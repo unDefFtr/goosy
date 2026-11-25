@@ -48,6 +48,7 @@ function allStatesTasks() {
             title: "晴天 · 双语逐字动态歌词（超长标题用于验证单行省略号截断效果是否正常显示）",
             state: "completed",
             done: 14400,
+            committed: 14400,
             total: 14400,
             elapsed: 112.0,
             fps: 128.6,
@@ -63,6 +64,7 @@ function allStatesTasks() {
             title: "Lemon — Kenshi Yonezu",
             state: "paused",
             done: 2880,
+            committed: 2880,
             total: 7200,
             elapsed: 45.2,
             fps: 63.7,
@@ -132,6 +134,18 @@ function allStatesTasks() {
             updatedAt: now - 1440000,
             lastActivitySeq: 101,
             config: { width: 1920, height: 1080, fps: 30, encoder: "FFmpeg", codec: "H.264" }
+        },
+        {
+            id: "mock-108",
+            title: "雨夜 · 恢复示例",
+            state: "interrupted",
+            done: 300,
+            committed: 300,
+            total: 2400,
+            output: "D:/Renders/rain.mp4",
+            thumbnail: "",
+            updatedAt: now - 1800000,
+            config: { width: 1920, height: 1080, fps: 30, codec: "H.264" }
         }
     ]
 }
@@ -151,6 +165,7 @@ function manyTasks(count) {
             title: "#" + (i + 1) + "  " + tpl.title,
             state: tpl.state,
             done: tpl.done,
+            committed: tpl.committed || 0,
             total: tpl.total,
             elapsed: tpl.elapsed,
             fps: tpl.fps,

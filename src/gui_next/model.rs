@@ -3,7 +3,7 @@ use crate::gui_shared::{
     sample_output_path, scan_sibling_assets,
 };
 use goosy_rinui::{FrameUpdate, RgbaFrame, Snapshot, ViewModel};
-use libgoosy::task_manager::{Control, TaskId, TaskInfo, TaskManager};
+use libgoosy::task_manager::{AssetRole, Control, RedoDraft, TaskId, TaskInfo, TaskManager};
 use libgoosy::{EncoderBackend, RenderOptions, VideoCodec, video};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -16,20 +16,30 @@ const DEFAULT_SAMPLE_DURATION: u32 = 15_000;
 const MAX_RECENT_TASKS: usize = 20;
 
 fn path_to_file_url(path: &Path) -> String {
-    let raw = path.to_string_lossy().replace('\\', "/");
-    let mut encoded = String::with_capacity(raw.len() + 8);
-    if raw.starts_with('/') {
-        encoded.push_str("file://");
+    let raw = path.to_string_lossy();
+    #[cfg(windows)]
+    let raw = raw.replace('\\', "/");
+    let (prefix, path) = if let Some(server_path) = raw.strip_prefix("//?/UNC/") {
+        ("file://", server_path)
     } else {
-        encoded.push_str("file:///");
-    }
-    for byte in raw.bytes() {
-        match byte {
-            b'%' | b'#' | b'?' | b' ' => {
-                use std::fmt::Write as _;
-                let _ = write!(&mut encoded, "%{byte:02X}");
-            }
-            _ => encoded.push(byte as char),
+        let path = raw.strip_prefix("//?/").unwrap_or(&raw);
+        let prefix = if path.starts_with("//") {
+            "file:"
+        } else if path.starts_with('/') {
+            "file://"
+        } else {
+            "file:///"
+        };
+        (prefix, path)
+    };
+    let mut encoded = String::with_capacity(prefix.len() + path.len());
+    encoded.push_str(prefix);
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(&mut encoded, "%{byte:02X}");
         }
     }
     encoded
@@ -120,6 +130,7 @@ impl<I: Send + 'static, O: Send + 'static> LatestJob<I, O> {
 
 #[derive(Clone, Eq, PartialEq)]
 struct PreviewAssets {
+    generation: u64,
     background: Option<PathBuf>,
     cover: Option<PathBuf>,
     embedded: Option<PathBuf>,
@@ -133,7 +144,7 @@ struct AudioSelection {
     notice: String,
 }
 
-type StyleRequest = (u64, StylePreviewScene, libgoosy::LyricsStyle);
+type StyleRequest = (u64, u64, StylePreviewScene, libgoosy::LyricsStyle);
 type StyleResult = (u64, Result<RgbaFrame, String>);
 
 #[derive(Default)]
@@ -146,6 +157,26 @@ struct Wizard {
     created_id: Option<TaskId>,
     sample_range: Option<(u64, u64)>,
     completed: u32,
+}
+
+// Keep the session's ordinary draft while the wizard edits a history snapshot.
+struct RedoSession {
+    draft: RedoDraft,
+    saved_options: RenderOptions,
+    saved_assets: Assets,
+    saved_wizard: Wizard,
+    saved_preview_interval: u32,
+    saved_matching: bool,
+    saved_edited: (bool, bool, bool),
+}
+
+fn asset_field(role: AssetRole) -> &'static str {
+    match role {
+        AssetRole::Audio => "audio",
+        AssetRole::Lyrics => "lyrics",
+        AssetRole::Cover => "cover",
+        AssetRole::Background => "background",
+    }
 }
 
 pub(crate) struct Model {
@@ -162,6 +193,7 @@ pub(crate) struct Model {
     sample_duration: u32,
     style_job: LatestJob<StyleRequest, StyleResult>,
     style_serial: u64,
+    preview_asset_generation: u64,
     style_dirty: bool,
     style_error: String,
     style: FrameUpdate,
@@ -171,13 +203,19 @@ pub(crate) struct Model {
     preview_cache: VecDeque<(TaskId, libgoosy::task_manager::RgbaFrame)>,
     pending_task_thumbnails: Vec<(String, FrameUpdate)>,
     task_error: String,
-    last_task_json: String,
+    last_task_revision: Option<u64>,
     project_dirty: bool,
     wizard: Wizard,
+    redo: Option<RedoSession>,
+    redo_revision: u64,
 }
 
 impl Model {
     pub fn new() -> std::io::Result<Self> {
+        Self::with_manager(TaskManager::new()?)
+    }
+
+    fn with_manager(manager: TaskManager) -> std::io::Result<Self> {
         let mut options = RenderOptions::new(PathBuf::new(), PathBuf::new());
         options.encoder = EncoderBackend::Pipe; // Match the legacy GUI default.
         let audio_job = LatestJob::new("goosy-asset-probe", |(serial, audio): (u64, PathBuf)| {
@@ -206,8 +244,9 @@ impl Model {
         let mut cached = None;
         let style_job = LatestJob::new(
             "goosy-style-preview",
-            move |(serial, scene, style): StyleRequest| {
+            move |(serial, generation, scene, style): StyleRequest| {
                 let sources = PreviewAssets {
+                    generation,
                     background: scene.background_path.clone(),
                     cover: scene.cover_path.clone(),
                     embedded: scene.embedded_cover_audio.clone(),
@@ -242,18 +281,21 @@ impl Model {
             sample_duration: DEFAULT_SAMPLE_DURATION,
             style_job,
             style_serial: 0,
+            preview_asset_generation: 0,
             style_dirty: true,
             style_error: String::new(),
             style: FrameUpdate::Keep,
             render: FrameUpdate::Keep,
-            manager: TaskManager::new()?,
+            manager,
             selected_task: None,
             preview_cache: VecDeque::new(),
             pending_task_thumbnails: Vec::new(),
             task_error: String::new(),
-            last_task_json: String::new(),
+            last_task_revision: None,
             project_dirty: true,
             wizard: Wizard::default(),
+            redo: None,
+            redo_revision: 0,
         })
     }
 
@@ -272,13 +314,10 @@ impl Model {
                 "active": self.wizard.active, "step": self.wizard.step,
                 "checked": self.wizard.checked, "issues": self.wizard.issues,
                 "mode": self.wizard.mode,
+                "redo": self.redo.is_some(), "redoRevision": self.redo_revision,
                 "completed": self.wizard.completed,
                 "createdId": self.wizard.created_id.map(|id| id.to_string()),
-                "effectiveOutput": if self.wizard.mode == 1 {
-                    sample_output_path(&self.options.output, u64::from(self.sample_start))
-                } else if let Some((start, _)) = self.wizard.sample_range {
-                    sample_output_path(&self.options.output, start)
-                } else { Some(self.options.output.clone()) }.map(|path| label(&path)),
+                "effectiveOutput": self.effective_output(self.wizard.sample_range).as_deref().map(label),
             },
             "lyricsPath": Assets::selected(&self.assets.lyrics, self.assets.lyrics_index).map(label),
             "lyricsContent": self.assets.lyrics_text,
@@ -291,8 +330,9 @@ impl Model {
             return format!("image://goosy/task/{}/{}", task.id, task.preview_frame);
         }
         for candidate in [
-            task.options.background.as_deref(),
+            task.thumbnail.as_deref(),
             task.options.cover.as_deref(),
+            task.options.background.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -304,18 +344,22 @@ impl Model {
         String::new()
     }
 
-    fn task_json(&self) -> Value {
-        let tasks = self.manager.tasks();
+    fn task_json(&self, tasks: &mut [TaskInfo]) -> Value {
+        tasks.sort_unstable_by_key(|t| {
+            std::cmp::Reverse((t.updated_at_ms, t.last_activity_seq, t.id))
+        });
         let task_value = |task: &TaskInfo| {
             json!({
                 "id": task.id.to_string(), "state": task.state.name(),
+                "actions": task.actions(),
                 "pending": task.pending.map(|control| match control {
                     Control::Pause => "pause", Control::Resume => "resume", Control::Cancel => "cancel",
                 }).unwrap_or(""),
-                "stage": task.stage, "detail": task.detail,
-                "done": task.done, "total": task.total, "elapsed": task.elapsed, "fps": task.fps, "log": task.log,
-                "previewFrame": task.preview_frame, "previewNote": task.preview_note,
-                "updatedAt": task.updated_at_ms, "lastActivitySeq": task.last_activity_seq,
+                "detail": task.detail,
+                "done": task.done, "committed": task.committed, "submitted": task.submitted,
+                "total": task.total, "elapsed": task.elapsed, "fps": task.fps,
+                "createdAt": task.created_at_ms, "updatedAt": task.updated_at_ms,
+                "lastActivitySeq": task.last_activity_seq, "outputSize": task.output_size,
                 "thumbnail": self.task_thumbnail_url(task),
                 "output": task.options.output.to_string_lossy(),
                 "title": task.options.title.as_deref().unwrap_or("未命名任务"),
@@ -331,19 +375,23 @@ impl Model {
                 },
             })
         };
-        let mut recent: Vec<&TaskInfo> = tasks.iter().collect();
-        recent.sort_by(|left, right| {
-            (right.last_activity_seq, right.updated_at_ms, right.id)
-                .cmp(&(left.last_activity_seq, left.updated_at_ms, left.id))
-        });
-        recent.truncate(MAX_RECENT_TASKS);
-        let mut value = tasks
-            .iter()
-            .find(|task| Some(task.id) == self.selected_task)
-            .map(task_value)
-            .unwrap_or_else(|| json!({"state": "idle", "pending": ""}));
-        value["tasks"] = tasks.iter().map(task_value).collect::<Vec<_>>().into();
-        value["recentTasks"] = recent.into_iter().map(task_value).collect::<Vec<_>>().into();
+        let mut value = json!({"state": "idle", "pending": ""});
+        let mut rows = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let row = task_value(task);
+            if self.selected_task == Some(task.id) {
+                value = row.clone();
+                value["options"] = json!(&*task.options);
+                value["stage"] = json!(task.stage);
+                value["previewFrame"] = task.preview_frame.into();
+                value["savedPreview"] = json!(task.thumbnail.as_deref().map(path_to_file_url));
+                value["previewNote"] = json!(task.preview_note);
+                value["log"] = json!(task.log);
+            }
+            rows.push(row);
+        }
+        value["recentTasks"] = Value::Array(rows[..rows.len().min(MAX_RECENT_TASKS)].to_vec());
+        value["tasks"] = Value::Array(rows);
         value["selectedId"] = self
             .selected_task
             .map(|id| id.to_string())
@@ -379,6 +427,8 @@ impl Model {
     }
 
     fn poll_assets(&mut self) {
+        // Leave a pending ordinary probe in its result slot until that draft is restored.
+        if self.redo.is_some() { return; }
         let Some(selection) = self
             .audio_job
             .poll()
@@ -425,9 +475,10 @@ impl Model {
             self.style_serial += 1;
             if !self
                 .style_job
-                .request((self.style_serial, scene, self.options.lyrics_style))
+                .request((self.style_serial, self.preview_asset_generation, scene, self.options.lyrics_style))
             {
                 self.style_error = "样式预览线程已退出".into();
+                self.last_task_revision = None;
             }
         }
         if let Some((_, result)) = self
@@ -440,18 +491,20 @@ impl Model {
                     self.style = FrameUpdate::Replace(image);
                     if !self.style_error.is_empty() {
                         self.style_error.clear();
+                        self.last_task_revision = None;
                     }
                 }
                 Err(error) => {
                     self.style = FrameUpdate::Clear;
                     self.style_error = error;
+                    self.last_task_revision = None;
                 }
             }
         }
     }
     fn draft_changed(&mut self) {
         self.wizard.checked = false;
-        self.wizard.issues.clear();
+        self.wizard.issues.retain(|issue| issue.get("canAccept").is_some());
         self.wizard.sample_range = None;
         self.wizard.completed = 0;
         self.project_dirty = true;
@@ -468,6 +521,76 @@ impl Model {
                     .and_then(|metadata| metadata.lyrics)
                     .unwrap_or_default()
             };
+    }
+
+    fn begin_redo(&mut self, id: TaskId) -> anyhow::Result<()> {
+        let draft = self.manager.redo_draft(id)?;
+        self.restore_ordinary_draft();
+        let mut assets = Assets { audio: Some(draft.options.song.clone()), ..Assets::default() };
+        assets.lyrics_index = Assets::pick(&mut assets.lyrics, draft.options.lyrics.clone());
+        assets.cover_index = Assets::pick(&mut assets.cover, draft.options.cover.clone());
+        let range = draft.options.sample_start_ms.is_some() || draft.options.sample_duration_ms.is_some();
+        let wizard = Wizard { active: true, step: 3, mode: u32::from(range), ..Wizard::default() };
+        self.redo = Some(RedoSession {
+            saved_options: std::mem::replace(&mut self.options, draft.options.clone()),
+            saved_assets: std::mem::replace(&mut self.assets, assets),
+            saved_wizard: std::mem::replace(&mut self.wizard, wizard),
+            saved_preview_interval: std::mem::replace(&mut self.preview_interval, draft.preview_interval),
+            saved_matching: std::mem::take(&mut self.matching_assets),
+            saved_edited: (self.title_edited, self.lyrics_edited, self.cover_edited),
+            draft,
+        });
+        self.redo_revision += 1;
+        self.preview_asset_generation += 1;
+        self.style = FrameUpdate::Clear;
+        self.style_dirty = true;
+        self.refresh_lyrics();
+        self.validate_draft(3);
+        Ok(())
+    }
+
+    fn restore_ordinary_draft(&mut self) {
+        let Some(session) = self.redo.take() else { return };
+        self.options = session.saved_options;
+        self.assets = session.saved_assets;
+        self.wizard = session.saved_wizard;
+        self.preview_interval = session.saved_preview_interval;
+        self.matching_assets = session.saved_matching;
+        (self.title_edited, self.lyrics_edited, self.cover_edited) = session.saved_edited;
+        self.style = FrameUpdate::Clear;
+        self.preview_asset_generation += 1;
+        self.style_dirty = true;
+        self.project_dirty = true;
+    }
+
+    fn inspect_redo_asset(&mut self, role: AssetRole) {
+        let Some(session) = self.redo.as_mut() else { return };
+        let options = &mut session.draft.options;
+        match role {
+            AssetRole::Audio => options.song = self.assets.audio.clone().unwrap_or_default(),
+            AssetRole::Lyrics => options.lyrics = Assets::selected(&self.assets.lyrics, self.assets.lyrics_index).map(Path::to_owned),
+            AssetRole::Cover => options.cover = Assets::selected(&self.assets.cover, self.assets.cover_index).map(Path::to_owned),
+            AssetRole::Background => options.background.clone_from(&self.options.background),
+        }
+        let field = asset_field(role);
+        self.wizard.issues.retain(|issue| issue["field"] != field || issue.get("canAccept").is_none());
+        if let Some(issue) = session.draft.inspect(role) {
+            self.wizard.issues.push(json!({"step": 0, "field": field, "message": issue.message,
+                "canAccept": issue.can_accept}));
+        }
+        self.project_dirty = true;
+    }
+
+    fn effective_output(&self, sample_range: Option<(u64, u64)>) -> Option<PathBuf> {
+        if self.redo.is_none() {
+            if self.wizard.mode == 1 {
+                return sample_output_path(&self.options.output, u64::from(self.sample_start));
+            }
+            if let Some((start, _)) = sample_range {
+                return sample_output_path(&self.options.output, start);
+            }
+        }
+        Some(self.options.output.clone())
     }
 
     fn navigate_wizard(&mut self, target: u32) {
@@ -500,7 +623,11 @@ impl Model {
     }
 
     fn validate_draft(&mut self, before_step: u32) {
-        let mut issues = Vec::new();
+        self.wizard.issues.clear();
+        if self.redo.is_some() {
+            for role in AssetRole::ALL { self.inspect_redo_asset(role); }
+        }
+        let mut issues = std::mem::take(&mut self.wizard.issues);
         let mut sample_range = None;
         let mut issue = |step, field: &str, message: String| {
             if step >= before_step {
@@ -556,14 +683,22 @@ impl Model {
                                     issue(0, "lyrics", "无可采样歌词，请更换歌词文件。".into());
                                 }
                             }
-                            let duration = lines
-                                .iter()
-                                .map(|line| line.end_ms)
-                                .max()
-                                .unwrap_or(0)
-                                .saturating_add(1_000);
-                            if self.wizard.mode == 1 && u64::from(self.sample_start) >= duration {
-                                issue(2, "sample", "起点超出歌词时长，请减小采样起点。".into());
+                            if self.wizard.mode == 1 {
+                                let (no_audio, start) = if self.redo.is_some() {
+                                    (self.options.no_audio, self.options.sample_start_ms.unwrap_or(0))
+                                } else {
+                                    (true, u64::from(self.sample_start))
+                                };
+                                let last_end = lines.iter().map(|line| line.end_ms).max().unwrap_or(0);
+                                let duration = libgoosy::render_duration_ms(no_audio, metadata.duration_seconds, last_end);
+                                if start >= duration {
+                                    let message = if no_audio {
+                                        "起点超出歌词时长，请减小采样起点。"
+                                    } else {
+                                        "起点超出音频时长，请减小采样起点。"
+                                    };
+                                    issue(2, "sample", message.into());
+                                }
                             }
                         }
                     }
@@ -594,13 +729,7 @@ impl Model {
         if self.options.width % 2 != 0 || self.options.height % 2 != 0 {
             issue(2, "dimensions", "宽度和高度须为偶数，请调整尺寸。".into());
         }
-        let output = if self.wizard.mode == 1 {
-            sample_output_path(&self.options.output, u64::from(self.sample_start))
-        } else if let Some((start, _)) = sample_range {
-            sample_output_path(&self.options.output, start)
-        } else {
-            Some(self.options.output.clone())
-        };
+        let output = self.effective_output(sample_range);
         match output {
             Some(output) => {
                 if let Err(error) = self.manager.check_output(&output) {
@@ -628,15 +757,12 @@ impl Model {
             Assets::selected(&self.assets.lyrics, self.assets.lyrics_index).map(Path::to_owned);
         options.cover =
             Assets::selected(&self.assets.cover, self.assets.cover_index).map(Path::to_owned);
-        options.title = options
-            .title
-            .take()
-            .filter(|title| !title.trim().is_empty());
-        if options.encoder.is_zero_copy() {
-            options.codec = VideoCodec::H264;
+        if self.redo.is_none() {
+            options.title = options.title.take().filter(|title| !title.trim().is_empty());
+            if options.encoder.is_zero_copy() { options.codec = VideoCodec::H264; }
         }
         self.render = FrameUpdate::Clear;
-        if action == "sample" {
+        if action == "sample" && self.redo.is_none() {
             let start = u64::from(self.sample_start);
             let Some(output) = sample_output_path(&options.output, start) else {
                 self.fail("无法生成采样输出文件名".into());
@@ -664,8 +790,10 @@ impl Model {
                     random_sample_range(&lines, &options.excluded_lines)
                         .ok_or_else(|| anyhow::anyhow!("没有可用于采样的歌词"))?
                 };
-                options.output = sample_output_path(&options.output, start)
-                    .ok_or_else(|| anyhow::anyhow!("无法生成采样输出文件名"))?;
+                if self.redo.is_none() {
+                    options.output = sample_output_path(&options.output, start)
+                        .ok_or_else(|| anyhow::anyhow!("无法生成采样输出文件名"))?;
+                }
                 options.sample_start_ms = Some(start);
                 options.sample_duration_ms = Some(end - start);
                 options.no_audio = true;
@@ -676,22 +804,37 @@ impl Model {
                 return;
             }
         }
-        match self.manager.enqueue(options, self.preview_interval) {
+        let result = if let Some(session) = &mut self.redo {
+            session.draft.options = options;
+            session.draft.preview_interval = self.preview_interval;
+            session.draft.submit(&self.manager)
+        } else {
+            self.manager.enqueue(options, self.preview_interval)
+        };
+        match result {
             Ok(id) => {
+                self.restore_ordinary_draft();
                 self.selected_task = Some(id);
                 self.task_error.clear();
                 self.wizard.created_id = Some(id);
                 self.wizard.active = false;
                 self.project_dirty = true;
             }
-            Err(error) => self.fail(format!("创建任务失败：{error:#}")),
+            Err(error) => {
+                self.fail(format!("创建任务失败：{error:#}"));
+                if self.redo.is_some() {
+                    self.validate_draft(3);
+                    if self.wizard.issues.is_empty() { self.fail(self.task_error.clone()); }
+                }
+            }
         }
     }
 
     fn fail(&mut self, message: String) {
         self.task_error = message;
+        self.last_task_revision = None;
         self.wizard.issues = vec![json!({"step": 2, "field": "output",
-            "message": "创建失败，请检查输出路径后重试。", "detail": self.task_error})];
+            "message": "创建任务失败", "detail": self.task_error})];
         self.project_dirty = true;
     }
 
@@ -710,10 +853,10 @@ impl Model {
             .unwrap_or(FrameUpdate::Clear);
     }
 
-    fn poll_worker(&mut self) {
+    fn poll_worker(&mut self, tasks: &[TaskInfo]) {
         // One latest frame per task, capped at 16 previews (at most ~14 MiB at 640 × 360).
         // Qt owns the published pixels; retain a separate copy only for reselecting a task.
-        for task in self.manager.tasks() {
+        for task in tasks.iter().filter(|task| task.preview_frame > 0) {
             let Some((_, frame)) = self.manager.take_preview(task.id) else {
                 continue;
             };
@@ -762,12 +905,18 @@ impl ViewModel for Model {
             "encoders": EncoderBackend::ALL.iter().map(|encoder| encoder.label()).collect::<Vec<_>>(),
             "codecs": VideoCodec::ALL.iter().map(|codec| codec.label()).collect::<Vec<_>>(),
             "zeroCopyEncoder": EncoderBackend::ALL.iter().position(|encoder| encoder.is_zero_copy()).map_or(-1, |index| index as i32),
-            "sampleStart": self.sample_start, "sampleDuration": self.sample_duration,
+            "sampleStart": if self.redo.is_some() { self.options.sample_start_ms.unwrap_or(0) } else { u64::from(self.sample_start) },
+            "sampleDuration": if self.redo.is_some() { self.options.sample_duration_ms } else { Some(u64::from(self.sample_duration)) },
         }).to_string()
     }
 
     fn select_asset(&mut self, kind: &str, path: Option<PathBuf>) {
         match (kind, path) {
+            ("audio", Some(path)) if self.redo.is_some() => {
+                self.assets.audio = Some(path);
+                self.refresh_lyrics();
+                self.style_dirty = true;
+            }
             ("audio", Some(path)) => self.selected_audio(path),
             ("lyrics", path) => {
                 self.lyrics_edited = true;
@@ -788,6 +937,10 @@ impl ViewModel for Model {
         }
         self.project_dirty = true;
         self.draft_changed();
+        if let Some(role) = AssetRole::ALL.into_iter().find(|&role| asset_field(role) == kind) {
+            self.preview_asset_generation += 1;
+            self.inspect_redo_asset(role);
+        }
     }
 
     fn set_text(&mut self, key: &str, value: String) {
@@ -806,7 +959,14 @@ impl ViewModel for Model {
             return;
         }
         if key == "renderMode" {
-            self.wizard.mode = value.clamp(0, 2) as u32;
+            let mode = value.clamp(0, 2) as u32;
+            if self.wizard.mode == mode { return; }
+            if self.redo.is_some() {
+                self.options.sample_start_ms = (mode == 1).then_some(0);
+                self.options.sample_duration_ms = (mode == 1).then_some(u64::from(DEFAULT_SAMPLE_DURATION));
+                if mode != 0 { self.options.no_audio = true; }
+            }
+            self.wizard.mode = mode;
             self.draft_changed();
             return;
         }
@@ -816,6 +976,7 @@ impl ViewModel for Model {
                 Ok(()) => self.task_error.clear(),
                 Err(error) => self.task_error = format!("并发设置失败：{error:#}"),
             }
+            self.last_task_revision = None;
             return;
         }
         self.draft_changed();
@@ -840,6 +1001,7 @@ impl ViewModel for Model {
                 }
                 self.cover_edited = true;
                 self.assets.cover_index = value as usize;
+                self.inspect_redo_asset(AssetRole::Cover);
                 self.project_dirty = true;
             }
             _ => {
@@ -847,16 +1009,22 @@ impl ViewModel for Model {
                     "lyricsIndex" if value as usize <= self.assets.lyrics.len() => {
                         self.lyrics_edited = true;
                         self.assets.lyrics_index = value as usize;
+                        self.inspect_redo_asset(AssetRole::Lyrics);
                         self.refresh_lyrics();
                         self.project_dirty = true;
                     }
                     "fps" => self.options.fps = value.clamp(1, 120),
                     "previewInterval" => self.preview_interval = value.clamp(1, 300),
+                    "sampleStart" if self.redo.is_some() => self.options.sample_start_ms = Some(u64::from(value)),
+                    "sampleDuration" if self.redo.is_some() => self.options.sample_duration_ms = Some(u64::from(value.max(1))),
                     "sampleStart" => self.sample_start = value,
                     "sampleDuration" => self.sample_duration = value.max(1),
                     "encoder" => {
                         if let Some(encoder) = EncoderBackend::ALL.get(value as usize) {
                             self.options.encoder = *encoder;
+                            if self.redo.is_some() && encoder.is_zero_copy() {
+                                self.options.codec = VideoCodec::H264;
+                            }
                         }
                     }
                     "codec" => {
@@ -893,12 +1061,14 @@ impl ViewModel for Model {
     fn command(&mut self, action: &str) {
         match action {
             "wizardBegin" => {
+                self.restore_ordinary_draft();
                 self.wizard.active = true;
                 self.wizard.created_id = None;
                 self.project_dirty = true;
                 return;
             }
             "wizardHome" => {
+                self.restore_ordinary_draft();
                 self.wizard.active = false;
                 self.project_dirty = true;
                 return;
@@ -933,45 +1103,85 @@ impl ViewModel for Model {
             _ => {}
         }
         if matches!(action, "start" | "sample" | "randomSample") {
+            if self.redo.is_some() { return; } // A history draft is submitted only after wizard validation.
             self.start(action);
+            return;
+        }
+        if let Some(field) = action.strip_prefix("acceptAsset:") {
+            let Some(role) = AssetRole::ALL.into_iter().find(|&role| asset_field(role) == field) else { return };
+            let Some(session) = self.redo.as_mut() else { return };
+            if let Err(error) = session.draft.accept(role) {
+                self.task_error = format!("无法采用当前素材：{error:#}");
+                self.last_task_revision = None;
+            }
+            self.validate_draft(3);
+            self.refresh_lyrics();
+            self.preview_asset_generation += 1;
+            self.style_dirty = true;
             return;
         }
         let Some((action, id)) = action.split_once(':') else {
             return;
         };
         let Ok(id) = id.parse::<TaskId>() else { return };
+        if action == "redo" {
+            match self.begin_redo(id) {
+                Ok(()) => self.task_error.clear(),
+                Err(error) => self.task_error = format!("无法重做任务：{error:#}"),
+            }
+            self.last_task_revision = None;
+            return;
+        }
         if action == "select" {
             if self.selected_task != Some(id)
                 && self.manager.tasks().iter().any(|task| task.id == id)
             {
                 self.selected_task = Some(id);
+                self.last_task_revision = None;
                 self.restore_task_preview(id);
             }
         } else {
-            let control = match action {
-                "pause" => Control::Pause,
-                "resume" => Control::Resume,
-                "cancel" => Control::Cancel,
+            let result = match action {
+                "pause" => self.manager.command(id, Control::Pause),
+                "resume" => self.manager.command(id, Control::Resume),
+                "cancel" => self.manager.command(id, Control::Cancel),
+                "openOutput" => self.manager.output_directory(id).and_then(|dir| {
+                    anyhow::ensure!(goosy_rinui::open_directory(&path_to_file_url(&dir)),
+                        "系统文件管理器无法打开目录：{}", dir.display());
+                    Ok(())
+                }),
+                "delete" => self.manager.delete(id).map(|()| {
+                    self.preview_cache.retain(|(cached, _)| *cached != id);
+                    self.pending_task_thumbnails.push((id.to_string(), FrameUpdate::Clear));
+                    if self.selected_task == Some(id) {
+                        self.selected_task = None;
+                        self.render = FrameUpdate::Clear;
+                    }
+                }),
                 _ => return,
             };
-            match self.manager.command(id, control) {
+            match result {
                 Ok(()) => self.task_error.clear(),
                 Err(error) => self.task_error = format!("任务操作失败：{error:#}"),
             }
+            self.last_task_revision = None;
         }
     }
 
     fn tick(&mut self) -> Snapshot {
         self.poll_assets();
         self.poll_style();
-        self.poll_worker();
-        let task_json = self.task_json().to_string();
-        let task_changed = task_json != self.last_task_json;
-        self.last_task_json.clone_from(&task_json);
+        let revision = self.manager.revision();
+        let task = (self.last_task_revision != Some(revision)).then(|| {
+            let mut tasks = self.manager.tasks();
+            self.poll_worker(&tasks);
+            self.last_task_revision = Some(revision);
+            self.task_json(&mut tasks).to_string()
+        });
         Snapshot {
             project: std::mem::take(&mut self.project_dirty)
                 .then(|| self.project_json().to_string()),
-            task: task_changed.then_some(task_json),
+            task,
             style: std::mem::take(&mut self.style),
             render: std::mem::take(&mut self.render),
             task_thumbnails: std::mem::take(&mut self.pending_task_thumbnails),
@@ -983,9 +1193,204 @@ impl ViewModel for Model {
 mod tests {
     use super::*;
 
+    fn isolated_model(dir: &Path, executable: PathBuf) -> Model {
+        Model::with_manager(TaskManager::with_data_dir(executable, &dir.join("user-data")).unwrap()).unwrap()
+    }
+
+    fn snapshot(model: &Model) -> Value {
+        model.task_json(&mut model.manager.tasks())
+    }
+
+    fn write_song(dir: &Path) -> PathBuf {
+        write_song_with_duration(dir, 1)
+    }
+
+    fn write_song_with_duration(dir: &Path, seconds: u32) -> PathBuf {
+        let path = dir.join("song.wav");
+        assert!(std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i"])
+            .arg(format!("sine=frequency=440:duration={seconds}"))
+            .arg("-y")
+            .arg(&path).status().unwrap().success());
+        path
+    }
+
+    // A controlled protocol stream lets the UI sample live progress before the process exits.
+    fn protocol_worker(dir: &Path, events: &[&str]) -> PathBuf {
+        let (name, header, hold) = if cfg!(windows) {
+            ("worker.cmd", "@echo off\r\n", "set /p command=\r\n")
+        } else {
+            ("worker.sh", "#!/bin/sh\n", "read command\n")
+        };
+        let mut script = String::from(header);
+        for event in events {
+            script.push_str("echo ");
+            script.push_str(event);
+            script.push_str(if cfg!(windows) { "\r\n" } else { "\n" });
+        }
+        script.push_str(hold);
+        let path = dir.join(name);
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn relinking_moved_audio_preserves_the_other_history_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut model = isolated_model(dir.path(), dir.path().join("missing-worker"));
+        let song = write_song(dir.path());
+        let lyrics = dir.path().join("external.lrc");
+        std::fs::write(&lyrics, "[00:00.01]Words\n").unwrap();
+        let mut options = RenderOptions::new(&song, dir.path().join("video.mp4"));
+        options.lyrics = Some(lyrics.clone());
+        options.title = Some("Captured title".into());
+        let id = model.manager.enqueue(options, 17).unwrap();
+        let moved = dir.path().join("relocated.wav");
+        std::fs::rename(&song, &moved).unwrap();
+        model.command(&format!("redo:{id}"));
+        assert!(model.wizard.issues.iter().any(|i| i["field"] == "audio" && i["canAccept"] == false));
+        let output = model.options.output.clone();
+        model.select_asset("audio", Some(moved.clone()));
+        model.command("wizardCheck");
+        assert!(model.wizard.issues.is_empty(), "{:?}", model.wizard.issues);
+        assert!(!model.matching_assets);
+        assert_eq!(model.assets.audio, Some(moved));
+        assert_eq!(Assets::selected(&model.assets.lyrics, model.assets.lyrics_index), Some(lyrics.as_path()));
+        assert_eq!(model.options.title.as_deref(), Some("Captured title"));
+        assert_eq!(model.options.output, output);
+    }
+
+    #[test]
+    fn redo_validates_outro_sample_against_captured_audio_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut model = isolated_model(dir.path(), dir.path().join("missing-worker"));
+        let song = write_song_with_duration(dir.path(), 8);
+        let lyrics = dir.path().join("source.yrc");
+        std::fs::write(&lyrics, "[0,1000](0,1000,0)Words\n").unwrap();
+        let mut options = RenderOptions::new(&song, dir.path().join("outro.mp4"));
+        options.format = libgoosy::LyricFormat::Yrc;
+        options.lyrics = Some(lyrics);
+        options.sample_start_ms = Some(5_000);
+        options.sample_duration_ms = Some(500);
+        options.no_audio = false;
+        let original = model.manager.enqueue(options.clone(), 15).unwrap();
+        model.command(&format!("redo:{original}"));
+        assert!(model.wizard.issues.is_empty(), "{:?}", model.wizard.issues);
+        model.command("wizardCreate");
+        let created = model.wizard.created_id.unwrap();
+        assert_ne!(created, original);
+        let tasks = model.manager.tasks();
+        let captured = &tasks.iter().find(|task| task.id == created).unwrap().options;
+        assert_eq!(captured.sample_start_ms, Some(5_000));
+        assert_eq!(captured.sample_duration_ms, Some(500));
+        assert!(!captured.no_audio);
+
+        for (no_audio, start, name, message) in [
+            (true, 5_000, "silent.mp4", "起点超出歌词时长，请减小采样起点。"),
+            (false, 8_000, "at-end.mp4", "起点超出音频时长，请减小采样起点。"),
+        ] {
+            options.output = dir.path().join(name);
+            options.no_audio = no_audio;
+            options.sample_start_ms = Some(start);
+            let id = model.manager.enqueue(options.clone(), 15).unwrap();
+            model.command(&format!("redo:{id}"));
+            model.command("wizardCreate");
+            assert!(model.wizard.created_id.is_none());
+            assert!(model.wizard.issues.iter().any(|i| i["field"] == "sample" && i["message"] == message));
+        }
+    }
+
+    #[test]
+    fn redo_preserves_captured_range_and_rechecks_accepted_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut model = isolated_model(dir.path(), dir.path().join("missing-worker"));
+        let song = write_song(dir.path());
+        let lyrics = dir.path().join("source.lrc");
+        std::fs::write(&lyrics, "[00:00.01]First\n").unwrap();
+        let mut options = RenderOptions::new(&song, dir.path().join("range-200.mp4"));
+        options.lyrics = Some(lyrics.clone());
+        options.title = Some("History".into());
+        options.sample_start_ms = Some(200);
+        options.sample_duration_ms = Some(301);
+        options.width = 1280;
+        options.lyrics_style.font_scale = 1.23;
+        options.no_audio = true;
+        let id = model.manager.enqueue(options.clone(), 37).unwrap();
+        let expected = json!(&*model.manager.tasks()[0].options);
+        model.selected_audio(song);
+        model.set_text("title", "Ordinary".into());
+        model.set_number("width", 888);
+        std::fs::write(&lyrics, "[00:00.01]Other\n").unwrap();
+        model.command(&format!("redo:{id}"));
+        let project = model.project_json();
+        assert_eq!(project["wizard"]["step"], 3);
+        assert_eq!(project["wizard"]["redoRevision"], 1);
+        assert_eq!(project["wizard"]["effectiveOutput"], project["output"]);
+        assert!(project["output"].as_str().unwrap().ends_with("range-200-redo.mp4"));
+        assert_eq!(project["settings"]["previewInterval"], 37);
+        assert_eq!(project["settings"]["sampleDuration"], 301);
+        assert_eq!(project["lyricsIndex"], 1);
+        assert!(model.wizard.issues.iter().any(|i| i["field"] == "lyrics" && i["canAccept"] == true));
+        model.command("acceptAsset:lyrics");
+        assert!(!model.wizard.issues.iter().any(|i| i.get("canAccept").is_some()));
+        let output = dir.path().join("chosen.mp4");
+        model.select_asset("output", Some(output.clone()));
+        std::fs::write(&lyrics, "[00:00.01]Again\n").unwrap();
+        model.command("wizardCreate");
+        assert_eq!(model.manager.tasks().len(), 1);
+        model.command("acceptAsset:lyrics");
+        model.command("wizardCreate");
+        let new_id = model.wizard.created_id.unwrap();
+        assert_ne!(new_id, id);
+        options.output = dir.path().canonicalize().unwrap().join(output.file_name().unwrap());
+        let tasks = model.manager.tasks();
+        assert_eq!(json!(&*tasks.iter().find(|t| t.id == new_id).unwrap().options), json!(options));
+        assert_eq!(json!(&*tasks.iter().find(|t| t.id == id).unwrap().options), expected);
+        model.poll_assets();
+        assert_eq!(model.options.title.as_deref(), Some("Ordinary"));
+        assert_eq!(model.options.width, 888);
+        model.command(&format!("redo:{id}"));
+        assert_eq!(model.project_json()["wizard"]["redoRevision"], 2);
+        model.command("wizardHome");
+        model.command("wizardBegin");
+        assert!(model.redo.is_none());
+        assert_eq!(model.options.width, 888);
+    }
+
+    #[test]
+    fn deleting_from_context_menu_preserves_other_selection_and_reports_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut model = isolated_model(dir.path(), dir.path().join("unused-worker"));
+        // Missing input leaves a failed, deletable history entry without starting a worker.
+        let failed = |name| model.manager.enqueue(
+            RenderOptions::new(dir.path().join("missing.wav"), dir.path().join(name)), 1,
+        ).unwrap();
+        let selected = failed("selected.mp4");
+        let other = failed("other.mp4");
+        model.command(&format!("select:{selected}"));
+        model.command(&format!("delete:{other}"));
+        let view = snapshot(&model);
+        assert_eq!(view["selectedId"], selected.to_string());
+        assert_eq!(view["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(view["error"], "");
+        model.command(&format!("openOutput:{other}"));
+        assert!(!snapshot(&model)["error"].as_str().unwrap().is_empty());
+        model.command(&format!("delete:{selected}"));
+        let empty = snapshot(&model);
+        assert_eq!(empty["selectedId"], "");
+        assert!(empty["tasks"].as_array().unwrap().is_empty());
+        assert!(matches!(model.render, FrameUpdate::Clear));
+    }
+
     #[test]
     fn wizard_routes_share_prerequisites_and_keep_draft() {
-        let mut model = Model::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut model = isolated_model(dir.path(), dir.path().join("unused-worker"));
         model.command("wizardBegin");
         model.set_number("wizardStep", 3);
         assert_eq!(model.wizard.step, 0);
@@ -1006,24 +1411,7 @@ mod tests {
                 .any(|issue| issue["field"] == "audio")
         );
 
-        let dir = tempfile::tempdir().unwrap();
-        let song = dir.path().join("song.wav");
-        assert!(
-            std::process::Command::new("ffmpeg")
-                .args([
-                    "-v",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "sine=frequency=440:duration=1",
-                    "-y",
-                ])
-                .arg(&song)
-                .status()
-                .unwrap()
-                .success()
-        );
+        let song = write_song(dir.path());
         let lyrics = dir.path().join("song.lrc");
         std::fs::write(&lyrics, "[00:00.00]Navigation\n[00:00.50]End\n").unwrap();
         model.assets.audio = Some(song);
@@ -1066,15 +1454,16 @@ mod tests {
 
     #[test]
     fn task_preview_selection_restores_only_its_own_frame() {
-        let mut model = Model::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
+        let mut model = isolated_model(dir.path(), dir.path().join("missing-worker"));
+        let song = write_song(dir.path());
         let ids: Vec<_> = (0..3)
             .map(|index| {
                 model
                     .manager
                     .enqueue(
                         RenderOptions::new(
-                            dir.path().join("missing.wav"),
+                            &song,
                             dir.path().join(format!("{index}.mp4")),
                         ),
                         1,
@@ -1114,163 +1503,47 @@ mod tests {
 
     #[test]
     fn task_json_reports_two_second_window_fps() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = if cfg!(windows) {
-            let path = dir.path().join("mock-worker.cmd");
-            std::fs::write(
-                &path,
-                "@echo off\r\n\
-echo GOOSY_PROGRESS 10 200 1.000\r\n\
-echo GOOSY_PROGRESS 20 200 2.000\r\n\
-echo GOOSY_PROGRESS 30 200 3.000\r\n\
-echo GOOSY_PROGRESS 40 200 4.000\r\n\
-echo GOOSY_PROGRESS 90 200 5.000\r\n\
-echo GOOSY_PROGRESS 140 200 6.000\r\n",
-            )
-            .unwrap();
-            path
-        } else {
-            let path = dir.path().join("mock-worker.sh");
-            std::fs::write(
-                &path,
-                "#!/bin/sh\n\
-printf 'GOOSY_PROGRESS 10 200 1.000\\n'\n\
-printf 'GOOSY_PROGRESS 20 200 2.000\\n'\n\
-printf 'GOOSY_PROGRESS 30 200 3.000\\n'\n\
-printf 'GOOSY_PROGRESS 40 200 4.000\\n'\n\
-printf 'GOOSY_PROGRESS 90 200 5.000\\n'\n\
-printf 'GOOSY_PROGRESS 140 200 6.000\\n'\n",
-            )
-            .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cases: &[(&[&str], u64, f64)] = &[
+            (&["GOOSY_PROGRESS 10 200 1.000", "GOOSY_PROGRESS 20 200 2.000",
+               "GOOSY_PROGRESS 30 200 3.000", "GOOSY_PROGRESS 40 200 4.000",
+               "GOOSY_PROGRESS 90 200 5.000", "GOOSY_PROGRESS 140 200 6.000"], 140, 50.0),
+            (&["GOOSY_PROGRESS 20 200 2.000", "GOOSY_CONTROL paused", "GOOSY_CONTROL resumed",
+               "GOOSY_PROGRESS 21 200 12.025", "GOOSY_PROGRESS 61 200 13.025"], 61, 40.0),
+        ];
+        for &(events, done, fps) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut model = isolated_model(dir.path(), protocol_worker(dir.path(), events));
+            let options = RenderOptions::new(write_song(dir.path()), dir.path().join("out.mp4"));
+            let id = model.manager.enqueue(options, 1).unwrap();
+            model.command(&format!("select:{id}"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let task = snapshot(&model);
+                if task["done"] == done {
+                    assert!((task["fps"].as_f64().unwrap() - fps).abs() < 1e-6);
+                    assert_eq!(task["committed"], 0, "live frames must not advance the recovery point");
+                    break;
+                }
+                assert_ne!(task["state"], "failed", "{task}");
+                assert!(std::time::Instant::now() < deadline, "worker stalled: {task}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            path
-        };
-
-        let mut model = Model::new().unwrap();
-        model.manager = TaskManager::with_worker_executable(script).unwrap();
-        let id = model
-            .manager
-            .enqueue(
-                RenderOptions::new(dir.path().join("song.wav"), dir.path().join("out.mp4")),
-                1,
-            )
-            .unwrap();
-        model.selected_task = Some(id);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let task = model.task_json();
-            if task["state"] == "completed" {
-                let fps = task["fps"].as_f64().expect("task_json must expose fps");
-                assert!(
-                    (fps - 50.0).abs() < 1e-6,
-                    "expected 2s windowed 50.0 FPS (not cumulative 23.3), got {fps}"
-                );
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "mock worker did not finish in time: {task}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        // Verify pause/resume resets the 2s window and excludes paused duration.
-        let pause_script = if cfg!(windows) {
-            let path = dir.path().join("mock-pause-worker.cmd");
-            std::fs::write(
-                &path,
-                "@echo off\r\n\
-echo GOOSY_PROGRESS 20 200 2.000\r\n\
-echo GOOSY_CONTROL paused\r\n\
-echo GOOSY_CONTROL resumed\r\n\
-echo GOOSY_PROGRESS 21 200 12.025\r\n\
-echo GOOSY_PROGRESS 61 200 13.025\r\n",
-            )
-            .unwrap();
-            path
-        } else {
-            let path = dir.path().join("mock-pause-worker.sh");
-            std::fs::write(
-                &path,
-                "#!/bin/sh\n\
-printf 'GOOSY_PROGRESS 20 200 2.000\\n'\n\
-printf 'GOOSY_CONTROL paused\\n'\n\
-printf 'GOOSY_CONTROL resumed\\n'\n\
-printf 'GOOSY_PROGRESS 21 200 12.025\\n'\n\
-printf 'GOOSY_PROGRESS 61 200 13.025\\n'\n",
-            )
-            .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            path
-        };
-
-        model.manager = TaskManager::with_worker_executable(pause_script).unwrap();
-        let paused_id = model
-            .manager
-            .enqueue(
-                RenderOptions::new(dir.path().join("song.wav"), dir.path().join("out2.mp4")),
-                1,
-            )
-            .unwrap();
-        model.selected_task = Some(paused_id);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let task = model.task_json();
-            if task["state"] == "completed" {
-                let fps = task["fps"].as_f64().expect("task_json must expose fps");
-                assert!(
-                    (fps - 40.0).abs() < 1e-6,
-                    "pause duration must not drag down resumed 2s FPS, got {fps}"
-                );
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "mock pause worker did not finish in time: {task}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
     #[test]
     fn recent_tasks_sorted_by_activity_capped_at_twenty_with_thumbnails() {
         let dir = tempfile::tempdir().unwrap();
-        let cover_path = dir.path().join("cover.png");
-        std::fs::write(&cover_path, b"stub").unwrap();
-        let mut model = Model::new().unwrap();
-        // Use a non-existent worker executable that stays blocked or fails cleanly?
-        // Better: use a paused/non-starting worker? Actually, if we enqueue 25 tasks with a slow mock worker
-        // that stays running on task 0, tasks 1..24 stay Queued deterministically!
-        let slow_worker = if cfg!(windows) {
-            let path = dir.path().join("hold-worker.cmd");
-            std::fs::write(&path, "@echo off\r\nset /p _hold=\r\n").unwrap();
-            path
-        } else {
-            let path = dir.path().join("hold-worker.sh");
-            std::fs::write(&path, "#!/bin/sh\nread _hold\n").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            path
-        };
-        model.manager = TaskManager::with_worker_executable(slow_worker).unwrap();
+        let cover_path = dir.path().join("封 面#.ppm");
+        std::fs::write(&cover_path, b"P6\n1 1\n255\n\xff\x80\x00").unwrap();
+        let slow_worker = protocol_worker(dir.path(), &[]);
+        let mut model = isolated_model(dir.path(), slow_worker);
+        let song = write_song(dir.path());
 
         let mut ids = Vec::new();
         for index in 0..24 {
             let mut options = RenderOptions::new(
-                dir.path().join("song.wav"),
+                &song,
                 dir.path().join(format!("out-{index}.mp4")),
             );
             options.title = Some(format!("Task {index}"));
@@ -1282,7 +1555,7 @@ printf 'GOOSY_PROGRESS 61 200 13.025\\n'\n",
 
         // Wait until task 0 starts so tasks 1..23 remain queued.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while model.manager.tasks()[0].state == libgoosy::task_manager::TaskState::Queued {
+        while model.manager.tasks().iter().any(|t| t.id == ids[0] && t.state == libgoosy::task_manager::TaskState::Queued) {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -1299,11 +1572,14 @@ printf 'GOOSY_PROGRESS 61 200 13.025\\n'\n",
             },
         ));
 
-        let json = model.task_json();
+        let json = snapshot(&model);
         let recent = json["recentTasks"]
             .as_array()
             .expect("recentTasks array must be present");
         assert_eq!(recent.len(), MAX_RECENT_TASKS);
+        let all = json["tasks"].as_array().unwrap();
+        assert_eq!(all.len(), ids.len());
+        assert_eq!(recent, &all[..MAX_RECENT_TASKS]);
         assert_eq!(
             recent[0]["id"].as_str(),
             Some(ids[2].to_string().as_str()),
@@ -1316,12 +1592,12 @@ printf 'GOOSY_PROGRESS 61 200 13.025\\n'\n",
                 .starts_with("file:///"),
             "task with cover image file must expose file URL thumbnail"
         );
-        // Verify strictly descending lastActivitySeq across recentTasks.
-        let seqs: Vec<u64> = recent
-            .iter()
-            .map(|item| item["lastActivitySeq"].as_u64().unwrap())
-            .collect();
-        assert!(seqs.windows(2).all(|pair| pair[0] > pair[1]));
+        assert!(recent[0]["thumbnail"].as_str().unwrap().ends_with("%E5%B0%81%20%E9%9D%A2%23.ppm"));
+        let keys = all.iter().map(|item| (
+            item["updatedAt"].as_u64().unwrap(), item["lastActivitySeq"].as_u64().unwrap(),
+            item["id"].as_str().unwrap(),
+        )).collect::<Vec<_>>();
+        assert!(keys.windows(2).all(|pair| pair[0] > pair[1]));
 
         // Task 3 has a cached preview frame -> check in full tasks array.
         let task3 = json["tasks"]
@@ -1334,5 +1610,39 @@ printf 'GOOSY_PROGRESS 61 200 13.025\\n'\n",
             task3["thumbnail"].as_str(),
             Some(format!("image://goosy/task/{}/0", ids[3]).as_str())
         );
+    }
+
+    #[test]
+    fn failed_task_details_and_options_survive_model_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("missing-worker");
+        let mut model = isolated_model(dir.path(), executable.clone());
+        let mut options = RenderOptions::new(write_song(dir.path()), dir.path().join("out.mp4"));
+        options.title = Some("Stored title".into());
+        options.lyrics_style.font_scale = 1.12;
+        let expected = json!(&options);
+        let id = model.manager.enqueue(options, 1).unwrap();
+        model.command(&format!("select:{id}"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let original = loop {
+            let task = snapshot(&model);
+            if task["state"] == "failed" { break task; }
+            assert!(std::time::Instant::now() < deadline, "{task}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        drop(model);
+        let mut reopened = isolated_model(dir.path(), executable);
+        reopened.command(&format!("select:{id}"));
+        let task = snapshot(&reopened);
+        assert_eq!(task["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(task["recentTasks"][0]["id"], id.to_string());
+        assert_eq!(task["state"], "failed");
+        assert!(!task["detail"].as_str().unwrap().is_empty());
+        assert_eq!(task["detail"], original["detail"]);
+        assert!(task["createdAt"].as_u64().unwrap() > 0);
+        assert_eq!(task["createdAt"], original["createdAt"]);
+        assert_eq!(task["outputSize"], 0);
+        assert_eq!(task["options"]["title"], expected["title"]);
+        assert_eq!(task["options"]["lyrics_style"], expected["lyrics_style"]);
     }
 }

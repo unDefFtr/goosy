@@ -1,3 +1,5 @@
+mod process_tree;
+
 use super::{Control, RgbaFrame};
 use crate::RenderOptions;
 use anyhow::{Context, Result};
@@ -21,6 +23,7 @@ impl Control {
 pub(super) enum Terminal {
     Completed,
     Cancelled,
+    Interrupted(String),
     Failed(String),
 }
 
@@ -83,6 +86,9 @@ impl FpsWindow {
 pub(super) struct Update {
     pub stage: Option<String>,
     pub progress: Option<(u64, u64, f64)>,
+    pub submitted: Option<(u64, u64, f64)>,
+    pub committed: Option<(u64, u64, f64)>,
+    pub complete_elapsed: Option<f64>,
     pub fps: Option<f64>,
     pub preview: Option<(u64, RgbaFrame)>,
     pub paused: Option<bool>,
@@ -94,7 +100,13 @@ pub(super) struct Update {
 #[derive(Default)]
 struct Feed {
     pending: Update,
+    highest_rendered: u64,
+    highest_submitted: u64,
+    highest_committed: u64,
+    last_progress: Option<Instant>,
     cancelled: bool,
+    interrupted: bool,
+    failed: bool,
 }
 
 pub(super) struct Worker {
@@ -108,6 +120,7 @@ impl Worker {
         options: Arc<RenderOptions>,
         preview_interval: u32,
         executable: Arc<PathBuf>,
+        workspace: PathBuf,
     ) -> Result<Self> {
         let (send, recv) = mpsc::sync_channel(2);
         let feed = Arc::new(Mutex::new(Feed::default()));
@@ -115,8 +128,15 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("goosy-worker-client".into())
             .spawn(move || {
-                let terminal = supervise(&options, preview_interval, recv, &updates, &executable)
-                    .unwrap_or_else(|error| Terminal::Failed(format!("{error:#}")));
+                let terminal = supervise(
+                    &options,
+                    preview_interval,
+                    recv,
+                    &updates,
+                    &executable,
+                    &workspace,
+                )
+                .unwrap_or_else(|error| Terminal::Failed(format!("{error:#}")));
                 updates.lock().unwrap().pending.terminal = Some(terminal);
             })?;
         Ok(Self {
@@ -130,6 +150,20 @@ impl Worker {
         self.commands
             .as_ref()
             .is_some_and(|send| send.try_send(control).is_ok())
+    }
+
+    pub fn disconnect(&mut self) {
+        self.commands.take();
+    }
+
+    pub fn join(&mut self) {
+        self.disconnect();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                self.feed.lock().unwrap().pending.terminal =
+                    Some(Terminal::Interrupted("渲染监控线程意外退出".into()));
+            }
+        }
     }
 
     pub fn poll(&self) -> Update {
@@ -146,10 +180,7 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.commands.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.join();
     }
 }
 
@@ -158,176 +189,164 @@ fn worker_command(
     options: &RenderOptions,
     preview_dir: &Path,
     interval: u32,
+    workspace: &Path,
 ) -> Command {
     let mut cmd = Command::new(executable);
-    cmd.arg("render");
-    let style = options.lyrics_style;
-    for (flag, value) in [
-        ("--font-scale", style.font_scale),
-        ("--translation-font-scale", style.translation_font_scale),
-        ("--background-font-scale", style.background_font_scale),
-        ("--line-height-scale", style.line_height_scale),
-        ("--line-spacing-scale", style.group_gap_scale),
-        ("--translation-gap-scale", style.translation_gap_scale),
-        ("--background-gap-scale", style.background_gap_scale),
-        ("--horizontal-padding-scale", style.horizontal_padding_scale),
-    ] {
-        cmd.arg(flag).arg(value.to_string());
-    }
-    for (flag, value) in [
-        ("--width", options.width),
-        ("--height", options.height),
-        ("--fps", options.fps),
-        ("--lyric-blur-sigma-step", style.lyric_blur_sigma_step),
-        ("--preview-interval", interval),
-    ] {
-        cmd.arg(flag).arg(value.to_string());
-    }
-    for (flag, enabled) in [
-        ("--debug-overlays", style.debug_overlays),
-        ("--no-audio", options.no_audio),
-        ("--no-embedded-cover", options.no_embedded_cover),
-        ("--no-translation", !options.render_translation),
-        ("--no-background-vocal", !options.render_background_vocal),
-    ] {
-        if enabled {
-            cmd.arg(flag);
-        }
-    }
-    for (flag, path) in [
-        ("--cover", &options.cover),
-        ("--background", &options.background),
-    ] {
-        if let Some(path) = path {
-            cmd.arg(flag).arg(path);
-        }
-    }
-    if let Some(title) = &options.title {
-        cmd.arg(format!("--title={title}"));
-    }
-    if let Some(value) = options.sample_start_ms {
-        cmd.arg("--sample-start-ms").arg(value.to_string());
-    }
-    if let Some(value) = options.sample_duration_ms {
-        cmd.arg("--sample-duration-ms").arg(value.to_string());
-    }
-    for index in &options.excluded_lines {
-        cmd.arg("--exclude-line").arg(index.to_string());
-    }
-    let format = match options.format {
-        crate::LyricFormat::Auto => "auto",
-        crate::LyricFormat::Lrc => "lrc",
-        crate::LyricFormat::Ttml => "ttml",
-        crate::LyricFormat::Yrc => "yrc",
-    };
-    cmd.arg("--output").arg(&options.output).args([
-        "--progress-events",
-        "--encoder",
-        options.encoder.cli_value(),
-        "--codec",
-        options.codec.cli_value(),
-        "--nvenc-preset",
-        &options.nvenc_preset,
-        "--format",
-        format,
-    ]);
+    cmd.arg("render").arg("--workspace").arg(workspace);
+    cmd.arg("--progress-events")
+        .arg("--preview-interval")
+        .arg(interval.to_string());
     if !options.encoder.is_zero_copy() {
         cmd.arg("--preview-dir").arg(preview_dir);
     }
-    cmd.arg("--").arg(&options.song);
-    if let Some(lyrics) = &options.lyrics {
-        cmd.arg(lyrics);
-    }
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     cmd
+}
+
+// A dead supervisor can leave preview handoffs behind. Reclaim recognized cache files
+// after reaping the worker or while holding its workspace lock during recovery.
+pub(super) fn clean_preview(workspace: &Path) -> Result<()> {
+    let directory = workspace.join("preview-cache");
+    match std::fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(meta) => anyhow::ensure!(
+            meta.is_dir(),
+            "invalid preview cache: {}",
+            directory.display()
+        ),
+    }
+    for entry in std::fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .and_then(|s| s.strip_suffix(".rgba"))
+            .is_some_and(|s| s.parse::<u64>().is_ok())
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    std::fs::remove_dir(directory)?;
+    Ok(())
 }
 
 fn supervise(
     options: &RenderOptions,
     interval: u32,
     commands: mpsc::Receiver<Control>,
-    feed: &Mutex<Feed>,
+    feed: &Arc<Mutex<Feed>>,
     executable: &Path,
+    workspace: &Path,
 ) -> Result<Terminal> {
-    let directory = tempfile::Builder::new()
-        .prefix("goosy-preview-")
-        .tempdir()
-        .context("创建实时预览目录")?;
-    let mut child = worker_command(executable, options, directory.path(), interval)
-        .spawn()
-        .with_context(|| format!("启动渲染 Worker {}", executable.display()))?;
-    let mut stdin = child.stdin.take().expect("piped worker stdin");
-    let stdout = child.stdout.take().expect("piped worker stdout");
-    let stderr = child.stderr.take().expect("piped worker stderr");
-    let status = thread::scope(|scope| {
-        let output = scope.spawn(|| read_stdout(stdout, directory.path(), feed));
-        let diagnostics = scope.spawn(|| read_stderr(stderr, feed));
-        let status = (|| {
-            let mut shutdown = None;
-            let mut stop_sent = false;
-            let interval = Duration::from_millis(25);
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    break Ok(status);
-                }
-                if let Some(deadline) = shutdown {
-                    if Instant::now() >= deadline {
-                        child.kill()?;
-                        break child.wait();
-                    }
-                    thread::sleep(interval);
-                    continue;
-                }
-                let control = match commands.recv_timeout(interval) {
-                    Ok(control) => control,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        shutdown = Some(Instant::now() + Duration::from_secs(2));
-                        if stop_sent {
-                            continue;
-                        }
-                        Control::Cancel
-                    }
-                };
-                if matches!(control, Control::Cancel) {
-                    shutdown.get_or_insert_with(|| Instant::now() + Duration::from_secs(10));
-                    stop_sent = true;
-                }
-                if let Err(error) = stdin.write_all(control.wire()) {
-                    feed.lock().unwrap().pending.warning =
-                        Some(format!("渲染控制通道已断开：{error}"));
-                }
+    let directory = workspace.join("preview-cache");
+    std::fs::create_dir(&directory).context("创建实时预览目录")?;
+    let result = supervise_process(
+        worker_command(executable, options, &directory, interval, workspace),
+        commands,
+        feed,
+        &directory,
+        Duration::from_secs(30),
+        Duration::from_secs(120),
+    );
+    // A detached reaper may still own a live Worker. Recovery will retry
+    // under this same lock once the Worker releases its workspace.
+    if let Err(error) = crate::workspace::lock(workspace, false).and_then(|_lock| clean_preview(workspace)) {
+        feed.lock().unwrap().pending.warning = Some(format!("清理预览缓存失败：{error:#}"));
+    }
+    result
+}
+
+fn supervise_process(
+    mut command: Command,
+    commands: mpsc::Receiver<Control>,
+    feed: &Arc<Mutex<Feed>>,
+    directory: &Path,
+    idle_limit: Duration,
+    total_limit: Duration,
+) -> Result<Terminal> {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut tree = process_tree::ProcessTree::spawn(&mut command)
+        .with_context(|| format!("启动渲染 Worker {:?}", command.get_program()))?;
+    let mut stdin = tree.child.stdin.take().expect("piped worker stdin");
+    let stdout = tree.child.stdout.take().expect("piped worker stdout");
+    let stderr = tree.child.stderr.take().expect("piped worker stderr");
+    let (input_tx, input_rx) = mpsc::channel::<Control>();
+    let input_feed = Arc::clone(feed);
+    // A Worker that stops reading stdin must never block the deadline monitor.
+    let input = thread::spawn(move || {
+        for control in input_rx {
+            if let Err(error) = stdin.write_all(control.wire()) {
+                input_feed.lock().unwrap().pending.warning = Some(format!("渲染控制通道已断开：{error}"));
+                break;
             }
-        })();
-        if status.is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
         }
-        drop(stdin);
-        // Drain both pipes after exit so the final frame, acknowledgement and errors are retained.
-        let output = output
-            .join()
-            .map_err(|_| anyhow::anyhow!("Worker 输出读取线程异常退出"))?;
-        let diagnostics = diagnostics
-            .join()
-            .map_err(|_| anyhow::anyhow!("Worker 日志读取线程异常退出"))?;
-        output.context("读取 Worker 标准输出")?;
-        diagnostics.context("读取 Worker 日志")?;
-        status.context("等待渲染 Worker 退出")
-    })?;
-    Ok(if status.success() {
-        Terminal::Completed
-    } else if status.code() == Some(1) && feed.lock().unwrap().cancelled {
+        Ok(())
+    });
+    let directory = directory.to_owned();
+    let output_feed = Arc::clone(feed);
+    let output = thread::spawn(move || read_stdout(stdout, &directory, &output_feed));
+    let diagnostic_feed = Arc::clone(feed);
+    let diagnostics = thread::spawn(move || read_stderr(stderr, &diagnostic_feed));
+
+    let mut input_tx = Some(input_tx);
+    let mut waiting_since = None;
+    let interrupted = loop {
+        match tree.leader_exited() {
+            Ok(true) => break None,
+            Ok(false) => (),
+            Err(error) => break Some(format!("等待渲染 Worker 退出失败：{error:#}")),
+        }
+        let mut interval = Duration::from_millis(25);
+        if let Some(start) = waiting_since {
+            let last = feed.lock().unwrap().last_progress.unwrap_or(start).max(start);
+            let now = Instant::now();
+            let deadline = (last + idle_limit).min(start + total_limit);
+            if now >= deadline {
+                break Some("渲染 Worker 未在宽限期内退出，已请求终止进程树".into());
+            }
+            interval = interval.min(deadline - now);
+        }
+        let Some(sender) = &input_tx else {
+            thread::sleep(interval);
+            continue;
+        };
+        match commands.recv_timeout(interval) {
+            Ok(control) if waiting_since.is_none() => {
+                if control == Control::Cancel {
+                    waiting_since = Some(Instant::now());
+                }
+                let _ = sender.send(control);
+            }
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => (),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Closing stdin asks the Worker to commit its current segment.
+                input_tx.take();
+                waiting_since.get_or_insert_with(Instant::now);
+            }
+        }
+    };
+    drop(input_tx);
+    // Terminate descendants even if the leader exited on its own. They may
+    // have inherited our output pipes or still be writing a segment.
+    let status = match tree.reap([input, output, diagnostics]) {
+        Ok(status) => status,
+        Err(error) => return Ok(Terminal::Interrupted(format!("回收渲染 Worker 失败：{error:#}"))),
+    };
+    if let Some(reason) = interrupted {
+        return Ok(Terminal::Interrupted(reason));
+    }
+    let feed = feed.lock().unwrap();
+    // An acknowledged stop is authoritative even when the child also reports a generic failure.
+    Ok(if feed.cancelled {
         Terminal::Cancelled
-    } else {
+    } else if feed.interrupted && status.success() {
+        Terminal::Interrupted(String::new())
+    } else if status.success() {
+        Terminal::Completed
+    } else if feed.failed {
         Terminal::Failed(format!("渲染 Worker 异常退出（{status}）"))
+    } else {
+        Terminal::Interrupted(format!("渲染 Worker 中断（{status}）"))
     })
 }
 
@@ -344,7 +363,7 @@ fn read_stdout(stdout: impl Read, directory: &Path, feed: &Mutex<Feed>) -> std::
                     feed.lock().unwrap().pending.stage = Some(message.to_owned());
                 }
             }
-            Some("GOOSY_PROGRESS") => {
+            Some(event @ ("GOOSY_PROGRESS" | "GOOSY_SUBMITTED" | "GOOSY_COMMITTED")) => {
                 let progress = (|| {
                     Some((
                         fields.next()?.parse().ok()?,
@@ -353,10 +372,31 @@ fn read_stdout(stdout: impl Read, directory: &Path, feed: &Mutex<Feed>) -> std::
                     ))
                 })();
                 if let Some((done, total, elapsed)) = progress {
-                    let fps = fps_window.record(done, elapsed);
                     let mut feed = feed.lock().unwrap();
-                    feed.pending.progress = Some((done, total, elapsed));
-                    feed.pending.fps = Some(fps);
+                    let highest = match event {
+                        "GOOSY_COMMITTED" => {
+                            feed.pending.committed = Some((done, total, elapsed));
+                            &mut feed.highest_committed
+                        }
+                        "GOOSY_SUBMITTED" => {
+                            feed.pending.submitted = Some((done, total, elapsed));
+                            &mut feed.highest_submitted
+                        }
+                        _ => {
+                            feed.pending.progress = Some((done, total, elapsed));
+                            feed.pending.fps = Some(fps_window.record(done, elapsed));
+                            &mut feed.highest_rendered
+                        }
+                    };
+                    if done > *highest {
+                        *highest = done;
+                        feed.last_progress = Some(Instant::now());
+                    }
+                }
+            }
+            Some("GOOSY_COMPLETE") => {
+                if let Some(elapsed) = fields.nth(1).and_then(|s| s.parse::<f64>().ok()) {
+                    feed.lock().unwrap().pending.complete_elapsed = Some(elapsed);
                 }
             }
             Some("GOOSY_PREVIEW") => {
@@ -387,7 +427,9 @@ fn read_stdout(stdout: impl Read, directory: &Path, feed: &Mutex<Feed>) -> std::
                         fps_window.reset();
                         feed.pending.paused = Some(false);
                     }
+                    Some("failed") => feed.failed = true,
                     Some("cancelled") => feed.cancelled = true,
+                    Some("interrupted") => feed.interrupted = true,
                     _ => {}
                 }
             }
@@ -436,6 +478,165 @@ fn read_stderr(mut stderr: impl Read, feed: &Mutex<Feed>) -> std::io::Result<()>
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    const HELPER: &str = "task_manager::worker::tests::supervision_child";
+    const ROLE: &str = "GOOSY_SUPERVISION_TEST_ROLE";
+    const DIRECTORY: &str = "GOOSY_SUPERVISION_TEST_DIR";
+    const IDLE: Duration = Duration::from_millis(350);
+
+    fn helper(role: &str, directory: &Path) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--ignored", "--exact", HELPER, "--nocapture"]);
+        command.env(ROLE, role).env(DIRECTORY, directory);
+        command
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for real Worker supervision"]
+    fn supervision_child() {
+        let Ok(role) = std::env::var(ROLE) else { return };
+        let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+        thread::spawn(|| {
+            thread::sleep(Duration::from_secs(5));
+            std::process::exit(91);
+        });
+        if role == "descendant" {
+            let lock = std::fs::File::create(directory.join("descendant.lock")).unwrap();
+            lock.try_lock().unwrap();
+            std::fs::write(directory.join("descendant.ready"), b"ready").unwrap();
+            // Keep both inherited output pipes and the lock until killed.
+            loop {
+                thread::park();
+            }
+        }
+
+        println!("\nGOOSY_PROGRESS 20 10000 1\nGOOSY_SUBMITTED 10 10000 1\nGOOSY_COMMITTED 7 10000 1");
+        let _descendant = helper("descendant", &directory).spawn().unwrap();
+        while !directory.join("descendant.ready").exists() {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if role == "leader-exits" {
+            return;
+        }
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        if role == "ignore-stop" {
+            assert_eq!(line, "stop\n");
+        } else {
+            assert!(line.is_empty(), "expected stdin EOF, got {line:?}");
+        }
+        std::fs::write(directory.join("requested"), line).unwrap();
+        for step in 1.. {
+            if role == "progress" {
+                println!("GOOSY_COMMITTED {} 10000 1", 7 + step);
+            } else {
+                // Duplicate and regressing frames, logs and acknowledgements
+                // continue arriving until the process tree is terminated.
+                println!("GOOSY_COMMITTED 7 10000 2\nGOOSY_PROGRESS 4 10000 2\nGOOSY_SUBMITTED 2 10000 2\nGOOSY_CONTROL paused");
+                eprintln!("still busy");
+            }
+            thread::sleep(Duration::from_millis(35));
+        }
+    }
+
+    struct Fixture {
+        directory: tempfile::TempDir,
+        commands: Option<mpsc::Sender<Control>>,
+        result: mpsc::Receiver<Result<Terminal>>,
+        feed: Arc<Mutex<Feed>>,
+    }
+
+    impl Fixture {
+        fn start(role: &str, total: Duration) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let command = helper(role, directory.path());
+            let path = directory.path().to_owned();
+            let (commands, incoming) = mpsc::channel();
+            let (finished, result) = mpsc::channel();
+            let feed = Arc::new(Mutex::new(Feed::default()));
+            let updates = Arc::clone(&feed);
+            thread::spawn(move || {
+                let status = supervise_process(command, incoming, &updates, &path, IDLE, total);
+                let _ = finished.send(status);
+            });
+            let start = Instant::now();
+            while !directory.path().join("descendant.ready").exists() {
+                assert!(start.elapsed() < Duration::from_secs(3), "descendant did not start");
+                thread::sleep(Duration::from_millis(5));
+            }
+            Self { directory, commands: Some(commands), result, feed }
+        }
+
+        fn finish(&self, timeout: Duration) -> Terminal {
+            let terminal = self.result.recv_timeout(timeout).expect("supervisor deadline").unwrap();
+            let lock = std::fs::File::open(self.directory.path().join("descendant.lock")).unwrap();
+            lock.try_lock().expect("descendant survived the Worker");
+            assert!(self.feed.lock().unwrap().highest_committed >= 7);
+            terminal
+        }
+
+        fn requested(&self) -> String {
+            std::fs::read_to_string(self.directory.path().join("requested")).unwrap()
+        }
+    }
+
+    #[test]
+    fn disconnect_terminates_an_unresponsive_worker_tree() {
+        let mut fixture = Fixture::start("ignore-eof", Duration::from_secs(3));
+        fixture.commands.take();
+        assert!(matches!(fixture.finish(Duration::from_secs(2)), Terminal::Interrupted(_)));
+        assert_eq!(fixture.requested(), "");
+    }
+
+    #[test]
+    fn repeated_controls_do_not_extend_cancel_deadline() {
+        let mut fixture = Fixture::start("ignore-stop", Duration::from_secs(3));
+        let commands = fixture.commands.take().unwrap();
+        commands.send(Control::Cancel).unwrap();
+        let repeats = thread::spawn(move || {
+            for control in [Control::Pause, Control::Resume, Control::Cancel].into_iter().cycle() {
+                thread::sleep(Duration::from_millis(35));
+                if commands.send(control).is_err() {
+                    break;
+                }
+            }
+        });
+        assert!(matches!(fixture.finish(Duration::from_secs(2)), Terminal::Interrupted(_)));
+        assert_eq!(fixture.requested(), "stop\n");
+        repeats.join().unwrap();
+    }
+
+    #[test]
+    fn leader_exit_reclaims_descendants_before_draining_pipes() {
+        let fixture = Fixture::start("leader-exits", Duration::from_secs(3));
+        assert!(matches!(fixture.finish(Duration::from_secs(2)), Terminal::Completed));
+    }
+
+    #[test]
+    fn increasing_frames_extend_grace_only_until_the_absolute_deadline() {
+        let mut fixture = Fixture::start("progress", Duration::from_millis(1150));
+        fixture.commands.take();
+        assert!(matches!(fixture.result.recv_timeout(2 * IDLE), Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(fixture.feed.lock().unwrap().highest_committed > 7);
+        assert!(matches!(fixture.finish(Duration::from_millis(1000)), Terminal::Interrupted(_)));
+        assert_eq!(fixture.requested(), "");
+    }
+
+    #[test]
+    fn only_new_per_counter_highs_refresh_progress_after_polling() {
+        let feed = Mutex::new(Feed::default());
+        let event = |line: &str| read_stdout(Cursor::new(line), Path::new("."), &feed).unwrap();
+        for line in ["GOOSY_PROGRESS 90 100 1", "GOOSY_SUBMITTED 40 100 1", "GOOSY_COMMITTED 20 100 1"] {
+            let before = Instant::now() - Duration::from_secs(1);
+            feed.lock().unwrap().last_progress = Some(before);
+            event(line);
+            assert!(feed.lock().unwrap().last_progress.unwrap() > before);
+            std::mem::take(&mut feed.lock().unwrap().pending);
+        }
+        let last = feed.lock().unwrap().last_progress;
+        event("GOOSY_COMMITTED 20 100 2\nGOOSY_SUBMITTED 3 100 3\nGOOSY_PROGRESS 89 100 4");
+        assert_eq!(feed.lock().unwrap().last_progress, last);
+    }
 
     #[test]
     fn fps_window_tracks_recent_two_seconds() {
@@ -491,6 +692,15 @@ mod tests {
         read_stdout(Cursor::new(before_pause), dir.path(), &feed).unwrap();
         let fps = feed.lock().unwrap().pending.fps.unwrap();
         assert!((fps - 10.0).abs() < 1e-6);
+
+        let phases = Mutex::new(Feed::default());
+        let events = "GOOSY_PROGRESS 14 30 2.1\nGOOSY_SUBMITTED 13 30 2.0\nGOOSY_COMMITTED 10 30 1.5\nGOOSY_COMPLETE 30 5.0\n";
+        read_stdout(Cursor::new(events), dir.path(), &phases).unwrap();
+        let pending = &phases.lock().unwrap().pending;
+        assert_eq!(pending.progress, Some((14, 30, 2.1)));
+        assert_eq!(pending.submitted, Some((13, 30, 2.0)));
+        assert_eq!(pending.committed, Some((10, 30, 1.5)));
+        assert_eq!(pending.complete_elapsed, Some(5.0));
 
         let stream = "\
 GOOSY_PROGRESS 10 100 1.000\n\

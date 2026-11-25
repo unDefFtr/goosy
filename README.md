@@ -10,10 +10,11 @@ Qt5Compat、Qt Shader Tools）。如果 Cargo 找不到 Qt 6 的 `qmake`，请�
 使用视频导出前，确保 `ffmpeg` 和 `ffprobe` 可从 `PATH` 找到。
 
 ```bash
-# 默认 egui 界面，无 Qt 依赖
+# 默认 egui 界面，无 Qt 依赖；Worker 与主程序放在同一目录
+cargo build --bin goosy --bin goosy-render-worker
 cargo run --bin goosy
 
-# 只构建新版与 Worker；首次运行或更新 Worker 后需要执行
+# 开发时一起构建 GUI Next 和 Worker。cargo run --bin 只更新指定的程序。
 cargo build --no-default-features --features gui-next --bin goosy-gui-next --bin goosy-render-worker
 cargo run --no-default-features --features gui-next --bin goosy-gui-next
 
@@ -27,6 +28,7 @@ cargo build --features gui-next --bins
 
 新版需要同一构建产物目录中的 `goosy-render-worker`（Windows 下为 `.exe`）。QML 已嵌入，
 不需要工作目录中的源码，但部署仍需要 Qt 运行库、平台插件和 QML 模块。
+若开发版任务日志出现 `unexpected argument '--workspace'`，在相同 profile 和 target 目录下执行 `cargo build --no-default-features --bin goosy-render-worker`，然后在 Tasks 中继续已中断的任务。
 
 新版支持素材选择与同名匹配、分辨率、样式、范围与随机采样、即时样式预览、导出进度和实时预览。
 选定范围和随机采样均不输出音频，文件名附加 `.sample-<起点毫秒>ms`。零拷贝编码提供进度但不提供
@@ -37,10 +39,16 @@ Home 是简洁欢迎页，点击“创建任务”进入内部四步向导：**�
 步骤条只显示一次步骤名称；素材表单保留未选择、自动匹配、音频元数据等真实状态。Tasks 查看队列、任务详情、日志和实际渲染预览；Settings 设置并发数和主题。
 任务列表使用持久 `ListModel`，按 Task ID 原位更新变化的字段；进度、状态、预览或日志更新不替换列表模型、不重建既有任务行，也不重复触发列表入场动画。选择与滚动位置只随显式选择或任务结构变化更新。
 
-Tasks 采用 Master–Detail：列表约占 30%，按创建顺序稳定排列；列表和详情独立滚动，任务画面在文件详情和日志之前。
+Tasks 采用 Master–Detail：列表约占 30%，按最近活动排序；列表和详情独立滚动，任务画面在文件详情和日志之前。
 列表只显示名称、状态、简要进度和输出文件名；详情集中显示真实状态、帧进度、耗时及当前允许的操作。
 完整路径/错误可通过工具提示和“文件与错误详情”查看；日志默认折叠，固定高度独立滚动，停留底部时跟随最新日志。
-现有日志协议仅保留最近 8 KiB，未扩展为完整持久历史；没有新增重试、删除或打开输出等任务能力。
+Worker 实时日志保留最近 8 KiB；任务失败原因随历史记录保存。
+左键选中任务查看详情。右键菜单随任务状态显示可用操作。“打开输出目录”可在视频生成前使用，前提是目标目录存在。
+
+“重做”会把历史配置载入 Home 创建向导，保留原任务选用的素材、样式、编码参数和实际采样范围。向导会检查素材大小和 BLAKE3 指纹。找不到素材时可重新定位，内容变化时需要明确接受当前文件。确认创建后，新任务获得独立的 UUID、工作目录、清单和输出路径。
+
+取消会保留历史记录。删除需要确认，有活动 Worker 时须先取消并等待其退出。Goosy 先记录删除意图，再清理工作数据、缩略图和历史记录，保留原始素材和用户导出的最终视频。如果输出盘离线，任务保留“删除中”状态。接回原盘并重新打开任务库后会继续清理。
+
 Tasks 组件审计基于 `rinui-host = 0.1.0-alpha.2` 的文档、Gallery 和随依赖发布的源码。已有 `ListView`/`ListViewDelegate`、`ProgressBar`、`Button`、`Segmented`、`Expander` 均保留原生外观，本轮补齐交互与主题绑定；`InfoBadge` 是通知标记，不强行用于任务状态。
 本轮 Tasks 采用原生组件替换表：
 
@@ -57,7 +65,6 @@ Tasks 组件审计基于 `rinui-host = 0.1.0-alpha.2` 的文档、Gallery 和随
 未手工覆盖 Button、ListViewDelegate、ProgressBar、Expander、Segmented 的背景、圆角、边框或动画。没有任务专用 Header、状态显示或视频帧控件，保留 Row/Column/Flow 元数据布局、主题语义色状态文字和 Image；分栏分隔线是正常布局，独立 Flickable 使用 RinUI ScrollBar，不为此嵌套会改变滚动语义的页面容器。
 任务画面与当前样式为明确独立的预览模式；无任务帧时显示真实空状态，不回退到样式画面。
 ViewModel 按任务保存最新预览，最多缓存 16 个任务（640 × 360 RGBA 约 14 MiB），切换时恢复对应帧；被淘汰且已结束的旧任务可能没有可恢复画面。
-Home/四步向导、渲染器、Worker 协议、任务状态模型和调度算法未因 Tasks 工作区调整而改变。
 
 
 向导左侧配置独立滚动、底部按钮固定；右侧同一个预览组件保持可见，切换步骤不销毁重建，画面保持 16:9。
@@ -79,23 +86,29 @@ NavigationView 的内置 StackView 过渡用于全局页面，未嵌套复用以
 参考 [官方窗口文档](https://rinui-rs.undef.work/Windowing/FluentWindow.html)、官方 Gallery 和随 `rinui-host` 发布的组件源码。
 
 
-`gui-next/` 持有 RinUI Host、QML 和 CXX-Qt 桥；`src/gui_next/model.rs` 只持有可编辑草稿和 UI 适配。
-`libgoosy::task_manager` 不依赖 Qt/QML：独立调度线程持有队列，每个任务在提交时保存 `Arc<RenderOptions>`
-不可变快照、任务 ID、独立进程控制通道、进度、8 KiB 日志尾部和最新预览槽位。无需 GUI tick 驱动调度，
-关闭页面不会停止 Worker；退出应用时管理器协作停止、超时终止并回收进程。任务记录仅在本次会话保留。
+### 用户数据与任务恢复
 
-并发默认 1，可设置 1–8；暂停任务仍占槽位，降低上限不会中断正在运行的任务。**大于 1 为实验性**：
-进程和文件隔离不等于 GPU/显存/硬件编码资源隔离。本机已验证两个 640 × 360 PipeEncoder Worker
-同时运行及独立控制，尚未验证高分辨率、零拷贝和跨平台并行稳定性。
+两个 GUI 和 `goosy render` 使用同一个 Task Manager。Home 显示最近 20 项，Tasks 提供完整历史与配置快照。默认 egui 界面的“选择历史任务”也支持继续任务。在提供 CLI 的平台上，`goosy resume <UUID>` 可继续中断的任务。嵌入式库的直接渲染 API 仍由调用方管理输出和生命周期。
 
-输出目录必须存在；拒绝已有文件以及本会话已使用的路径，规范化父目录和大小写别名（macOS/Windows
-保守忽略大小写），用输出旁的 `.文件名.goosy-lock` 避免多个新版实例争用。正常结束或退出时移除锁；
-宿主被强制杀死可能留下锁，确认无 Worker 后才能手动删除。锁不约束外部软件或旧 GUI 写入同一路径。
-取消或失败可能留下不完整视频，需换用新路径或手动清理；不会自动删除已有输出。
+用户数据位于 Windows 的 `%LOCALAPPDATA%/Goosy`、macOS 的 `~/Library/Application Support/Goosy` 或 Linux 的 `${XDG_DATA_HOME:-~/.local/share}/goosy`。同一用户目录同时由一个管理器持有。退出应用后可备份整个目录。
 
-Worker 沿用原有命令和帧协议；完成必须等待成功退出和管道排空，不以最后一帧进度判定。
-暂停/继续等收到 `GOOSY_CONTROL paused|resumed` 才改变已确认状态；取消等确认及退出，期间显示待确认请求。
-取消等待最多 10 秒，随后强制终止并记为 Failed，而非伪造 Cancelled。预览临时目录随 Worker 回收，事件只保留最新帧。
+| 位置 | 内容 |
+| --- | --- |
+| `history.sqlite3` | UUID、状态、时间、原始配置、帧数、耗时、输出大小和错误 |
+| `settings.toml` | `max_concurrent`（1–8）、`segment_seconds`（默认 5）、`keep_segments`（默认 `false`） |
+| `tasks/<UUID>/config.json` | 配置版本、渲染器标识、输入路径、大小与 BLAKE3、实际采样参数、分段策略 |
+| `tasks/<UUID>/manifest.json` | 确定的时间范围、连续分段及 Checkpoint 索引、最终输出校验信息 |
+| `tasks/<UUID>/segments/`、`checkpoints/` | 独立视频分段与分段末尾的动画状态 |
+| `tasks/<UUID>/audio/`、`output/` | 任务私有工作目录。最终封装临时文件与输出文件位于同一文件系统 |
+| `thumbnails/`、`logs/`、`cache/` | 可用的预览缩略图、诊断目录及可清理缓存 |
+
+暂停请求在当前分段结束时生效。Worker 排空编码器、完成封装、独立解码校验并刷新视频和 Checkpoint，最后原子替换 Manifest。取消或正常关闭时会等待 Worker 处理当前分段。连续 30 秒没有帧进展或等待达到 120 秒时，管理器终止该 Worker 及其编码子进程。重新打开后可在 Tasks 继续中断的任务。恢复会检查素材与已提交文件的哈希，使用最后一个连续有效分段的动画状态。素材变动或版本不兼容时会显示原因。
+
+最终输出通过校验且完成状态写入 SQLite 后，默认删除该任务的视频分段和 Checkpoint，并把 `manifest.json` 归档为 `manifest.completed.json`。历史记录和缩略图继续保留。运行中、暂停、中断及失败的任务保留已有恢复数据；失败任务目前没有自动过期时间。显式设置 `keep_segments = true` 可在完成后保留分段、Checkpoint 和原清单。已有设置继续生效，编辑 `settings.toml` 前先退出 Goosy。
+
+最终封装使用输出目录下的私有暂存目录，工作区记录对应任务和尝试的 UUID。发布不会覆盖已有文件。任务管理器在后台校验成品，期间其他任务可以查询、控制和调度。旧版遗留的 `.part.*` 文件没有所有权记录，需由用户确认后自行处理。
+
+恢复需要原输入素材和兼容的渲染环境。校验与最终发布涉及完整文件读取，最终封装还需要一份输出文件的可用空间。硬件编码、驱动与系统字体可能影响图像或码流的逐字节一致性。
 
 真实 Worker 生命周期回归（需 PATH 中有 ffmpeg/ffprobe）：
 
