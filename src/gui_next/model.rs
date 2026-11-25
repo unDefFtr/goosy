@@ -13,6 +13,27 @@ use std::thread;
 
 const DEFAULT_PREVIEW_INTERVAL: u32 = 15;
 const DEFAULT_SAMPLE_DURATION: u32 = 15_000;
+const MAX_RECENT_TASKS: usize = 20;
+
+fn path_to_file_url(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(raw.len() + 8);
+    if raw.starts_with('/') {
+        encoded.push_str("file://");
+    } else {
+        encoded.push_str("file:///");
+    }
+    for byte in raw.bytes() {
+        match byte {
+            b'%' | b'#' | b'?' | b' ' => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut encoded, "%{byte:02X}");
+            }
+            _ => encoded.push(byte as char),
+        }
+    }
+    encoded
+}
 
 #[derive(Default)]
 struct Assets {
@@ -148,6 +169,7 @@ pub(crate) struct Model {
     manager: TaskManager,
     selected_task: Option<TaskId>,
     preview_cache: VecDeque<(TaskId, libgoosy::task_manager::RgbaFrame)>,
+    pending_task_thumbnails: Vec<(String, FrameUpdate)>,
     task_error: String,
     last_task_json: String,
     project_dirty: bool,
@@ -227,6 +249,7 @@ impl Model {
             manager: TaskManager::new()?,
             selected_task: None,
             preview_cache: VecDeque::new(),
+            pending_task_thumbnails: Vec::new(),
             task_error: String::new(),
             last_task_json: String::new(),
             project_dirty: true,
@@ -263,6 +286,24 @@ impl Model {
         })
     }
 
+    fn task_thumbnail_url(&self, task: &TaskInfo) -> String {
+        if self.preview_cache.iter().any(|(id, _)| *id == task.id) {
+            return format!("image://goosy/task/{}/{}", task.id, task.preview_frame);
+        }
+        for candidate in [
+            task.options.background.as_deref(),
+            task.options.cover.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if candidate.is_file() {
+                return path_to_file_url(candidate);
+            }
+        }
+        String::new()
+    }
+
     fn task_json(&self) -> Value {
         let tasks = self.manager.tasks();
         let task_value = |task: &TaskInfo| {
@@ -272,8 +313,10 @@ impl Model {
                     Control::Pause => "pause", Control::Resume => "resume", Control::Cancel => "cancel",
                 }).unwrap_or(""),
                 "stage": task.stage, "detail": task.detail,
-                "done": task.done, "total": task.total, "elapsed": task.elapsed, "log": task.log,
+                "done": task.done, "total": task.total, "elapsed": task.elapsed, "fps": task.fps, "log": task.log,
                 "previewFrame": task.preview_frame, "previewNote": task.preview_note,
+                "updatedAt": task.updated_at_ms, "lastActivitySeq": task.last_activity_seq,
+                "thumbnail": self.task_thumbnail_url(task),
                 "output": task.options.output.to_string_lossy(),
                 "title": task.options.title.as_deref().unwrap_or("未命名任务"),
                 "config": {
@@ -288,12 +331,19 @@ impl Model {
                 },
             })
         };
+        let mut recent: Vec<&TaskInfo> = tasks.iter().collect();
+        recent.sort_by(|left, right| {
+            (right.last_activity_seq, right.updated_at_ms, right.id)
+                .cmp(&(left.last_activity_seq, left.updated_at_ms, left.id))
+        });
+        recent.truncate(MAX_RECENT_TASKS);
         let mut value = tasks
             .iter()
             .find(|task| Some(task.id) == self.selected_task)
             .map(task_value)
             .unwrap_or_else(|| json!({"state": "idle", "pending": ""}));
         value["tasks"] = tasks.iter().map(task_value).collect::<Vec<_>>().into();
+        value["recentTasks"] = recent.into_iter().map(task_value).collect::<Vec<_>>().into();
         value["selectedId"] = self
             .selected_task
             .map(|id| id.to_string())
@@ -670,9 +720,20 @@ impl Model {
             if let Some(index) = self.preview_cache.iter().position(|(id, _)| *id == task.id) {
                 self.preview_cache.remove(index);
             }
+            self.pending_task_thumbnails.push((
+                task.id.to_string(),
+                FrameUpdate::Replace(RgbaFrame {
+                    width: frame.width,
+                    height: frame.height,
+                    pixels: frame.pixels.clone(),
+                }),
+            ));
             self.preview_cache.push_back((task.id, frame));
             if self.preview_cache.len() > 16 {
-                self.preview_cache.pop_front();
+                if let Some((evicted_id, _)) = self.preview_cache.pop_front() {
+                    self.pending_task_thumbnails
+                        .push((evicted_id.to_string(), FrameUpdate::Clear));
+                }
             }
             if self.selected_task == Some(task.id) {
                 self.restore_task_preview(task.id);
@@ -913,6 +974,7 @@ impl ViewModel for Model {
             task: task_changed.then_some(task_json),
             style: std::mem::take(&mut self.style),
             render: std::mem::take(&mut self.render),
+            task_thumbnails: std::mem::take(&mut self.pending_task_thumbnails),
         }
     }
 }
@@ -1047,6 +1109,230 @@ mod tests {
         assert!(
             matches!(model.render, FrameUpdate::Keep),
             "reselecting current task must not republish or clear preview"
+        );
+    }
+
+    #[test]
+    fn task_json_reports_two_second_window_fps() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = if cfg!(windows) {
+            let path = dir.path().join("mock-worker.cmd");
+            std::fs::write(
+                &path,
+                "@echo off\r\n\
+echo GOOSY_PROGRESS 10 200 1.000\r\n\
+echo GOOSY_PROGRESS 20 200 2.000\r\n\
+echo GOOSY_PROGRESS 30 200 3.000\r\n\
+echo GOOSY_PROGRESS 40 200 4.000\r\n\
+echo GOOSY_PROGRESS 90 200 5.000\r\n\
+echo GOOSY_PROGRESS 140 200 6.000\r\n",
+            )
+            .unwrap();
+            path
+        } else {
+            let path = dir.path().join("mock-worker.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\n\
+printf 'GOOSY_PROGRESS 10 200 1.000\\n'\n\
+printf 'GOOSY_PROGRESS 20 200 2.000\\n'\n\
+printf 'GOOSY_PROGRESS 30 200 3.000\\n'\n\
+printf 'GOOSY_PROGRESS 40 200 4.000\\n'\n\
+printf 'GOOSY_PROGRESS 90 200 5.000\\n'\n\
+printf 'GOOSY_PROGRESS 140 200 6.000\\n'\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        };
+
+        let mut model = Model::new().unwrap();
+        model.manager = TaskManager::with_worker_executable(script).unwrap();
+        let id = model
+            .manager
+            .enqueue(
+                RenderOptions::new(dir.path().join("song.wav"), dir.path().join("out.mp4")),
+                1,
+            )
+            .unwrap();
+        model.selected_task = Some(id);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let task = model.task_json();
+            if task["state"] == "completed" {
+                let fps = task["fps"].as_f64().expect("task_json must expose fps");
+                assert!(
+                    (fps - 50.0).abs() < 1e-6,
+                    "expected 2s windowed 50.0 FPS (not cumulative 23.3), got {fps}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mock worker did not finish in time: {task}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Verify pause/resume resets the 2s window and excludes paused duration.
+        let pause_script = if cfg!(windows) {
+            let path = dir.path().join("mock-pause-worker.cmd");
+            std::fs::write(
+                &path,
+                "@echo off\r\n\
+echo GOOSY_PROGRESS 20 200 2.000\r\n\
+echo GOOSY_CONTROL paused\r\n\
+echo GOOSY_CONTROL resumed\r\n\
+echo GOOSY_PROGRESS 21 200 12.025\r\n\
+echo GOOSY_PROGRESS 61 200 13.025\r\n",
+            )
+            .unwrap();
+            path
+        } else {
+            let path = dir.path().join("mock-pause-worker.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\n\
+printf 'GOOSY_PROGRESS 20 200 2.000\\n'\n\
+printf 'GOOSY_CONTROL paused\\n'\n\
+printf 'GOOSY_CONTROL resumed\\n'\n\
+printf 'GOOSY_PROGRESS 21 200 12.025\\n'\n\
+printf 'GOOSY_PROGRESS 61 200 13.025\\n'\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        };
+
+        model.manager = TaskManager::with_worker_executable(pause_script).unwrap();
+        let paused_id = model
+            .manager
+            .enqueue(
+                RenderOptions::new(dir.path().join("song.wav"), dir.path().join("out2.mp4")),
+                1,
+            )
+            .unwrap();
+        model.selected_task = Some(paused_id);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let task = model.task_json();
+            if task["state"] == "completed" {
+                let fps = task["fps"].as_f64().expect("task_json must expose fps");
+                assert!(
+                    (fps - 40.0).abs() < 1e-6,
+                    "pause duration must not drag down resumed 2s FPS, got {fps}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mock pause worker did not finish in time: {task}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn recent_tasks_sorted_by_activity_capped_at_twenty_with_thumbnails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cover_path = dir.path().join("cover.png");
+        std::fs::write(&cover_path, b"stub").unwrap();
+        let mut model = Model::new().unwrap();
+        // Use a non-existent worker executable that stays blocked or fails cleanly?
+        // Better: use a paused/non-starting worker? Actually, if we enqueue 25 tasks with a slow mock worker
+        // that stays running on task 0, tasks 1..24 stay Queued deterministically!
+        let slow_worker = if cfg!(windows) {
+            let path = dir.path().join("hold-worker.cmd");
+            std::fs::write(&path, "@echo off\r\nset /p _hold=\r\n").unwrap();
+            path
+        } else {
+            let path = dir.path().join("hold-worker.sh");
+            std::fs::write(&path, "#!/bin/sh\nread _hold\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        };
+        model.manager = TaskManager::with_worker_executable(slow_worker).unwrap();
+
+        let mut ids = Vec::new();
+        for index in 0..24 {
+            let mut options = RenderOptions::new(
+                dir.path().join("song.wav"),
+                dir.path().join(format!("out-{index}.mp4")),
+            );
+            options.title = Some(format!("Task {index}"));
+            if index == 2 {
+                options.cover = Some(cover_path.clone());
+            }
+            ids.push(model.manager.enqueue(options, 1).unwrap());
+        }
+
+        // Wait until task 0 starts so tasks 1..23 remain queued.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while model.manager.tasks()[0].state == libgoosy::task_manager::TaskState::Queued {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Cancel older queued task 2: its activity seq becomes the newest!
+        model.command(&format!("cancel:{}", ids[2]));
+        // Add cached preview for task 3 to verify image://goosy/task/<id>/... thumbnail URL.
+        model.preview_cache.push_back((
+            ids[3],
+            libgoosy::task_manager::RgbaFrame {
+                width: 1,
+                height: 1,
+                pixels: vec![255, 0, 0, 255],
+            },
+        ));
+
+        let json = model.task_json();
+        let recent = json["recentTasks"]
+            .as_array()
+            .expect("recentTasks array must be present");
+        assert_eq!(recent.len(), MAX_RECENT_TASKS);
+        assert_eq!(
+            recent[0]["id"].as_str(),
+            Some(ids[2].to_string().as_str()),
+            "most recently updated task must appear first in recentTasks"
+        );
+        assert!(
+            recent[0]["thumbnail"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("file:///"),
+            "task with cover image file must expose file URL thumbnail"
+        );
+        // Verify strictly descending lastActivitySeq across recentTasks.
+        let seqs: Vec<u64> = recent
+            .iter()
+            .map(|item| item["lastActivitySeq"].as_u64().unwrap())
+            .collect();
+        assert!(seqs.windows(2).all(|pair| pair[0] > pair[1]));
+
+        // Task 3 has a cached preview frame -> check in full tasks array.
+        let task3 = json["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"].as_str() == Some(ids[3].to_string().as_str()))
+            .unwrap();
+        assert_eq!(
+            task3["thumbnail"].as_str(),
+            Some(format!("image://goosy/task/{}/0", ids[3]).as_str())
         );
     }
 }

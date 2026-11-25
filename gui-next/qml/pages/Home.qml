@@ -4,6 +4,8 @@ import QtQuick.Layouts
 import RinUI
 import "qrc:/rinui/RinUI/animations" as RinAnimations
 import "../components"
+import "../js/ui.js" as Ui
+import "../js/mock_recent_tasks.js" as MockRecentTasks
 
 Controls.Page {
     id: page
@@ -19,6 +21,101 @@ Controls.Page {
     property int navigationDirection: 1
     property string navigationAction: ""
     property int navigationTarget: 0
+
+    // Responsive breakpoint matching Fluent compact/medium threshold (content width < 720px stacks vertically).
+    readonly property real narrowBreakpoint: 720
+    readonly property bool isNarrow: page.width < narrowBreakpoint
+
+    // Optional preview hooks (empty / -1 use live Backend data and system local hour).
+    property string mockPreset: ""
+    property int greetingHour: -1
+    property string greeting: Ui.greetingText(greetingHour)
+
+    readonly property var recentSource: {
+        var mock = MockRecentTasks.preset(page.mockPreset)
+        if (mock !== null)
+            return mock
+        return page.task.recentTasks || page.task.tasks || []
+    }
+
+    ListModel {
+        id: recentRows
+    }
+
+    function syncRecentRows() {
+        var snapshot = page.recentSource || []
+        var maxCount = Math.min(snapshot.length, 20)
+        var keepIds = {}
+        for (var k = 0; k < maxCount; ++k)
+            keepIds[String(snapshot[k].id || "")] = true
+        for (var r = recentRows.count - 1; r >= 0; --r) {
+            if (!keepIds[recentRows.get(r).taskId])
+                recentRows.remove(r)
+        }
+        for (var i = 0; i < maxCount; ++i) {
+            var item = snapshot[i]
+            var itemCfg = item.config || {}
+            var values = {
+                taskId: String(item.id || ""),
+                title: String(item.title || ""),
+                taskState: String(item.state || "idle"),
+                done: Number(item.done) || 0,
+                total: Number(item.total) || 0,
+                outputWidth: Number(itemCfg.width) || 0,
+                outputHeight: Number(itemCfg.height) || 0,
+                outputFps: Number(itemCfg.fps) || 0,
+                codec: String(itemCfg.codec || ""),
+                thumbnail: String(item.thumbnail || ""),
+                detail: String(item.detail || "")
+            }
+            var existing = -1
+            for (var j = i; j < recentRows.count; ++j) {
+                if (recentRows.get(j).taskId === values.taskId) {
+                    existing = j
+                    break
+                }
+            }
+            if (existing < 0) {
+                recentRows.insert(i, values)
+            } else {
+                if (existing !== i)
+                    recentRows.move(existing, i, 1)
+                var row = recentRows.get(i)
+                for (var key in values) {
+                    if (row[key] !== values[key])
+                        recentRows.setProperty(i, key, values[key])
+                }
+            }
+        }
+    }
+
+    function openTasksPage() {
+        var win = Controls.ApplicationWindow.window
+        if (win && win.navigationView) {
+            win.navigationView.push(Qt.resolvedUrl("Tasks.qml"))
+        }
+    }
+
+    function openTaskDetail(taskId) {
+        if (taskId && !page.mockPreset) {
+            Backend.command("select:" + taskId)
+        }
+        openTasksPage()
+    }
+
+    onRecentSourceChanged: syncRecentRows()
+    onGreetingHourChanged: page.greeting = Ui.greetingText(page.greetingHour)
+    Component.onCompleted: {
+        page.greeting = Ui.greetingText(page.greetingHour)
+        syncRecentRows()
+    }
+
+    Timer {
+        interval: 60000
+        repeat: true
+        running: page.greetingHour < 0
+        onTriggered: page.greeting = Ui.greetingText(page.greetingHour)
+    }
 
     function navigate(target, action) {
         if (navigating || (target === step && !action)) return
@@ -58,28 +155,247 @@ Controls.Page {
             }
         }
     }
-    padding: 28
+    padding: 48
 
-    ColumnLayout {
-        anchors.centerIn: parent
-        width: Math.min(parent.width - 80, 660)
+    Flickable {
+        id: workbenchScroll
+        objectName: "homeWorkbenchScroll"
+        anchors.fill: parent
         visible: !page.wizard.active
-        spacing: 18
-        Text { text: "Goosy"; typography: Typography.Display }
-        Text {
-            Layout.fillWidth: true
-            text: qsTr("音乐与歌词视频渲染工具")
-            color: Theme.currentTheme.colors.textSecondaryColor
-            wrapMode: Text.WordWrap
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        contentWidth: width
+        contentHeight: page.isNarrow ? (workbenchGrid.implicitHeight + 6) : height
+        interactive: page.isNarrow
+        Controls.ScrollBar.vertical: ScrollBar {
+            id: workbenchVScroll
+            policy: page.isNarrow ? Controls.ScrollBar.AsNeeded : Controls.ScrollBar.AlwaysOff
         }
-        Button {
-            objectName: "beginWizardButton"
-            text: qsTr("创建任务")
-            Controls.ToolTip.visible: hovered
-            Controls.ToolTip.text: qsTr("草稿仅保留于本次会话")
-            highlighted: true
-            icon.name: "ic_fluent_add_20_regular"
-            onClicked: Backend.command("wizardBegin")
+
+        GridLayout {
+            id: workbenchGrid
+            objectName: "homeWorkbenchGrid"
+            x: 3
+            y: 3
+            width: Math.max(0, workbenchScroll.width - 6 - (page.isNarrow && workbenchVScroll.visible ? 12 : 0))
+            height: page.isNarrow ? implicitHeight : Math.max(0, workbenchScroll.height - 6)
+            columns: page.isNarrow ? 1 : 2
+            columnSpacing: 48
+            rowSpacing: 28
+
+            ColumnLayout {
+                id: leftColumn
+                objectName: "homeLeftColumn"
+                Layout.fillWidth: true
+                Layout.fillHeight: !page.isNarrow
+                Layout.alignment: page.isNarrow ? Qt.AlignTop : Qt.AlignVCenter
+                Layout.minimumWidth: 0
+                Layout.preferredWidth: page.isNarrow
+                    ? workbenchGrid.width
+                    : Math.max(0, (workbenchGrid.width - workbenchGrid.columnSpacing) * 0.4)
+                spacing: 0
+
+                Item {
+                    Layout.fillHeight: true
+                    visible: !page.isNarrow
+                }
+
+                Text {
+                    id: greetingTitle
+                    objectName: "homeGreetingTitle"
+                    Layout.fillWidth: true
+                    text: page.greeting
+                    typography: Typography.TitleLarge
+                    color: Theme.currentTheme.colors.textColor
+                    wrapMode: Text.WordWrap
+                }
+
+                Text {
+                    id: greetingSubtitle
+                    objectName: "homeGreetingSubtitle"
+                    Layout.fillWidth: true
+                    Layout.topMargin: 6
+                    text: qsTr("准备好创作下一支视频了吗？")
+                    typography: Typography.Body
+                    color: Theme.currentTheme.colors.textSecondaryColor
+                    wrapMode: Text.WordWrap
+                }
+
+                Text {
+                    objectName: "quickStartHeading"
+                    Layout.fillWidth: true
+                    Layout.topMargin: 28
+                    text: qsTr("快速开始")
+                    typography: Typography.BodyStrong
+                    color: Theme.currentTheme.colors.textColor
+                }
+
+                QuickStartCard {
+                    id: quickStartCard
+                    objectName: "beginWizardButton"
+                    Layout.fillWidth: true
+                    Layout.topMargin: 10
+                    title: qsTr("创建渲染任务")
+                    description: qsTr("导入音频、歌词与样式")
+                    Controls.ToolTip.visible: hovered
+                    Controls.ToolTip.delay: 600
+                    Controls.ToolTip.text: qsTr("草稿仅保留于本次会话")
+                    onClicked: Backend.command("wizardBegin")
+                }
+
+                Item {
+                    Layout.fillHeight: true
+                    visible: !page.isNarrow
+                }
+            }
+
+            ColumnLayout {
+                id: rightColumn
+                objectName: "homeRightColumn"
+                Layout.fillWidth: true
+                Layout.fillHeight: !page.isNarrow
+                Layout.alignment: Qt.AlignTop
+                Layout.minimumWidth: 0
+                Layout.preferredWidth: page.isNarrow
+                    ? workbenchGrid.width
+                    : Math.max(0, (workbenchGrid.width - workbenchGrid.columnSpacing) * 0.6)
+                spacing: 0
+
+                Item {
+                    Layout.fillHeight: true
+                    visible: !page.isNarrow && recentRows.count > 0
+                }
+
+                ListView {
+                    id: recentTaskList
+                    objectName: "recentTaskList"
+                    Layout.fillWidth: true
+                    Layout.fillHeight: false
+                    Layout.preferredHeight: {
+                        var total = Math.max(0, contentHeight + topMargin + bottomMargin)
+                        if (page.isNarrow)
+                            return total
+                        return Math.min(Math.max(0, workbenchScroll.height - 6), total)
+                    }
+                    visible: recentRows.count > 0
+                    clip: true
+                    spacing: 8
+                    topMargin: 3
+                    bottomMargin: 3
+                    boundsBehavior: Flickable.StopAtBounds
+                    interactive: !page.isNarrow
+                    cacheBuffer: Math.max(2000, count * 120)
+                    activeFocusOnTab: false
+                    verticalScrollBar.policy: page.isNarrow ? Controls.ScrollBar.AlwaysOff : Controls.ScrollBar.AsNeeded
+                    model: recentRows
+
+                    delegate: RecentTaskItem {
+                        id: recentDelegate
+                        required property var model
+                        required property int index
+
+                        taskId: model.taskId
+                        title: model.title
+                        taskState: model.taskState
+                        done: model.done
+                        total: model.total
+                        outputWidth: model.outputWidth
+                        outputHeight: model.outputHeight
+                        outputFps: model.outputFps
+                        codec: model.codec
+                        thumbnail: model.thumbnail
+                        detail: model.detail
+
+                        x: 3
+                        width: Math.max(0, recentTaskList.width - 6 - (!page.isNarrow && recentTaskList.verticalScrollBar.visible ? 12 : 0))
+                        onClicked: page.openTaskDetail(recentDelegate.taskId)
+
+                        Keys.onUpPressed: function(event) {
+                            if (index > 0) {
+                                recentTaskList.positionViewAtIndex(index - 1, ListView.Contain)
+                                var prev = recentTaskList.itemAtIndex(index - 1)
+                                if (prev)
+                                    prev.forceActiveFocus(Qt.TabFocusReason)
+                            }
+                            event.accepted = true
+                        }
+                        Keys.onDownPressed: function(event) {
+                            if (index + 1 < recentTaskList.count) {
+                                recentTaskList.positionViewAtIndex(index + 1, ListView.Contain)
+                                var next = recentTaskList.itemAtIndex(index + 1)
+                                if (next)
+                                    next.forceActiveFocus(Qt.TabFocusReason)
+                            }
+                            event.accepted = true
+                        }
+                    }
+                }
+
+                Item {
+                    Layout.fillHeight: true
+                    visible: !page.isNarrow && recentRows.count > 0
+                }
+
+                Item {
+                    id: emptyState
+                    objectName: "recentTasksEmptyState"
+                    Layout.fillWidth: true
+                    Layout.fillHeight: !page.isNarrow
+                    Layout.minimumHeight: 240
+                    visible: recentRows.count === 0
+
+                    ColumnLayout {
+                        anchors.centerIn: parent
+                        width: Math.min(parent.width - 24, 340)
+                        spacing: 10
+
+                        Icon {
+                            Layout.alignment: Qt.AlignHCenter
+                            name: "ic_fluent_movies_and_tv_20_regular"
+                            size: 36
+                            color: Theme.currentTheme.colors.textSecondaryColor
+                            opacity: 0.7
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            horizontalAlignment: Text.AlignHCenter
+                            text: qsTr("还没有渲染任务")
+                            typography: Typography.BodyStrong
+                            color: Theme.currentTheme.colors.textColor
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            horizontalAlignment: Text.AlignHCenter
+                            text: qsTr("创建第一个渲染任务后，进度与历史记录将显示在这里")
+                            typography: Typography.Caption
+                            color: Theme.currentTheme.colors.textSecondaryColor
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Button {
+                            id: emptyCreateButton
+                            objectName: "emptyStateCreateButton"
+                            Layout.alignment: Qt.AlignHCenter
+                            Layout.topMargin: 6
+                            highlighted: false
+                            text: qsTr("开始创建")
+                            icon.name: "ic_fluent_add_20_regular"
+                            focusPolicy: Qt.StrongFocus
+                            onClicked: Backend.command("wizardBegin")
+                            Keys.onReturnPressed: function(event) {
+                                click()
+                                event.accepted = true
+                            }
+                            Keys.onEnterPressed: function(event) {
+                                click()
+                                event.accepted = true
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

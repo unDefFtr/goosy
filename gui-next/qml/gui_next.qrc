@@ -6,10 +6,13 @@
         <file>pages/Settings.qml</file>
         <file>components/NumberField.qml</file>
         <file>components/PreviewPanel.qml</file>
+        <file>components/QuickStartCard.qml</file>
+        <file>components/RecentTaskItem.qml</file>
         <file>components/TaskPreview.qml</file>
         <file>components/SectionCard.qml</file>
         <file>components/SettingsPanel.qml</file>
         <file>components/SliderRow.qml</file>
+        <file>js/mock_recent_tasks.js</file>
         <file>js/ui.js</file>
     </qresource>
 </RCC>

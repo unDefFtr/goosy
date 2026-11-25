@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QImage>
+#include <QString>
 #include <memory>
 
 class QQmlApplicationEngine;
@@ -13,6 +14,7 @@ class PreviewImages {
 public:
     explicit PreviewImages(std::shared_ptr<PreviewState> state);
     void set(bool style, const QImage &image) const;
+    void set_task(const QString &id, const QImage &image) const;
     void install(QQmlApplicationEngine &engine) const;
 
 private:

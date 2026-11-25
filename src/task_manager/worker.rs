@@ -1,6 +1,7 @@
 use super::{Control, RgbaFrame};
 use crate::RenderOptions;
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -23,10 +24,66 @@ pub(super) enum Terminal {
     Failed(String),
 }
 
+const FPS_WINDOW_SECS: f64 = 2.0;
+
+struct FpsWindow {
+    samples: VecDeque<(u64, f64)>,
+}
+
+impl FpsWindow {
+    fn new() -> Self {
+        let mut samples = VecDeque::new();
+        samples.push_back((0, 0.0));
+        Self { samples }
+    }
+
+    fn reset(&mut self) {
+        self.samples.clear();
+    }
+
+    fn record(&mut self, done: u64, elapsed: f64) -> f64 {
+        if !elapsed.is_finite() || elapsed < 0.0 {
+            return 0.0;
+        }
+        if let Some(&(prev_done, prev_elapsed)) = self.samples.back() {
+            if done < prev_done || elapsed < prev_elapsed {
+                self.samples.clear();
+                self.samples.push_back((done, elapsed));
+            } else if prev_elapsed == elapsed && prev_done > 0 {
+                if let Some(back) = self.samples.back_mut() {
+                    back.0 = done;
+                }
+            } else {
+                self.samples.push_back((done, elapsed));
+            }
+        } else {
+            self.samples.push_back((done, elapsed));
+        }
+
+        let cutoff = elapsed - FPS_WINDOW_SECS + 1e-9;
+        while self.samples.len() > 2 && self.samples[1].1 <= cutoff {
+            self.samples.pop_front();
+        }
+
+        let (Some(&(old_done, old_elapsed)), Some(&(new_done, new_elapsed))) =
+            (self.samples.front(), self.samples.back())
+        else {
+            return 0.0;
+        };
+        let dt = new_elapsed - old_elapsed;
+        if dt <= 0.0 || new_done <= old_done {
+            return 0.0;
+        }
+        let fps = (new_done - old_done) as f64 / dt;
+        if fps.is_finite() { fps } else { 0.0 }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Update {
     pub stage: Option<String>,
     pub progress: Option<(u64, u64, f64)>,
+    pub fps: Option<f64>,
     pub preview: Option<(u64, RgbaFrame)>,
     pub paused: Option<bool>,
     pub terminal: Option<Terminal>,
@@ -277,6 +334,7 @@ fn supervise(
 fn read_stdout(stdout: impl Read, directory: &Path, feed: &Mutex<Feed>) -> std::io::Result<()> {
     let mut reader = BufReader::new(stdout);
     let mut bytes = Vec::new();
+    let mut fps_window = FpsWindow::new();
     while reader.read_until(b'\n', &mut bytes)? != 0 {
         let line = String::from_utf8_lossy(&bytes);
         let mut fields = line.split_whitespace();
@@ -294,8 +352,11 @@ fn read_stdout(stdout: impl Read, directory: &Path, feed: &Mutex<Feed>) -> std::
                         fields.next()?.parse().ok()?,
                     ))
                 })();
-                if let Some(progress) = progress {
-                    feed.lock().unwrap().pending.progress = Some(progress);
+                if let Some((done, total, elapsed)) = progress {
+                    let fps = fps_window.record(done, elapsed);
+                    let mut feed = feed.lock().unwrap();
+                    feed.pending.progress = Some((done, total, elapsed));
+                    feed.pending.fps = Some(fps);
                 }
             }
             Some("GOOSY_PREVIEW") => {
@@ -317,8 +378,15 @@ fn read_stdout(stdout: impl Read, directory: &Path, feed: &Mutex<Feed>) -> std::
             Some("GOOSY_CONTROL") => {
                 let mut feed = feed.lock().unwrap();
                 match fields.next() {
-                    Some("paused") => feed.pending.paused = Some(true),
-                    Some("resumed") => feed.pending.paused = Some(false),
+                    Some("paused") => {
+                        fps_window.reset();
+                        feed.pending.paused = Some(true);
+                        feed.pending.fps = Some(0.0);
+                    }
+                    Some("resumed") => {
+                        fps_window.reset();
+                        feed.pending.paused = Some(false);
+                    }
                     Some("cancelled") => feed.cancelled = true,
                     _ => {}
                 }
@@ -361,5 +429,97 @@ fn read_stderr(mut stderr: impl Read, feed: &Mutex<Feed>) -> std::io::Result<()>
         tail.drain(..discard);
         tail.extend_from_slice(&chunk[..len]);
         feed.lock().unwrap().pending.log = Some(String::from_utf8_lossy(&tail).into_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn fps_window_tracks_recent_two_seconds() {
+        let mut window = FpsWindow::new();
+        // First 4 seconds at 10 FPS (1 frame every 0.1s).
+        for frame in 1..=40 {
+            let elapsed = frame as f64 * 0.1;
+            let fps = window.record(frame, elapsed);
+            assert!(
+                (fps - 10.0).abs() < 1e-6,
+                "frame {frame} at {elapsed:.3}s: expected 10.0 FPS, got {fps}"
+            );
+        }
+        // Next 2 seconds at 50 FPS (5 frames every 0.1s -> 1 frame every 0.02s).
+        let mut last_fps = 0.0;
+        for step in 1..=100 {
+            let done = 40 + step;
+            let elapsed = 4.0 + step as f64 * 0.02;
+            last_fps = window.record(done, elapsed);
+            if step == 50 {
+                // At t = 5.0s, window [3.0, 5.0] has 10 frames (3..4s) + 50 frames (4..5s) = 30 FPS.
+                assert!(
+                    (last_fps - 30.0).abs() < 1e-6,
+                    "at t=5.0s expected 30.0 FPS, got {last_fps}"
+                );
+            }
+        }
+        // At t = 6.0s, window [4.0, 6.0] is purely 50 FPS.
+        assert!(
+            (last_fps - 50.0).abs() < 1e-6,
+            "at t=6.0s expected 50.0 FPS, got {last_fps}"
+        );
+    }
+
+    #[test]
+    fn fps_window_handles_slow_and_sub_millisecond_frames() {
+        let mut slow = FpsWindow::new();
+        assert!((slow.record(1, 3.0) - (1.0 / 3.0)).abs() < 1e-9);
+        assert!((slow.record(2, 6.0) - (1.0 / 3.0)).abs() < 1e-9);
+
+        let mut fast = FpsWindow::new();
+        assert_eq!(fast.record(1, 0.0), 0.0);
+        assert_eq!(fast.record(2, 0.0), 0.0);
+        assert!((fast.record(3, 0.001) - 3000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn read_stdout_resets_fps_window_across_pause_and_resume() {
+        let feed = Mutex::new(Feed::default());
+        let dir = tempfile::tempdir().unwrap();
+
+        let before_pause = "GOOSY_PROGRESS 10 100 1.000\nGOOSY_PROGRESS 20 100 2.000\n";
+        read_stdout(Cursor::new(before_pause), dir.path(), &feed).unwrap();
+        let fps = feed.lock().unwrap().pending.fps.unwrap();
+        assert!((fps - 10.0).abs() < 1e-6);
+
+        let stream = "\
+GOOSY_PROGRESS 10 100 1.000\n\
+GOOSY_PROGRESS 20 100 2.000\n\
+GOOSY_CONTROL paused\n";
+        let paused_feed = Mutex::new(Feed::default());
+        read_stdout(Cursor::new(stream), dir.path(), &paused_feed).unwrap();
+        {
+            let pending = &paused_feed.lock().unwrap().pending;
+            assert_eq!(pending.paused, Some(true));
+            assert_eq!(pending.fps, Some(0.0));
+        }
+
+        // Pause lasts 10 seconds (2.0s -> 12.0s), then resumes at 50 FPS.
+        let resumed_stream = "\
+GOOSY_PROGRESS 10 100 1.000\n\
+GOOSY_PROGRESS 20 100 2.000\n\
+GOOSY_CONTROL paused\n\
+GOOSY_CONTROL resumed\n\
+GOOSY_PROGRESS 21 100 12.020\n\
+GOOSY_PROGRESS 71 100 13.020\n";
+        let resumed_feed = Mutex::new(Feed::default());
+        read_stdout(Cursor::new(resumed_stream), dir.path(), &resumed_feed).unwrap();
+        let pending = &resumed_feed.lock().unwrap().pending;
+        assert_eq!(pending.paused, Some(false));
+        assert!(
+            (pending.fps.unwrap() - 50.0).abs() < 1e-6,
+            "pause duration must not drag down resumed FPS, got {:?}",
+            pending.fps
+        );
     }
 }

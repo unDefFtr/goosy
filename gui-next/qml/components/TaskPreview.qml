@@ -12,25 +12,17 @@ ColumnLayout {
     property int mode: 0
     readonly property bool actual: mode === 0
     readonly property string source: actual ? renderSource : styleSource
-    readonly property real imageWidth: Math.min(width, maximumImageHeight * 16 / 9)
+    readonly property real aspect: {
+        var c = (task && task.config) || {};
+        return (c.width > 0 && c.height > 0) ? c.width / c.height : 16 / 9;
+    }
+    readonly property real imageWidth: Math.min(width, maximumImageHeight * aspect)
     spacing: 8
     onModeChanged: if (modes.currentIndex !== mode)
         modes.currentIndex = mode
 
     RowLayout {
         Layout.fillWidth: true
-        Text {
-            Layout.fillWidth: true
-            text: root.actual ? qsTr("任务画面 · #%1").arg(root.task.id || "") : qsTr("当前样式")
-            typography: Typography.BodyStrong
-            elide: Text.ElideRight
-        }
-        Text {
-            visible: root.actual && Number(root.task.previewFrame) > 0 && !!root.renderSource
-            text: qsTr("第 %1 帧").arg(root.task.previewFrame || 0)
-            typography: Typography.Caption
-            color: Theme.currentTheme.colors.textSecondaryColor
-        }
         Segmented {
             id: modes
             objectName: "taskPreviewModes"
@@ -45,13 +37,16 @@ ColumnLayout {
                 icon.name: "ic_fluent_image_20_regular"
             }
         }
+        Item {
+            Layout.fillWidth: true
+        }
     }
 
     Frame {
         id: viewport
         objectName: "taskPreviewViewport"
         Layout.preferredWidth: root.imageWidth
-        Layout.preferredHeight: root.imageWidth * 9 / 16
+        Layout.preferredHeight: root.imageWidth / root.aspect
         Layout.alignment: Qt.AlignHCenter
         hoverable: false
         padding: 0
@@ -83,6 +78,16 @@ ColumnLayout {
             wrapMode: Text.WordWrap
             color: Theme.currentTheme.colors.textSecondaryColor
         }
+    }
+
+    Text {
+        Layout.preferredWidth: root.imageWidth
+        Layout.alignment: Qt.AlignHCenter
+        visible: root.actual && Number(root.task.previewFrame) > 0 && !!root.renderSource
+        text: qsTr("第 %1 帧").arg(root.task.previewFrame || 0)
+        typography: Typography.Caption
+        color: Theme.currentTheme.colors.textSecondaryColor
+        horizontalAlignment: Text.AlignLeft
     }
     Text {
         Layout.fillWidth: true

@@ -24,6 +24,7 @@ pub mod ffi {
         fn make_preview_images() -> UniquePtr<PreviewImages>;
         fn install(self: &PreviewImages, engine: Pin<&mut QQmlApplicationEngine>);
         fn set(self: &PreviewImages, style: bool, image: &QImage);
+        fn set_task(self: &PreviewImages, id: &QString, image: &QImage);
     }
 
     extern "RustQt" {
@@ -122,6 +123,7 @@ impl ffi::Backend {
             task,
             style,
             render,
+            task_thumbnails,
         }) = (|| {
             let mut rust = self.as_mut().rust_mut();
             let model = rust.model.as_deref_mut()?;
@@ -131,6 +133,7 @@ impl ffi::Backend {
         else {
             return;
         };
+        self.as_mut().update_task_thumbnails(task_thumbnails);
         if let Some(project) = project {
             self.as_mut().rust_mut().project_json = QString::from(project.as_str());
             self.as_mut().project_json_changed();
@@ -143,15 +146,15 @@ impl ffi::Backend {
         self.update_image(false, render);
     }
 
-    fn update_image(mut self: Pin<&mut Self>, style: bool, update: FrameUpdate) {
-        let image = match update {
-            FrameUpdate::Keep => return,
-            FrameUpdate::Clear => QImage::default(),
+    fn frame_to_qimage(update: FrameUpdate) -> Option<QImage> {
+        match update {
+            FrameUpdate::Keep => None,
+            FrameUpdate::Clear => Some(QImage::default()),
             FrameUpdate::Replace(frame) => {
                 let (Ok(width), Ok(height)) =
                     (i32::try_from(frame.width), i32::try_from(frame.height))
                 else {
-                    return;
+                    return None;
                 };
                 if width <= 0
                     || height <= 0
@@ -160,19 +163,42 @@ impl ffi::Backend {
                         .and_then(|stride| stride.checked_mul(height as usize))
                         != Some(frame.pixels.len())
                 {
-                    return;
+                    return None;
                 }
                 // SAFETY: packed RGBA8888, 4-byte-aligned scanlines. Qt owns the Vec until
                 // the last implicitly shared QImage goes away, including image provider copies.
-                unsafe {
+                Some(unsafe {
                     QImage::from_raw_bytes(
                         frame.pixels,
                         width,
                         height,
                         QImageFormat::Format_RGBA8888_Premultiplied,
                     )
-                }
+                })
             }
+        }
+    }
+
+    fn update_task_thumbnails(
+        mut self: Pin<&mut Self>,
+        updates: Vec<(String, FrameUpdate)>,
+    ) {
+        if updates.is_empty() {
+            return;
+        }
+        let rust = self.as_mut().rust_mut();
+        let Some(images) = &rust.images else { return };
+        for (id, update) in updates {
+            let Some(image) = Self::frame_to_qimage(update) else {
+                continue;
+            };
+            images.set_task(&QString::from(id.as_str()), &image);
+        }
+    }
+
+    fn update_image(mut self: Pin<&mut Self>, style: bool, update: FrameUpdate) {
+        let Some(image) = Self::frame_to_qimage(update) else {
+            return;
         };
         let mut rust = self.as_mut().rust_mut();
         let Some(images) = &rust.images else { return };

@@ -24,6 +24,7 @@ pub struct Snapshot {
     pub task: Option<String>,
     pub style: FrameUpdate,
     pub render: FrameUpdate,
+    pub task_thumbnails: Vec<(String, FrameUpdate)>,
 }
 
 pub trait ViewModel {

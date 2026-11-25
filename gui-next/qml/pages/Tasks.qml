@@ -46,7 +46,8 @@ Controls.Page {
                 done: Number(task.done) || 0,
                 total: Number(task.total) || 0,
                 elapsed: Number(task.elapsed) || 0,
-                output: String(task.output || "")
+                output: String(task.output || ""),
+                detail: String(task.detail || "")
             };
             var rowIndex = indexFor(values.taskId);
             if (rowIndex < 0) {
@@ -166,6 +167,7 @@ Controls.Page {
                         event.accepted = true
                     }
                     delegate: ListViewDelegate {
+                        id: taskCard
                         required property string taskId
                         required property string title
                         required property string taskState
@@ -173,60 +175,104 @@ Controls.Page {
                         required property real total
                         required property real elapsed
                         required property string output
+                        required property string detail
                         required property int index
+                        readonly property bool isCompleted: taskState === "completed" || taskState === "done"
+                        readonly property bool isFailed: taskState === "failed"
+                        readonly property real percentWidth: Math.ceil(Math.max(percentMetrics.width, percentMetrics.advanceWidth))
                         width: queue.width
-                        height: contentItem.implicitHeight + topPadding + bottomPadding + 20
+                        topPadding: 10
+                        bottomPadding: 10
+                        leftPadding: 16
+                        rightPadding: 12
+                        height: contentItem.implicitHeight + topPadding + bottomPadding
                         highlighted: taskId === String(page.task.selectedId || "")
                         keyboardNavigation: queue.keyboardNavigation && highlighted
                         focusPolicy: Qt.StrongFocus
                         Accessible.name: title + "，" + Ui.stateLabel(taskState)
+
+                        TextMetrics {
+                            id: percentMetrics
+                            font: percentLabel.font
+                            text: Ui.progressPercent(1, 1)
+                        }
+
+                        ToolTip {
+                            id: stateTip
+                            visible: taskCard.hovered && !pathTip.visible
+                            text: Ui.stateLabel(taskCard.taskState)
+                        }
+
                         contentItem: ColumnLayout {
-                            spacing: 3
+                            spacing: 6
+
                             RowLayout {
                                 Layout.fillWidth: true
+                                spacing: 6
+
+                                Icon {
+                                    size: 16
+                                    name: Ui.stateIcon(taskCard.taskState)
+                                    color: Ui.stateColor(taskCard.taskState, Theme.currentTheme.colors)
+                                    Layout.alignment: Qt.AlignVCenter
+                                }
+
                                 Text {
                                     Layout.fillWidth: true
-                                    text: "#" + taskId + "  " + title
+                                    Layout.alignment: Qt.AlignVCenter
+                                    text: taskCard.title
                                     typography: Typography.BodyStrong
                                     elide: Text.ElideRight
+                                    maximumLineCount: 1
+                                    wrapMode: Text.NoWrap
+                                    verticalAlignment: Text.AlignVCenter
                                 }
+
                                 Text {
-                                    text: Ui.stateLabel(taskState)
-                                    color: Ui.stateColor(taskState, Theme.currentTheme.colors)
-                                    typography: Typography.Caption
-                                }
-                            }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                visible: total > 0
-                                ProgressBar {
-                                    Layout.fillWidth: true
-                                    from: 0
-                                    to: 1
-                                    value: Ui.progressValue(done, total)
-                                    state: taskState === "failed" ? ProgressBar.Error : taskState === "paused" ? ProgressBar.Paused : ProgressBar.Running
-                                }
-                                Text {
-                                    text: Ui.progressPercent(done, total) + " · " + Ui.formatFps(done, elapsed)
+                                    id: percentLabel
+                                    Layout.alignment: Qt.AlignVCenter
+                                    Layout.preferredWidth: taskCard.percentWidth
+                                    Layout.minimumWidth: taskCard.percentWidth
+                                    Layout.maximumWidth: taskCard.percentWidth
+                                    text: Ui.progressPercent(taskCard.done, taskCard.total)
                                     typography: Typography.Caption
                                     color: Theme.currentTheme.colors.textSecondaryColor
+                                    horizontalAlignment: Text.AlignRight
+                                    verticalAlignment: Text.AlignVCenter
+                                    maximumLineCount: 1
+                                    wrapMode: Text.NoWrap
                                 }
                             }
+
+                            ProgressBar {
+                                Layout.fillWidth: true
+                                from: 0
+                                to: 1
+                                value: Ui.progressValue(taskCard.done, taskCard.total)
+                                state: taskCard.isFailed ? ProgressBar.Error : taskCard.taskState === "paused" ? ProgressBar.Paused : ProgressBar.Running
+                                opacity: taskCard.isCompleted ? 0 : 1
+                            }
+
                             Text {
                                 Layout.fillWidth: true
-                                text: output.split(/[\\/]/).pop()
+                                text: taskCard.isFailed
+                                    ? (taskCard.detail ? taskCard.detail.replace(/[\r\n]+/g, " ").trim() : qsTr("渲染失败"))
+                                    : taskCard.output.split(/[\\/]/).pop()
                                 typography: Typography.Caption
-                                color: Theme.currentTheme.colors.textSecondaryColor
-                                elide: Text.ElideMiddle
+                                color: taskCard.isFailed
+                                    ? Theme.currentTheme.colors.systemCriticalColor
+                                    : Theme.currentTheme.colors.textSecondaryColor
+                                elide: taskCard.isFailed ? Text.ElideRight : Text.ElideMiddle
                                 maximumLineCount: 1
                                 wrapMode: Text.NoWrap
                                 HoverHandler {
                                     id: outputHover
                                 }
                                 ToolTip {
+                                    id: pathTip
                                     objectName: "taskListPathTip"
-                                    visible: outputHover.hovered
-                                    text: output
+                                    visible: outputHover.hovered && pathTip.text.length > 0
+                                    text: taskCard.isFailed ? (taskCard.detail || taskCard.output) : taskCard.output
                                 }
                             }
                         }
@@ -269,13 +315,14 @@ Controls.Page {
                         Text {
                             Layout.fillWidth: true
                             text: page.task.title || (page.task.id ? qsTr("任务 #%1").arg(page.task.id) : "")
-                            typography: Typography.Title
+                            typography: Typography.Subtitle
                             elide: Text.ElideRight
                         }
                         Button {
                             objectName: "pauseButton"
                             text: qsTr("暂停")
                             icon.name: "ic_fluent_pause_20_regular"
+                            highlighted: true
                             visible: page.state === "running"
                             enabled: page.canPause
                             onClicked: Backend.command("pause:" + page.task.id)
@@ -284,6 +331,7 @@ Controls.Page {
                             objectName: "resumeButton"
                             text: qsTr("继续")
                             icon.name: "ic_fluent_play_20_regular"
+                            highlighted: true
                             visible: page.state === "paused"
                             enabled: page.canResume
                             onClicked: Backend.command("resume:" + page.task.id)
@@ -294,7 +342,10 @@ Controls.Page {
                             icon.name: "ic_fluent_dismiss_20_regular"
                             visible: ["queued", "starting", "running", "paused"].indexOf(page.state) >= 0
                             enabled: page.canCancel
-                            onClicked: Backend.command("cancel:" + page.task.id)
+                            onClicked: {
+                                cancelConfirmDialog.targetTaskId = String(page.task.id || "");
+                                cancelConfirmDialog.open();
+                            }
                         }
                     }
 
@@ -321,11 +372,11 @@ Controls.Page {
                         }
                         Text {
                             visible: Number(page.task.total) > 0
-                            text: Ui.formatCount(page.task.done, page.task.total) + " · " + Ui.progressPercent(page.task.done, page.task.total) + " · " + Ui.formatFps(page.task.done, page.task.elapsed)
+                            text: Ui.formatCount(page.task.done, page.task.total) + " · " + Ui.progressPercent(page.task.done, page.task.total) + " · " + Ui.formatFps(page.task.fps)
                             typography: Typography.Body
                         }
                         Text {
-                            text: Ui.formatElapsed(page.task.elapsed)
+                            text: qsTr("已用 %1").arg(Ui.formatElapsed(page.task.elapsed))
                             typography: Typography.Caption
                             color: Theme.currentTheme.colors.textSecondaryColor
                         }
@@ -402,7 +453,7 @@ Controls.Page {
                         id: taskPreview
                         objectName: "selectedTaskPreview"
                         Layout.fillWidth: true
-                        maximumImageHeight: Math.max(180, Math.min(340, detailScroll.height - 265))
+                        maximumImageHeight: Math.max(180, detailScroll.height - 265)
                         task: page.task
                         renderSource: Backend.renderSource
                         styleSource: Backend.styleSource
@@ -476,6 +527,72 @@ Controls.Page {
                 color: Theme.currentTheme.colors.textSecondaryColor
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
+            }
+        }
+    }
+
+    Dialog {
+        id: cancelConfirmDialog
+        objectName: "cancelTaskConfirmDialog"
+        property string targetTaskId: ""
+        title: qsTr("取消任务")
+        modal: true
+        closePolicy: Controls.Popup.CloseOnEscape
+        onOpened: dismissCancelButton.forceActiveFocus()
+        onAccepted: {
+            if (page.canCancel && String(page.task.id || "") === cancelConfirmDialog.targetTaskId)
+                Backend.command("cancel:" + cancelConfirmDialog.targetTaskId);
+        }
+
+        Text {
+            Layout.fillWidth: true
+            text: qsTr("确定取消该任务吗？已渲染的进度将被丢弃。")
+            typography: Typography.Body
+            color: Theme.currentTheme.colors.textColor
+            wrapMode: Text.WordWrap
+        }
+
+        footer: DialogButtonBox {
+            id: cancelDialogFooter
+            Button {
+                id: confirmCancelButton
+                objectName: "confirmCancelTaskButton"
+                Layout.fillWidth: true
+                Layout.preferredWidth: 1
+                text: qsTr("取消任务")
+                highlighted: true
+                primaryColor: Theme.currentTheme.colors.systemCriticalColor
+                focusPolicy: Qt.StrongFocus
+                onClicked: cancelConfirmDialog.accept()
+                Keys.onReturnPressed: confirmCancelButton.click()
+                Keys.onEnterPressed: confirmCancelButton.click()
+            }
+            Button {
+                id: dismissCancelButton
+                objectName: "dismissCancelTaskButton"
+                Layout.fillWidth: true
+                Layout.preferredWidth: 1
+                text: qsTr("返回")
+                focusPolicy: Qt.StrongFocus
+                onClicked: cancelConfirmDialog.reject()
+                Keys.onReturnPressed: dismissCancelButton.click()
+                Keys.onEnterPressed: dismissCancelButton.click()
+            }
+        }
+
+        Connections {
+            target: page
+            function onStateChanged() {
+                if (cancelConfirmDialog.opened && !page.canCancel)
+                    cancelConfirmDialog.close();
+            }
+            function onCanCancelChanged() {
+                if (cancelConfirmDialog.opened && !page.canCancel)
+                    cancelConfirmDialog.close();
+            }
+            function onSelectedIdChanged() {
+                if (cancelConfirmDialog.opened && String(page.task.id || "") !== cancelConfirmDialog.targetTaskId)
+                    cancelConfirmDialog.close();
             }
         }
     }

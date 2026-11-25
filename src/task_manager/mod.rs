@@ -11,12 +11,29 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use worker::{Terminal, Worker};
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_ACTIVITY_SEQ: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn next_activity_seq() -> u64 {
+    NEXT_ACTIVITY_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn touch_activity(info: &mut TaskInfo) {
+    info.last_activity_seq = next_activity_seq();
+    info.updated_at_ms = now_epoch_ms();
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct TaskId(u64);
 impl fmt::Display for TaskId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -79,9 +96,12 @@ pub struct TaskInfo {
     pub done: u64,
     pub total: u64,
     pub elapsed: f64,
+    pub fps: f64,
     pub log: String,
     pub preview_frame: u64,
     pub preview_note: String,
+    pub last_activity_seq: u64,
+    pub updated_at_ms: u64,
 }
 
 struct Reservation {
@@ -220,9 +240,12 @@ impl TaskManager {
                 done: 0,
                 total: 0,
                 elapsed: 0.0,
+                fps: 0.0,
                 log: String::new(),
                 preview_frame: 0,
                 preview_note,
+                last_activity_seq: next_activity_seq(),
+                updated_at_ms: now_epoch_ms(),
             },
             interval: preview_interval,
             worker: None,
@@ -251,6 +274,7 @@ impl TaskManager {
             task.info.state = TaskState::Cancelled;
             task.info.stage.clear();
             task.reservation.take();
+            touch_activity(&mut task.info);
         } else {
             match control {
                 Control::Pause => ensure!(
@@ -269,6 +293,7 @@ impl TaskManager {
                 "Worker 控制通道不可用"
             );
             task.info.pending = Some(control);
+            touch_activity(&mut task.info);
         }
         drop(state);
         self.wake();
@@ -374,14 +399,17 @@ fn finish(task: &mut Task, terminal: Terminal) {
             TaskState::Failed
         }
     };
+    touch_activity(&mut task.info);
 }
 
 fn advance(state: &mut State) {
     for task in &mut state.tasks {
         let Some(worker) = &task.worker else { continue };
         let update = worker.poll();
+        let mut touched = false;
         if let Some(stage) = update.stage {
             task.info.stage = stage;
+            touched = true;
         }
         if let Some((done, total, elapsed)) = update.progress {
             task.info.done = done;
@@ -393,6 +421,11 @@ fn advance(state: &mut State) {
             if done == total {
                 task.info.stage = "正在完成编码与封装".into();
             }
+            touched = true;
+        }
+        if let Some(fps) = update.fps {
+            task.info.fps = fps;
+            touched = true;
         }
         if let Some(paused) = update.paused {
             task.info.state = if paused {
@@ -406,19 +439,24 @@ fn advance(state: &mut State) {
             ) {
                 task.info.pending = None;
             }
+            touched = true;
         }
         if let Some((frame, image)) = update.preview {
             task.info.preview_frame = frame;
             task.preview = Some((frame, image));
+            touched = true;
         }
         if let Some(log) = update.log {
             task.info.log = log;
         }
         if let Some(warning) = update.warning {
             task.info.detail = warning;
+            touched = true;
         }
         if let Some(terminal) = update.terminal {
             finish(task, terminal);
+        } else if touched {
+            touch_activity(&mut task.info);
         }
     }
     let mut active = state
@@ -442,6 +480,7 @@ fn advance(state: &mut State) {
         }
         task.info.state = TaskState::Starting;
         task.info.stage = "启动渲染进程".into();
+        touch_activity(&mut task.info);
         match Worker::start(
             Arc::clone(&task.info.options),
             task.interval,
