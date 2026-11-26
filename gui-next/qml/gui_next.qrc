@@ -1,6 +1,7 @@
 <RCC>
     <qresource prefix="/goosy">
         <file>Goosy.qml</file>
+        <file>languages/zh_CN.qm</file>
         <file>pages/Home.qml</file>
         <file>pages/Tasks.qml</file>
         <file>pages/Settings.qml</file>

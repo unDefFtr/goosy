@@ -15,7 +15,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 pub(crate) const DELETING_RESERVED: &str = "deleting_reserved";
 
 pub(crate) fn thumbnail_path(root: &Path, id: Uuid) -> PathBuf {
@@ -281,11 +281,22 @@ impl History {
             version <= SCHEMA_VERSION,
             "unsupported history.sqlite3 schema {version}"
         );
-        if version == 0 {
+        if version < 4 {
             let tx = db.transaction()?;
+            if version > 0 {
+                // Rebuild the table to give the existing rowid a permanent name and enable
+                // AUTOINCREMENT. Keep foreign keys enabled throughout the migration.
+                tx.execute_batch("ALTER TABLE tasks RENAME TO legacy_tasks;")?;
+                if version < 3 {
+                    tx.execute_batch("ALTER TABLE legacy_tasks ADD COLUMN deletion_parent BLOB;")?;
+                }
+                if version >= 2 {
+                    tx.execute_batch("ALTER TABLE preserved_task_paths RENAME TO legacy_paths;")?;
+                }
+            }
             tx.execute_batch(
                 "CREATE TABLE tasks (
-                uuid TEXT PRIMARY KEY NOT NULL,
+                uuid TEXT NOT NULL UNIQUE,
                 created_ms INTEGER NOT NULL,
                 updated_ms INTEGER NOT NULL,
                 state TEXT NOT NULL,
@@ -296,27 +307,31 @@ impl History {
                 total_frames INTEGER NOT NULL,
                 elapsed_seconds REAL NOT NULL,
                 output_size INTEGER NOT NULL,
-                error TEXT NOT NULL
+                error TEXT NOT NULL,
+                deletion_parent BLOB,
+                list_order_seq INTEGER PRIMARY KEY AUTOINCREMENT
             ) STRICT;
-            CREATE INDEX tasks_recent ON tasks(updated_ms DESC, uuid);",
-            )?;
-            tx.pragma_update(None, "user_version", 1)?;
-            tx.commit()?;
-        }
-        if version < 2 {
-            let tx = db.transaction()?;
-            tx.execute_batch("CREATE TABLE preserved_task_paths (
+            CREATE TABLE preserved_task_paths (
                 uuid TEXT NOT NULL REFERENCES tasks(uuid) ON DELETE CASCADE,
                 path BLOB NOT NULL,
                 PRIMARY KEY (uuid, path)
-            ) STRICT;")?;
-            tx.pragma_update(None, "user_version", 2)?;
-            tx.commit()?;
-        }
-        if version < 3 {
-            let tx = db.transaction()?;
-            tx.execute_batch("ALTER TABLE tasks ADD COLUMN deletion_parent BLOB;")?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            ) STRICT;",
+            )?;
+            if version > 0 {
+                tx.execute_batch("INSERT INTO tasks (list_order_seq, uuid, created_ms, updated_ms, state,
+                    options_json, manifest_version, preview_interval, committed_frames, total_frames,
+                    elapsed_seconds, output_size, error, deletion_parent)
+                    SELECT rowid, uuid, created_ms, updated_ms, state, options_json, manifest_version,
+                    preview_interval, committed_frames, total_frames, elapsed_seconds, output_size,
+                    error, deletion_parent FROM legacy_tasks;")?;
+                if version >= 2 {
+                    tx.execute_batch("INSERT INTO preserved_task_paths (uuid, path)
+                        SELECT uuid, path FROM legacy_paths; DROP TABLE legacy_paths;")?;
+                }
+                tx.execute_batch("DROP TABLE legacy_tasks;")?;
+            }
+            tx.execute_batch("CREATE INDEX tasks_recent ON tasks(updated_ms DESC, uuid);")?;
+            tx.pragma_update(None, "user_version", 4)?;
             tx.commit()?;
         }
         Ok(Self {
@@ -489,44 +504,33 @@ impl History {
         Ok(())
     }
 
+    pub fn insert(&self, record: &Record) -> Result<u64> {
+        let seq = self.db.prepare_cached("INSERT INTO tasks (uuid,created_ms,updated_ms,state,
+            options_json,manifest_version,preview_interval,committed_frames,total_frames,
+            elapsed_seconds,output_size,error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")?
+            .insert(params![
+                record.id.to_string(), i64::try_from(record.created_ms)?, i64::try_from(record.updated_ms)?,
+                record.state, serde_json::to_string(&record.options)?, crate::workspace::MANIFEST_VERSION,
+                record.interval, i64::try_from(record.committed)?, i64::try_from(record.total)?,
+                record.elapsed, i64::try_from(record.output_size)?, record.error,
+            ])?;
+        Ok(u64::try_from(seq)?)
+    }
+
     pub fn save(&self, record: &Record) -> Result<()> {
-        let id = record.id.to_string();
-        let updated_ms = i64::try_from(record.updated_ms)?;
-        let committed = i64::try_from(record.committed)?;
-        let total = i64::try_from(record.total)?;
-        let size = i64::try_from(record.output_size)?;
         let updated = self.db.prepare_cached("UPDATE tasks SET state=?2, updated_ms=?3,
             committed_frames=?4, total_frames=?5, elapsed_seconds=?6, output_size=?7, error=?8 WHERE uuid=?1")?
-            .execute(params![id, record.state, updated_ms, committed, total,
-                record.elapsed, size, record.error])?;
-        if updated == 0 {
-            self.db.execute(
-                "INSERT INTO tasks (uuid,created_ms,updated_ms,state,options_json,manifest_version,
-                preview_interval,committed_frames,total_frames,elapsed_seconds,output_size,error)
-                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                params![
-                    id,
-                    i64::try_from(record.created_ms)?,
-                    updated_ms,
-                    record.state,
-                    serde_json::to_string(&record.options)?,
-                    crate::workspace::MANIFEST_VERSION,
-                    record.interval,
-                    committed,
-                    total,
-                    record.elapsed,
-                    size,
-                    record.error
-                ],
-            )?;
-        }
+            .execute(params![record.id.to_string(), record.state, i64::try_from(record.updated_ms)?,
+                i64::try_from(record.committed)?, i64::try_from(record.total)?, record.elapsed,
+                i64::try_from(record.output_size)?, record.error])?;
+        ensure!(updated == 1, "任务历史不存在");
         Ok(())
     }
 
-    pub fn load(&self) -> Result<Vec<Record>> {
+    pub fn load(&self) -> Result<Vec<(u64, Record)>> {
         let mut stmt = self.db.prepare("SELECT uuid,state,options_json,created_ms,updated_ms,
-            elapsed_seconds,committed_frames,total_frames,output_size,error,preview_interval,manifest_version
-            FROM tasks ORDER BY created_ms, rowid")?;
+            elapsed_seconds,committed_frames,total_frames,output_size,error,preview_interval,manifest_version,
+            list_order_seq FROM tasks ORDER BY list_order_seq")?;
         let mut rows = stmt.query([])?;
         let mut records = Vec::new();
         while let Some(row) = rows.next()? {
@@ -536,7 +540,8 @@ impl History {
                 "unsupported manifest version for task {id}"
             );
             let json: String = row.get(2)?;
-            records.push(Record {
+            let list_order_seq = u64::try_from(row.get::<_, i64>(12)?)?;
+            records.push((list_order_seq, Record {
                 id: id
                     .parse()
                     .with_context(|| format!("invalid history UUID {id}"))?,
@@ -551,7 +556,7 @@ impl History {
                 output_size: u64::try_from(row.get::<_, i64>(8)?)?,
                 error: row.get(9)?,
                 interval: row.get(10)?,
-            });
+            }));
         }
         Ok(records)
     }
@@ -580,7 +585,7 @@ mod tests {
             error: String::new(),
             interval: 15,
         };
-        history.save(&record)?;
+        let list_order_seq = history.insert(&record)?;
         record.options.sample_start_ms = Some(999);
         record.state = "paused".into();
         record.committed = 90;
@@ -590,7 +595,8 @@ mod tests {
         assert!(History::open(dir.path()).is_err());
         drop(history);
         let reopened = History::open(dir.path())?;
-        let saved = reopened.load()?.pop().unwrap();
+        let (restored_seq, saved) = reopened.load()?.pop().unwrap();
+        assert_eq!(restored_seq, list_order_seq);
         assert_eq!(
             (
                 saved.id,
@@ -603,6 +609,69 @@ mod tests {
         assert_eq!(reopened.settings.max_concurrent, 3);
         Ok(())
     }
+
+    #[test]
+    fn list_order_migrates_legacy_rowids_and_preserves_owned_paths() -> Result<()> {
+        for version in 1..=3 {
+            let dir = tempfile::tempdir()?;
+            let db = Connection::open(dir.path().join("history.sqlite3"))?;
+            db.execute_batch("CREATE TABLE tasks (
+                uuid TEXT PRIMARY KEY NOT NULL, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
+                state TEXT NOT NULL, options_json TEXT NOT NULL, manifest_version INTEGER NOT NULL,
+                preview_interval INTEGER NOT NULL, committed_frames INTEGER NOT NULL, total_frames INTEGER NOT NULL,
+                elapsed_seconds REAL NOT NULL, output_size INTEGER NOT NULL, error TEXT NOT NULL
+            ) STRICT; CREATE INDEX tasks_recent ON tasks(updated_ms DESC, uuid);")?;
+            let options = serde_json::to_string(&RenderOptions::new("in.wav", "out.mp4"))?;
+            let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+            // Equal creation timestamps followed by a clock rollback. Gaps simulate forgotten rows.
+            for ((rowid, created), id) in [(2, 90), (5, 90), (7, 40)].into_iter().zip(ids) {
+                db.execute("INSERT INTO tasks (rowid,uuid,created_ms,updated_ms,state,options_json,
+                    manifest_version,preview_interval,committed_frames,total_frames,elapsed_seconds,output_size,error)
+                    VALUES (?1,?2,?3,?3,'deleting',?4,?5,1,0,0,0,0,'')",
+                    params![rowid, id.to_string(), created, options, crate::workspace::MANIFEST_VERSION])?;
+            }
+            if version >= 2 {
+                db.execute_batch("CREATE TABLE preserved_task_paths (
+                    uuid TEXT NOT NULL REFERENCES tasks(uuid) ON DELETE CASCADE, path BLOB NOT NULL,
+                    PRIMARY KEY (uuid, path)) STRICT;")?;
+                db.execute("INSERT INTO preserved_task_paths VALUES (?1, x'01')", [ids[2].to_string()])?;
+            }
+            if version == 3 {
+                db.execute_batch("ALTER TABLE tasks ADD COLUMN deletion_parent BLOB;
+                    UPDATE tasks SET deletion_parent=x'02' WHERE rowid=7;")?;
+            }
+            db.pragma_update(None, "user_version", version)?;
+            drop(db);
+
+            let history = History::open(dir.path())?;
+            let records = history.load()?;
+            assert_eq!(records.iter().map(|(seq, r)| (*seq, r.id)).collect::<Vec<_>>(),
+                [(2, ids[0]), (5, ids[1]), (7, ids[2])]);
+            let paths = || history.db.query_row("SELECT COUNT(*) FROM preserved_task_paths
+                WHERE uuid=?1 AND path=x'01'", [ids[2].to_string()], |r| r.get::<_, i32>(0));
+            assert_eq!(paths()?, i32::from(version >= 2));
+            let parent: Option<Vec<u8>> = history.db.query_row("SELECT deletion_parent FROM tasks WHERE uuid=?1",
+                [ids[2].to_string()], |r| r.get(0))?;
+            assert_eq!(parent, (version == 3).then_some(vec![2]));
+            history.finish_deletion(ids[2])?;
+            assert_eq!(paths()?, 0);
+            drop(history);
+
+            let reopened = History::open(dir.path())?;
+            let (_, mut next) = records.into_iter().next().unwrap();
+            next.id = Uuid::new_v4();
+            let first = reopened.insert(&next)?;
+            next.id = Uuid::new_v4();
+            let same_ms = reopened.insert(&next)?;
+            next.id = Uuid::new_v4();
+            next.created_ms = 10;
+            next.updated_ms = 10;
+            let rolled_back = reopened.insert(&next)?;
+            assert!(7 < first && first < same_ms && same_ms < rolled_back);
+        }
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[test]
     fn read_only_database_is_rejected_without_modification() -> Result<()> {

@@ -1,6 +1,6 @@
 //! Qt-independent render queue. The scheduler owns processes; consumers only read snapshots.
 mod redo;
-pub use redo::{AssetIssue, AssetRole, RedoDraft};
+pub use redo::{AssetIssue, AssetIssueReason, AssetRole, RedoDraft};
 mod worker;
 
 use crate::{
@@ -128,11 +128,13 @@ pub struct TaskInfo {
     pub committed: u64,
     pub output_size: u64,
     pub created_at_ms: u64,
+    /// Durable enqueue order. A larger sequence identifies a more recently inserted task.
+    pub list_order_seq: u64,
     pub thumbnail: Option<PathBuf>,
     pub fps: f64,
     pub log: String,
     pub preview_frame: u64,
-    pub preview_note: String,
+    pub thumbnail_error: Option<String>,
     pub last_activity_seq: u64,
     pub updated_at_ms: u64,
 }
@@ -169,7 +171,7 @@ struct Task {
 }
 
 impl Task {
-    fn from_record(record: Record, history: &History) -> Result<Self> {
+    fn from_record(record: Record, list_order_seq: u64, history: &History) -> Result<Self> {
         let workspace = history.root().join("tasks").join(record.id.to_string());
         let marker = reservation_path(&record.options.output)?;
         let thumbnail = crate::history::thumbnail_path(history.root(), record.id);
@@ -197,12 +199,9 @@ impl Task {
             fps: 0.0,
             log: String::new(),
             preview_frame: 0,
-            preview_note: if record.options.encoder.is_zero_copy() {
-                "零拷贝模式不提供 CPU 帧预览".into()
-            } else {
-                String::new()
-            },
+            thumbnail_error: None,
             created_at_ms: record.created_ms,
+            list_order_seq,
             updated_at_ms: record.updated_ms,
             last_activity_seq: 0,
         };
@@ -302,8 +301,8 @@ impl TaskManager {
         let records = history.load().map_err(io::Error::other)?;
         let mut tasks = Vec::with_capacity(records.len());
         let mut scheduled = Vec::new();
-        for record in records {
-            let mut task = Task::from_record(record, &history).map_err(io::Error::other)?;
+        for (list_order_seq, record) in records {
+            let mut task = Task::from_record(record, list_order_seq, &history).map_err(io::Error::other)?;
             if task.info.state == TaskState::Deleting {
                 match delete_task(&mut task, &history) {
                     Ok(()) => continue,
@@ -400,7 +399,7 @@ impl TaskManager {
         }
         let id = Uuid::new_v4();
         let now = now_epoch_ms();
-        let record = Record {
+        let mut record = Record {
             id,
             options,
             state: "queued".into(),
@@ -416,11 +415,12 @@ impl TaskManager {
         let (mut task, seconds, reserved) = {
             let state = self.state.lock().unwrap();
             state.writable()?;
-            let mut task = Task::from_record(record, &state.history)?;
-            task.info.stage = "等待并发槽位".into();
-            touch_activity(&mut task.info);
             // The history row identifies the owner of every subsequently created file.
-            task.save(&state.history)?;
+            record.updated_ms = now_epoch_ms();
+            let list_order_seq = state.history.insert(&record).context("保存任务历史")?;
+            let mut task = Task::from_record(record, list_order_seq, &state.history)?;
+            task.info.stage = "等待并发槽位".into();
+            task.info.last_activity_seq = next_activity_seq();
             let reserved = check_output(&task.info.options.output).and_then(|()| reserve(&task));
             (task, state.history.settings.segment_seconds, reserved)
         };
@@ -664,21 +664,49 @@ fn delete_task(task: &mut Task, history: &History) -> Result<()> {
     history.finish_deletion(task.record.id)
 }
 
+/// A known output validation failure, retained in the `anyhow` error chain for UI clients.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OutputError {
+    MissingFileName,
+    MissingExtension,
+    MissingParent,
+    ParentNotFound,
+    PrivateDirectory(PathBuf),
+    AlreadyExists(PathBuf),
+    Reserved(PathBuf),
+}
+
+impl fmt::Display for OutputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingFileName => f.write_str("输出路径缺少文件名"),
+            Self::MissingExtension => f.write_str("输出路径缺少容器扩展名"),
+            Self::MissingParent => f.write_str("输出路径缺少父目录"),
+            Self::ParentNotFound => f.write_str("输出目录不存在"),
+            Self::PrivateDirectory(path) => write!(f, "不能导出到 Goosy 私有暂存目录：{}", path.display()),
+            Self::AlreadyExists(path) => write!(f, "输出文件已存在：{}", path.display()),
+            Self::Reserved(path) => write!(f, "输出已被另一 Goosy 任务预留：{}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for OutputError {}
+
 fn output_identity(path: &Path) -> Result<PathBuf> {
-    ensure!(path.extension().is_some_and(|ext| !ext.is_empty()), "输出路径缺少容器扩展名");
-    let name = path.file_name().context("输出路径缺少文件名")?;
+    let name = path.file_name().context(OutputError::MissingFileName)?;
+    ensure!(path.extension().is_some_and(|ext| !ext.is_empty()), OutputError::MissingExtension);
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let output = parent.canonicalize().context("输出目录不存在")?.join(name);
+    let output = parent.canonicalize().context(OutputError::ParentNotFound)?.join(name);
     Ok(output)
 }
 
 fn reservation_path(output: &Path) -> Result<PathBuf> {
     let name = output
         .file_name()
-        .context("输出路径缺少文件名")?
+        .context(OutputError::MissingFileName)?
         .to_string_lossy();
     let name = if cfg!(any(target_os = "macos", windows)) {
         name.to_lowercase()
@@ -697,17 +725,16 @@ fn exists(path: &Path) -> Result<bool> {
 }
 
 fn check_output(output: &Path) -> Result<()> {
-    ensure!(output.extension().is_some_and(|ext| !ext.is_empty()), "输出路径缺少容器扩展名");
-    let parent = output.parent().context("输出路径缺少父目录")?;
+    ensure!(output.extension().is_some_and(|ext| !ext.is_empty()), OutputError::MissingExtension);
+    let parent = output.parent().context(OutputError::MissingParent)?;
     ensure!(
         !parent.components().any(|part| crate::media::private_stage_dir_name(part.as_os_str())),
-        "不能导出到 Goosy 私有暂存目录：{}", parent.display()
+        OutputError::PrivateDirectory(parent.to_owned())
     );
-    ensure!(!exists(output)?, "输出文件已存在：{}", output.display());
+    ensure!(!exists(output)?, OutputError::AlreadyExists(output.to_owned()));
     ensure!(
         !exists(&reservation_path(output)?)?,
-        "输出已被另一 Goosy 任务预留：{}",
-        output.display()
+        OutputError::Reserved(output.to_owned())
     );
     Ok(())
 }
@@ -1047,7 +1074,7 @@ fn poll(task: &mut Task, history: &History) -> Result<()> {
             task.thumbnail_attempted = true;
             match crate::history::save_thumbnail(history.root(), task.record.id, &mut image) {
                 Ok(path) => task.info.thumbnail = Some(path),
-                Err(error) => task.info.preview_note = format!("保存缩略图失败：{error:#}"),
+                Err(error) => task.info.thumbnail_error = Some(format!("{error:#}")),
             }
         }
         task.info.preview_frame = frame;
@@ -1188,8 +1215,8 @@ mod tests {
             elapsed: 0.0, committed: 0, total: 0, output_size: 0, error: String::new(), interval: 1,
         };
         let mut state = manager.state.lock().unwrap();
-        let mut task = Task::from_record(record, &state.history).unwrap();
-        task.save(&state.history).unwrap();
+        let list_order_seq = state.history.insert(&record).unwrap();
+        let task = Task::from_record(record, list_order_seq, &state.history).unwrap();
         reserve(&task).unwrap();
         let work = Workspace::create(&task.workspace, &task.info.options, 1).unwrap();
         let id = task.info.id;
@@ -1205,6 +1232,29 @@ mod tests {
             assert!(Instant::now() < deadline, "expected {status:?}, got {:?}: {}", info.state, info.detail);
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn list_order_survives_restart_and_advances_on_new_enqueue() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("history");
+        let open = || TaskManager::with_data_dir(dir.path().join("missing-worker"), &root);
+        // A missing source makes each enqueue reach its terminal state synchronously.
+        let options = |name: &str| RenderOptions::new(dir.path().join("missing.wav"), dir.path().join(name));
+        let manager = open()?;
+        let a = manager.enqueue(options("a.mp4"), 1)?;
+        let b = manager.enqueue(options("b.mp4"), 1)?;
+        let seq_a = manager.task(a).unwrap().list_order_seq;
+        let seq_b = manager.task(b).unwrap().list_order_seq;
+        assert!(seq_a < seq_b);
+        drop(manager);
+
+        let manager = open()?;
+        assert_eq!(manager.task(a).unwrap().list_order_seq, seq_a);
+        assert_eq!(manager.task(b).unwrap().list_order_seq, seq_b);
+        let c = manager.enqueue(options("c.mp4"), 1)?;
+        assert!(manager.task(c).unwrap().list_order_seq > seq_b);
+        Ok(())
     }
 
     #[test]

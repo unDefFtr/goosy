@@ -41,7 +41,7 @@ fn style_percent_slider(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StylePreviewKey {
     style: [u32; 10],
-    scene: StylePreviewScene,
+    scene: StylePreviewScene<'static>,
 }
 
 fn preview_color_image(frame: PreviewFrame) -> egui::ColorImage {
@@ -54,7 +54,7 @@ fn preview_color_image(frame: PreviewFrame) -> egui::ColorImage {
 #[cfg(test)]
 fn render_style_preview(
     style: LyricsStyle,
-    scene: &StylePreviewScene,
+    scene: &StylePreviewScene<'_>,
     cover_asset: Option<&libgoosy::image_asset::ImageAsset>,
 ) -> Result<egui::ColorImage, String> {
     let assets = SceneImageAssets {
@@ -650,6 +650,7 @@ impl GoosyApp {
                 embedded_cover_audio,
                 render_translation: self.render_translation,
                 render_background_vocal: self.render_background_vocal,
+                sample_text: None,
             },
         };
         if self.style_preview_key.as_ref() != Some(&key) {
@@ -1397,7 +1398,7 @@ mod tests {
         }
     }
 
-    fn preview_scene(width: u32, height: u32) -> StylePreviewScene {
+    fn preview_scene(width: u32, height: u32) -> StylePreviewScene<'static> {
         StylePreviewScene {
             width,
             height,
@@ -1407,10 +1408,11 @@ mod tests {
             embedded_cover_audio: None,
             render_translation: true,
             render_background_vocal: true,
+            sample_text: None,
         }
     }
 
-    fn preview_key(style: [u32; 10], scene: StylePreviewScene) -> StylePreviewKey {
+    fn preview_key(style: [u32; 10], scene: StylePreviewScene<'static>) -> StylePreviewKey {
         StylePreviewKey { style, scene }
     }
 

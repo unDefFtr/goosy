@@ -5,8 +5,8 @@ import RinUI
 Card {
     id: root
 
-    property string title: qsTr("创建渲染任务")
-    property string description: qsTr("导入音频、歌词与样式")
+    property string title: qsTr("Create a render task")
+    property string description: qsTr("Import audio, lyrics, and style settings")
     property string iconName: "ic_fluent_filmstrip_play_20_filled"
 
     focusPolicy: Qt.StrongFocus

@@ -14,6 +14,17 @@ FluentWindow {
         { title: qsTr("Tasks"), page: Qt.resolvedUrl("pages/Tasks.qml"), icon: "ic_fluent_task_list_square_ltr_20_regular" },
         { title: qsTr("Settings"), page: Qt.resolvedUrl("pages/Settings.qml"), icon: "ic_fluent_settings_20_regular", position: Position.Bottom }
     ]
+    readonly property var previewText: [
+        qsTr("Previous line"), qsTr("This is the line we are singing now"),
+        //: This lyric is the translation of the current line. Show it in English in the Chinese UI.
+        qsTr("此刻我们唱着这一行"), qsTr("Backing vocals"), qsTr("Next line")
+    ]
+    function updatePreviewText() {
+        Backend.setPreviewText(previewText[0], previewText[1], previewText[2], previewText[3], previewText[4])
+    }
+    onPreviewTextChanged: updatePreviewText()
+    Component.onCompleted: updatePreviewText()
+
     property var draft: JSON.parse(Backend.projectJson || "{}")
     property string lastCreatedId: ""
     property double lastRedoRevision: 0

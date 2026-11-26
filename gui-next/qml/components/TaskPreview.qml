@@ -1,13 +1,14 @@
 import QtQuick
 import QtQuick.Layouts
 import RinUI
+import "../js/ui.js" as Ui
 
 ColumnLayout {
     id: root
     property var task: ({})
     property string renderSource: ""
     property string styleSource: ""
-    property string styleError: ""
+    property var styleError: null
     property real maximumImageHeight: 360
     property int mode: 0
     readonly property bool actual: mode === 0
@@ -29,11 +30,11 @@ ColumnLayout {
             currentIndex: root.mode
             onCurrentIndexChanged: root.mode = currentIndex
             SegmentedItem {
-                text: qsTr("任务画面")
+                text: qsTr("Task preview")
                 icon.name: "ic_fluent_filmstrip_20_regular"
             }
             SegmentedItem {
-                text: qsTr("当前样式")
+                text: qsTr("Current style")
                 icon.name: "ic_fluent_image_20_regular"
             }
         }
@@ -63,18 +64,19 @@ ColumnLayout {
             anchors.centerIn: parent
             width: parent.width - 32
             visible: !root.source || frame.status === Image.Error
+            textFormat: Text.PlainText
             text: {
                 if (!root.actual)
-                    return root.styleError ? qsTr("样式预览不可用") : qsTr("加载样式预览…");
+                    return root.styleError ? Ui.messageText(root.styleError) : qsTr("Loading style preview…");
                 if (frame.status === Image.Error)
-                    return qsTr("无法读取任务画面");
+                    return qsTr("Could not load the task preview");
                 if (root.task.previewNote)
-                    return root.task.previewNote;
+                    return Ui.messageText(root.task.previewNote);
                 if (root.task.state === "queued")
-                    return qsTr("排队中，暂无画面");
+                    return qsTr("Queued; no preview yet");
                 if (root.task.state === "starting" || root.task.state === "running")
-                    return qsTr("等待渲染画面…");
-                return qsTr("无可用任务画面");
+                    return qsTr("Waiting for a rendered frame…");
+                return qsTr("No task preview available");
             }
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
@@ -86,17 +88,20 @@ ColumnLayout {
         Layout.preferredWidth: root.imageWidth
         Layout.alignment: Qt.AlignHCenter
         visible: root.actual && Number(root.task.previewFrame) > 0 && !!root.renderSource
-        text: qsTr("第 %1 帧").arg(root.task.previewFrame || 0)
+        text: qsTr("Frame %1").arg(root.task.previewFrame || 0)
         typography: Typography.Caption
         color: Theme.currentTheme.colors.textSecondaryColor
         horizontalAlignment: Text.AlignLeft
     }
     Text {
         Layout.fillWidth: true
-        visible: !root.actual && !!root.styleError
-        text: root.styleError
+        readonly property var message: root.actual ? root.task.previewNote : root.styleError
+        visible: text.length > 0
+        text: message ? [(root.source || (root.actual && frame.status === Image.Error)) ? Ui.messageText(message) : "",
+                         message.detail].filter(Boolean).join("\n") : ""
+        textFormat: Text.PlainText
         typography: Typography.Caption
         wrapMode: Text.WrapAnywhere
-        color: Theme.currentTheme.colors.systemCriticalColor
+        color: root.actual ? Theme.currentTheme.colors.textSecondaryColor : Theme.currentTheme.colors.systemCriticalColor
     }
 }

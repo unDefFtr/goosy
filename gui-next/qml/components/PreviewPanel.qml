@@ -1,14 +1,15 @@
 import QtQuick
 import QtQuick.Layouts
 import RinUI
+import "../js/ui.js" as Ui
 
 SectionCard {
     id: root
 
     property string renderSource: ""
     property string styleSource: ""
-    property string styleError: ""
-    property string previewNote: ""
+    property var styleError: null
+    property var previewNote: null
     property var task: ({})
     property bool active: false
     property int mode: 0
@@ -36,7 +37,7 @@ SectionCard {
         Text {
             Layout.fillWidth: true
             typography: Typography.BodyLarge
-            text: root.showRender ? qsTr("预览 · 任务 #%1").arg(root.task.id || "") : qsTr("预览")
+            text: root.showRender ? qsTr("Preview · Task #%1").arg(root.task.id || "") : qsTr("Preview")
             elide: Text.ElideRight
         }
 
@@ -44,7 +45,7 @@ SectionCard {
             typography: Typography.Caption
             color: Theme.currentTheme.colors.textSecondaryColor
             text: root.showRender && (Number(root.task.previewFrame) || 0) > 0
-                ? qsTr("第 %1 帧").arg(root.task.previewFrame)
+                ? qsTr("Frame %1").arg(root.task.previewFrame)
                 : ""
             visible: text.length > 0
         }
@@ -57,13 +58,13 @@ SectionCard {
 
             SegmentedItem {
                 objectName: "renderPreviewTab"
-                text: qsTr("任务画面")
+                text: qsTr("Task preview")
                 enabled: root.renderAvailable
             }
 
             SegmentedItem {
                 objectName: "stylePreviewTab"
-                text: qsTr("当前样式")
+                text: qsTr("Current style")
                 enabled: root.styleAvailable
             }
         }
@@ -113,14 +114,15 @@ SectionCard {
             width: parent.width - 32
             horizontalAlignment: Text.AlignHCenter
             typography: Typography.Body
-            color: root.styleError.length > 0
+            color: !!root.styleError
                 ? Theme.currentTheme.colors.systemCriticalColor
                 : Theme.currentTheme.colors.textSecondaryColor
+            textFormat: Text.PlainText
             text: {
                 if (root.hasImage) return ""
-                if (root.styleError.length > 0) return qsTr("预览不可用")
-                if (root.previewNote.length > 0) return root.previewNote
-                return root.active ? qsTr("等待画面…") : qsTr("加载预览…")
+                if (root.styleError) return Ui.messageText(root.styleError)
+                if (root.previewNote) return Ui.messageText(root.previewNote)
+                return root.active ? qsTr("Waiting for a frame…") : qsTr("Loading preview…")
             }
             visible: text.length > 0
             wrapMode: Text.WordWrap
@@ -130,12 +132,13 @@ SectionCard {
     Expander {
         Layout.fillWidth: true
         implicitWidth: 0
-        visible: root.styleError.length > 0
-        text: qsTr("预览错误")
+        visible: !!root.styleError
+        text: root.hasImage ? Ui.messageText(root.styleError) : qsTr("Preview error")
         Text {
             objectName: "styleErrorLabel"
             Layout.fillWidth: true
-            text: root.styleError
+            text: root.styleError ? root.styleError.detail || Ui.messageText(root.styleError) : ""
+            textFormat: Text.PlainText
             color: Theme.currentTheme.colors.systemCriticalColor
             wrapMode: Text.WrapAnywhere
         }
@@ -144,7 +147,7 @@ SectionCard {
     RowLayout {
         Layout.fillWidth: true
         spacing: 6
-        visible: root.previewNote.length > 0 && root.hasImage
+        visible: !!root.previewNote && (root.hasImage || !!root.previewNote.detail || !!root.styleError)
 
         Icon {
             Layout.alignment: Qt.AlignTop
@@ -158,7 +161,9 @@ SectionCard {
             Layout.fillWidth: true
             typography: Typography.Caption
             color: Theme.currentTheme.colors.textSecondaryColor
-            text: root.previewNote
+            text: root.previewNote ? [(root.hasImage || root.styleError) ? Ui.messageText(root.previewNote) : "",
+                                      root.previewNote.detail].filter(Boolean).join("\n") : ""
+            textFormat: Text.PlainText
             wrapMode: Text.WordWrap
         }
     }

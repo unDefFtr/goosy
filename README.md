@@ -34,12 +34,19 @@ cargo build --features gui-next --bins
 选定范围和随机采样均不输出音频，文件名附加 `.sample-<起点毫秒>ms`。零拷贝编码提供进度但不提供
 CPU 帧预览。逐行排除、歌曲署名自动排除、PDF 导出和速度曲线仍仅在旧版提供。
 
-界面使用 RinUI 原生 `FluentWindow` 导航、列表、输入和主题组件，一级导航为 **Home / Tasks / Settings**。
+界面支持简体中文和英语。首次启动按系统语言选择，可在 **设置 → 外观 → 语言** 中即时切换；GUI Next 将选择保存在自己的 `language.json` 中。歌曲标题、歌词、文件名及原始诊断保留原文。一级导航为 **首页 / 任务 / 设置**（**Home / Tasks / Settings**）。
 Home 是简洁欢迎页，点击“创建任务”进入内部四步向导：**素材 → 样式 → 输出 → 确认**；工作区标题为“创建任务”。
 步骤条只显示一次步骤名称；素材表单保留未选择、自动匹配、音频元数据等真实状态。Tasks 查看队列、任务详情、日志和实际渲染预览；Settings 设置并发数和主题。
 任务列表使用持久 `ListModel`，按 Task ID 原位更新变化的字段；进度、状态、预览或日志更新不替换列表模型、不重建既有任务行，也不重复触发列表入场动画。选择与滚动位置只随显式选择或任务结构变化更新。
 
-Tasks 采用 Master–Detail：列表约占 30%，按最近活动排序；列表和详情独立滚动，任务画面在文件详情和日志之前。
+维护界面文案时使用 Qt 6 Linguist Tools。从仓库根目录提取英文源文案，在 `zh_CN.ts` 中补全简体中文翻译，再编译并一起提交 TS 和 QM。普通构建直接嵌入仓库内的 QM。
+
+```bash
+lupdate gui-next/qml -extensions qml,js -source-language en_US -target-language zh_CN -no-obsolete -ts gui-next/qml/languages/zh_CN.ts
+lrelease -fail-on-unfinished gui-next/qml/languages/zh_CN.ts -qm gui-next/qml/languages/zh_CN.qm
+```
+
+Tasks 采用 Master–Detail，列表约占 30%，与详情独立滚动。任务按创建顺序从新到旧排列，首页显示同一列表的前 20 项。任务开始、暂停、恢复和结束都保留原位置，重启后仍沿用该顺序。任务画面位于文件详情和日志之前。
 列表只显示名称、状态、简要进度和输出文件名；详情集中显示真实状态、帧进度、耗时及当前允许的操作。
 完整路径/错误可通过工具提示和“文件与错误详情”查看；日志默认折叠，固定高度独立滚动，停留底部时跟随最新日志。
 Worker 实时日志保留最近 8 KiB；任务失败原因随历史记录保存。

@@ -3,12 +3,42 @@ use crate::RenderOptions;
 pub use crate::workspace::AssetRole;
 use crate::workspace::{Fingerprint, InputFingerprints, Workspace};
 use anyhow::{Context, Result, ensure};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub struct AssetIssue {
-    pub message: String,
-    pub can_accept: bool,
+#[derive(Debug)]
+pub enum AssetIssueReason {
+    Unreadable(anyhow::Error),
+    MissingFingerprint,
+    ContentChanged,
 }
+
+#[derive(Debug)]
+pub struct AssetIssue {
+    pub path: PathBuf,
+    pub reason: AssetIssueReason,
+}
+
+impl AssetIssue {
+    pub fn can_accept(&self) -> bool {
+        !matches!(self.reason, AssetIssueReason::Unreadable(_))
+    }
+}
+
+impl fmt::Display for AssetIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match &self.reason {
+            AssetIssueReason::Unreadable(error) => {
+                return write!(f, "素材缺失或无法读取，请重新定位 {}：{error:#}", self.path.display());
+            }
+            AssetIssueReason::MissingFingerprint => "没有可对比的历史指纹",
+            AssetIssueReason::ContentChanged => "文件内容与历史指纹不一致",
+        };
+        write!(f, "{reason}，请重新定位或确认使用当前文件：{}", self.path.display())
+    }
+}
+
+impl std::error::Error for AssetIssue {}
 
 struct ReviewedAsset {
     path: PathBuf,
@@ -69,7 +99,7 @@ fn available_output(source: &Path) -> Result<PathBuf> {
 }
 
 impl RedoDraft {
-    fn unapproved(&self, role: AssetRole, path: &Path, current: &Fingerprint) -> Option<String> {
+    fn unapproved(&self, role: AssetRole, path: &Path, current: &Fingerprint) -> Option<AssetIssue> {
         let index = role as usize;
         if self.original[index].as_ref() == Some(current)
             || self.accepted[index].as_ref().is_some_and(|asset| {
@@ -79,11 +109,11 @@ impl RedoDraft {
             return None;
         }
         let reason = if self.original[index].is_some() {
-            "文件内容与历史指纹不一致"
+            AssetIssueReason::ContentChanged
         } else {
-            "没有可对比的历史指纹"
+            AssetIssueReason::MissingFingerprint
         };
-        Some(format!("{reason}，请重新定位或确认使用当前文件：{}", path.display()))
+        Some(AssetIssue { path: path.to_owned(), reason })
     }
 
     /// Inspect the currently selected file for one role. A moved, byte-identical original is valid.
@@ -93,13 +123,13 @@ impl RedoDraft {
         let content = match Fingerprint::read(path) {
             Ok(content) => content,
             Err(error) => return Some(AssetIssue {
-                message: format!("素材缺失或无法读取，请重新定位 {}：{error:#}", path.display()),
-                can_accept: false,
+                path: path.to_owned(),
+                reason: AssetIssueReason::Unreadable(error),
             }),
         };
-        let message = self.unapproved(role, path, &content)?;
+        let issue = self.unapproved(role, path, &content)?;
         self.offered[role as usize] = Some(ReviewedAsset { path: path.to_owned(), content });
-        Some(AssetIssue { message, can_accept: true })
+        Some(issue)
     }
 
     /// Authorize precisely the path and content reported by the most recent inspection.
@@ -126,8 +156,8 @@ impl RedoDraft {
             if let Some(path) = role.path(&self.options) {
                 let content = Fingerprint::read(path)
                     .with_context(|| format!("素材缺失或无法读取，请重新定位 {}", path.display()))?;
-                if let Some(message) = self.unapproved(role, path, &content) {
-                    anyhow::bail!(message);
+                if let Some(issue) = self.unapproved(role, path, &content) {
+                    return Err(issue.into());
                 }
                 expected[role as usize] = Some(content);
             }

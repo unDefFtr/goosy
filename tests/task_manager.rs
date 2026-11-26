@@ -1,4 +1,4 @@
-use libgoosy::task_manager::{Control, TaskId, TaskManager, TaskState};
+use libgoosy::task_manager::{Control, OutputError, TaskId, TaskManager, TaskState};
 use libgoosy::{EncoderBackend, RenderOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -114,6 +114,8 @@ fn real_workers_queue_controls_failure_and_cleanup() {
         .enqueue(options(dir.path(), "second.mp4", 500), 1)
         .unwrap();
     assert_ne!(first, second);
+    let creation_order = [first, second].map(|id| manager.task(id).unwrap().list_order_seq);
+    assert!(creation_order[0] < creation_order[1]);
     assert_eq!(manager.tasks()[1].state, TaskState::Queued);
     assert!(
         manager
@@ -155,6 +157,7 @@ fn real_workers_queue_controls_failure_and_cleanup() {
     wait(&manager, first, TaskState::Completed);
     wait(&manager, second, TaskState::Completed);
     let completed = manager.task(first).unwrap();
+    assert_eq!([first, second].map(|id| manager.task(id).unwrap().list_order_seq), creation_order);
     assert_eq!(completed.done, completed.total);
     assert_eq!(completed.committed, completed.total);
     assert_eq!(
@@ -234,6 +237,7 @@ fn real_workers_queue_controls_failure_and_cleanup() {
         .unwrap();
     wait(&manager, failed, TaskState::Failed);
     wait(&manager, recovery, TaskState::Completed);
+    assert!(manager.task(failed).unwrap().list_order_seq < manager.task(recovery).unwrap().list_order_seq);
     assert!(
         manager
             .enqueue(options(dir.path(), "second.mp4", 500), 1)
@@ -370,6 +374,7 @@ fn real_workers_queue_controls_failure_and_cleanup() {
         .unwrap();
     worker_lock.try_lock().unwrap();
     let reopened = self::manager(&root);
+    assert_eq!([first, second].map(|id| reopened.task(id).unwrap().list_order_seq), creation_order);
     assert!(reopened.delete(paused).is_err());
     assert!(reopened.command(paused, Control::Resume).is_err());
     assert!(reopened.command(paused, Control::Cancel).is_err());
@@ -437,17 +442,29 @@ fn invalid_container_or_private_stage_is_rejected_before_history() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("data");
     let manager = manager(&root);
+    let missing_name = manager.check_output(Path::new("")).unwrap_err();
+    assert_eq!(missing_name.downcast_ref::<OutputError>(), Some(&OutputError::MissingFileName));
+    let missing_dir = manager.check_output(&dir.path().join("missing").join("out.mp4")).unwrap_err();
+    assert_eq!(missing_dir.downcast_ref::<OutputError>(), Some(&OutputError::ParentNotFound));
+    assert_eq!(missing_dir.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::NotFound);
     for name in ["video", "video."] {
         let options = options(dir.path(), name, 500);
-        assert_eq!(manager.check_output(&options.output).unwrap_err().to_string(), "输出路径缺少容器扩展名");
+        let error = manager.check_output(&options.output).unwrap_err();
+        assert_eq!(error.downcast_ref::<OutputError>(), Some(&OutputError::MissingExtension));
+        assert_eq!(error.to_string(), "输出路径缺少容器扩展名");
         assert_eq!(manager.enqueue(options, 1).unwrap_err().to_string(), "输出路径缺少容器扩展名");
     }
     let private = dir.path().join(format!(".goosy-stage-{}-{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()));
     let nested = private.join("child");
     fs::create_dir_all(&nested).unwrap();
     let draft = options(&nested, "out.mp4", 500);
-    assert!(manager.check_output(&draft.output).is_err());
+    let error = manager.check_output(&draft.output).unwrap_err();
+    assert_eq!(error.downcast_ref::<OutputError>(), Some(&OutputError::PrivateDirectory(nested.canonicalize().unwrap())));
     assert!(manager.enqueue(draft, 1).is_err());
+    let reserved = dir.path().canonicalize().unwrap().join("reserved.mp4");
+    fs::write(dir.path().join(".reserved.mp4.goosy-lock"), b"reservation").unwrap();
+    let error = manager.check_output(&reserved).unwrap_err();
+    assert_eq!(error.downcast_ref::<OutputError>(), Some(&OutputError::Reserved(reserved)));
     let db = rusqlite::Connection::open(root.join("history.sqlite3")).unwrap();
     assert_eq!(db.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     assert_eq!(fs::read_dir(root.join("tasks")).unwrap().count(), 0);

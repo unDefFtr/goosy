@@ -41,7 +41,7 @@ function allStatesTasks() {
             thumbnail: _svgThumb("#1b3a6b", "#4e2a84"),
             updatedAt: now - 1000,
             lastActivitySeq: 107,
-            config: { width: 3840, height: 2160, fps: 120, encoder: "NVENC", codec: "H.265" }
+            config: { width: 3840, height: 2160, fps: 120, encoder: "ffmpeg-next-nvenc-zero-copy", codec: "H.265" }
         },
         {
             id: "mock-102",
@@ -57,7 +57,7 @@ function allStatesTasks() {
             thumbnail: _svgThumb("#0e5a6d", "#2c8c7c"),
             updatedAt: now - 60000,
             lastActivitySeq: 106,
-            config: { width: 1920, height: 1080, fps: 60, encoder: "QSV", codec: "H.264" }
+            config: { width: 1920, height: 1080, fps: 60, encoder: "ffmpeg-next", codec: "H.264" }
         },
         {
             id: "mock-103",
@@ -73,7 +73,7 @@ function allStatesTasks() {
             thumbnail: _svgThumb("#5b3a29", "#b07d3c"),
             updatedAt: now - 180000,
             lastActivitySeq: 105,
-            config: { width: 2560, height: 1440, fps: 60, encoder: "NVENC", codec: "H.264" }
+            config: { width: 2560, height: 1440, fps: 60, encoder: "ffmpeg-next-nvenc-zero-copy", codec: "H.264" }
         },
         {
             id: "mock-104",
@@ -88,7 +88,7 @@ function allStatesTasks() {
             thumbnail: "",
             updatedAt: now - 240000,
             lastActivitySeq: 104,
-            config: { width: 3840, height: 2160, fps: 60, encoder: "NVENC", codec: "H.265" }
+            config: { width: 3840, height: 2160, fps: 60, encoder: "ffmpeg-next-nvenc-zero-copy", codec: "H.265" }
         },
         {
             id: "mock-105",
@@ -103,7 +103,7 @@ function allStatesTasks() {
             thumbnail: "",
             updatedAt: now - 360000,
             lastActivitySeq: 103,
-            config: { width: 1920, height: 1080, fps: 60, encoder: "FFmpeg", codec: "H.264" }
+            config: { width: 1920, height: 1080, fps: 60, encoder: "pipe", codec: "H.264" }
         },
         {
             id: "mock-106",
@@ -118,7 +118,7 @@ function allStatesTasks() {
             thumbnail: "",
             updatedAt: now - 720000,
             lastActivitySeq: 102,
-            config: { width: 3840, height: 2160, fps: 120, encoder: "NVENC", codec: "AV1" }
+            config: { width: 3840, height: 2160, fps: 120, encoder: "ffmpeg-next-nvenc-zero-copy", codec: "AV1" }
         },
         {
             id: "mock-107",
@@ -133,7 +133,7 @@ function allStatesTasks() {
             thumbnail: _svgThumb("#2d3748", "#4a5568"),
             updatedAt: now - 1440000,
             lastActivitySeq: 101,
-            config: { width: 1920, height: 1080, fps: 30, encoder: "FFmpeg", codec: "H.264" }
+            config: { width: 1920, height: 1080, fps: 30, encoder: "pipe", codec: "H.264" }
         },
         {
             id: "mock-108",

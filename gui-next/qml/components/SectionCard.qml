@@ -38,6 +38,7 @@ Item {
                 Layout.fillWidth: true
                 typography: Typography.BodyLarge
                 text: root.title
+                wrapMode: Text.WordWrap
             }
 
             Icon {

@@ -1802,6 +1802,7 @@ dependencies = [
  "cxx-qt",
  "cxx-qt-build",
  "rinui-host",
+ "serde",
 ]
 
 [[package]]

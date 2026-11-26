@@ -10,7 +10,7 @@ pub(crate) const STYLE_PREVIEW_MAX_HEIGHT: u32 = 360;
 const STYLE_PREVIEW_TIME_MS: u64 = 2_500;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StylePreviewScene {
+pub(crate) struct StylePreviewScene<'a> {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) title: String,
@@ -19,6 +19,7 @@ pub(crate) struct StylePreviewScene {
     pub(crate) embedded_cover_audio: Option<PathBuf>,
     pub(crate) render_translation: bool,
     pub(crate) render_background_vocal: bool,
+    pub(crate) sample_text: Option<&'a [String; 5]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,12 +39,21 @@ pub(crate) fn style_preview_dimensions(width: u32, height: u32) -> (u32, u32) {
     )
 }
 
-fn style_preview_lines() -> Vec<lrc::LyricLine> {
+fn style_preview_lines(sample_text: Option<&[String; 5]>) -> Vec<lrc::LyricLine> {
+    let [previous, current, translation, backing, next] = sample_text
+        .map(|text| text.each_ref().map(String::as_str))
+        .unwrap_or([
+            "上一行歌词 · Previous line",
+            "正在演唱的歌词，用于预览换行与行高",
+            "Live style preview for spacing and line height",
+            "伴唱歌词 · Background vocal",
+            "下一行歌词 · Next line",
+        ]);
     vec![
         lrc::LyricLine {
             start_ms: 0,
             end_ms: 1_500,
-            text: "上一行歌词 · Previous line".to_owned(),
+            text: previous.to_owned(),
             translation: None,
             agent_id: None,
             is_duet: false,
@@ -54,20 +64,20 @@ fn style_preview_lines() -> Vec<lrc::LyricLine> {
         lrc::LyricLine {
             start_ms: 1_500,
             end_ms: 4_500,
-            text: "正在演唱的歌词，用于预览换行与行高".to_owned(),
-            translation: Some("Live style preview for spacing and line height".to_owned()),
+            text: current.to_owned(),
+            translation: Some(translation.to_owned()),
             agent_id: None,
             is_duet: false,
             is_background: false,
             background_vocal: Some(lrc::BackgroundVocal {
                 start_ms: 2_000,
                 end_ms: 3_500,
-                text: "伴唱歌词 · Background vocal".to_owned(),
+                text: backing.to_owned(),
                 translation: None,
                 words: vec![lrc::LyricWord {
                     start_ms: 2_000,
                     end_ms: 3_500,
-                    text: "伴唱歌词 · Background vocal".to_owned(),
+                    text: backing.to_owned(),
                 }],
             }),
             words: Vec::new(),
@@ -75,7 +85,7 @@ fn style_preview_lines() -> Vec<lrc::LyricLine> {
         lrc::LyricLine {
             start_ms: 4_500,
             end_ms: 6_500,
-            text: "下一行歌词 · Next line".to_owned(),
+            text: next.to_owned(),
             translation: None,
             agent_id: None,
             is_duet: false,
@@ -87,7 +97,7 @@ fn style_preview_lines() -> Vec<lrc::LyricLine> {
 }
 
 pub(crate) fn load_style_preview_assets(
-    scene: &StylePreviewScene,
+    scene: &StylePreviewScene<'_>,
 ) -> Result<SceneImageAssets, String> {
     let cover_path = scene.cover_path.as_deref();
     let background_path = scene.background_path.as_deref();
@@ -106,7 +116,7 @@ pub(crate) fn load_style_preview_assets(
 
 pub(crate) fn render_style_preview(
     style: LyricsStyle,
-    scene: &StylePreviewScene,
+    scene: &StylePreviewScene<'_>,
     assets: &SceneImageAssets,
 ) -> Result<PreviewFrame, String> {
     use skia_safe::{AlphaType, ColorType, IPoint, ImageInfo, surfaces};
@@ -116,7 +126,7 @@ pub(crate) fn render_style_preview(
     let preview_dimensions = style_preview_dimensions(output_width, output_height);
     let preview_size = (preview_dimensions.0 as i32, preview_dimensions.1 as i32);
     let geometry = FrameGeometry::for_frame(output_width, output_height);
-    let lines = style_preview_lines();
+    let lines = style_preview_lines(scene.sample_text);
     let renderer = LyricsRenderer::new_with_options(
         &lines,
         geometry.lyrics,

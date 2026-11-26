@@ -79,9 +79,9 @@ fn deletion_only_unlinks_verified_unprotected_stage_files() {
         id, state: "deleting".into(), options: opts.clone(), created_ms: 0, updated_ms: 0,
         elapsed: 0.0, committed: 0, total: 0, output_size: 0, error: String::new(), interval: 1,
     };
-    history.save(&record).unwrap();
+    history.insert(&record).unwrap();
     let other_id = Uuid::new_v4();
-    history.save(&Record {
+    history.insert(&Record {
         id: other_id,
         options: RenderOptions { song: input.movie.clone(), output: decoy.clone(), ..opts.clone() },
         state: "deleting".into(), created_ms: 0, updated_ms: 0, elapsed: 0.0, committed: 0,

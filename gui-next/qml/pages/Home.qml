@@ -10,6 +10,7 @@ import "../js/mock_recent_tasks.js" as MockRecentTasks
 Controls.Page {
     id: page
     objectName: "homePage"
+    title: qsTr("Home")
     background: Item {}
     property var project: JSON.parse(Backend.projectJson || "{}")
     property var task: JSON.parse(Backend.taskJson || "{}")
@@ -17,7 +18,7 @@ Controls.Page {
     readonly property var cfg: project.settings || {}
     readonly property int step: wizard.step || 0
     readonly property double redoRevision: wizard.redoRevision || 0
-    readonly property var titles: [qsTr("素材"), qsTr("样式"), qsTr("输出"), qsTr("确认")]
+    readonly property var titles: [qsTr("Media"), qsTr("Style"), qsTr("Output"), qsTr("Review")]
     readonly property bool navigating: stepTransition.running
     property int navigationDirection: 1
     property string navigationAction: ""
@@ -30,7 +31,8 @@ Controls.Page {
     // Optional preview hooks (empty / -1 use live Backend data and system local hour).
     property string mockPreset: ""
     property int greetingHour: -1
-    property string greeting: Ui.greetingText(greetingHour)
+    property int localHour: new Date().getHours()
+    readonly property string greeting: Ui.greetingText(greetingHour >= 0 ? greetingHour : localHour)
 
     readonly property var recentSource: {
         var mock = MockRecentTasks.preset(page.mockPreset)
@@ -78,17 +80,13 @@ Controls.Page {
     }
 
     onRecentSourceChanged: syncRecentRows()
-    onGreetingHourChanged: page.greeting = Ui.greetingText(page.greetingHour)
-    Component.onCompleted: {
-        page.greeting = Ui.greetingText(page.greetingHour)
-        syncRecentRows()
-    }
+    Component.onCompleted: syncRecentRows()
 
     Timer {
         interval: 60000
         repeat: true
-        running: page.greetingHour < 0
-        onTriggered: page.greeting = Ui.greetingText(page.greetingHour)
+        running: true
+        onTriggered: page.localHour = new Date().getHours()
     }
 
     onRedoRevisionChanged: {
@@ -197,7 +195,7 @@ Controls.Page {
                     objectName: "homeGreetingSubtitle"
                     Layout.fillWidth: true
                     Layout.topMargin: 6
-                    text: qsTr("准备好创作下一支视频了吗？")
+                    text: qsTr("Ready to make your next video?")
                     typography: Typography.Body
                     color: Theme.currentTheme.colors.textSecondaryColor
                     wrapMode: Text.WordWrap
@@ -207,7 +205,7 @@ Controls.Page {
                     objectName: "quickStartHeading"
                     Layout.fillWidth: true
                     Layout.topMargin: 28
-                    text: qsTr("快速开始")
+                    text: qsTr("Quick start")
                     typography: Typography.BodyStrong
                     color: Theme.currentTheme.colors.textColor
                 }
@@ -217,11 +215,9 @@ Controls.Page {
                     objectName: "beginWizardButton"
                     Layout.fillWidth: true
                     Layout.topMargin: 10
-                    title: qsTr("创建渲染任务")
-                    description: qsTr("导入音频、歌词与样式")
                     Controls.ToolTip.visible: hovered
                     Controls.ToolTip.delay: 600
-                    Controls.ToolTip.text: qsTr("草稿仅保留于本次会话")
+                    Controls.ToolTip.text: qsTr("Drafts are kept for this session only")
                     onClicked: Backend.command("wizardBegin")
                 }
 
@@ -342,7 +338,7 @@ Controls.Page {
                         Text {
                             Layout.fillWidth: true
                             horizontalAlignment: Text.AlignHCenter
-                            text: qsTr("还没有渲染任务")
+                            text: qsTr("No render tasks yet")
                             typography: Typography.BodyStrong
                             color: Theme.currentTheme.colors.textColor
                         }
@@ -350,7 +346,7 @@ Controls.Page {
                         Text {
                             Layout.fillWidth: true
                             horizontalAlignment: Text.AlignHCenter
-                            text: qsTr("创建第一个渲染任务后，进度与历史记录将显示在这里")
+                            text: qsTr("Create your first task to see its progress and history here.")
                             typography: Typography.Caption
                             color: Theme.currentTheme.colors.textSecondaryColor
                             wrapMode: Text.WordWrap
@@ -362,7 +358,7 @@ Controls.Page {
                             Layout.alignment: Qt.AlignHCenter
                             Layout.topMargin: 6
                             highlighted: false
-                            text: qsTr("开始创建")
+                            text: qsTr("Get started")
                             icon.name: "ic_fluent_add_20_regular"
                             focusPolicy: Qt.StrongFocus
                             onClicked: Backend.command("wizardBegin")
@@ -393,7 +389,7 @@ Controls.Page {
             spacing: 10
             Text {
                 objectName: "createTaskTitle"
-                text: page.wizard.redo ? qsTr("重做任务") : qsTr("创建任务")
+                text: page.wizard.redo ? qsTr("Redo task") : qsTr("Create task")
                 typography: Typography.Title
                 Layout.bottomMargin: 6
             }
@@ -412,8 +408,8 @@ Controls.Page {
                         text: (index + 1) + "  " + modelData
                         icon.name: ((page.wizard.completed || 0) & (1 << index)) ? "ic_fluent_checkmark_20_regular" : ""
                         focusPolicy: Qt.StrongFocus
-                        Accessible.description: index === page.step ? qsTr("当前步骤")
-                            : (((page.wizard.completed || 0) & (1 << index)) ? qsTr("已完成") : qsTr("待访问"))
+                        Accessible.description: index === page.step ? qsTr("Current step")
+                            : (((page.wizard.completed || 0) & (1 << index)) ? qsTr("Completed") : qsTr("Not visited yet"))
                         onClicked: page.navigate(index)
                         Keys.onLeftPressed: function(event) { stepButtons.itemAt(Math.max(0, index - 1)).forceActiveFocus(Qt.TabFocusReason); event.accepted = true }
                         Keys.onRightPressed: function(event) { stepButtons.itemAt(Math.min(3, index + 1)).forceActiveFocus(Qt.TabFocusReason); event.accepted = true }
@@ -458,23 +454,53 @@ Controls.Page {
                         spacing: 14
                         Repeater {
                             model: [
-                                { heading: qsTr("素材"), target: 0, body: qsTr("音频：%1\n歌词：%2\n封面：%3\n背景：%4\n歌曲名称：%5").arg(page.project.audio || qsTr("未选择")).arg(page.project.lyricsPath || qsTr("内嵌歌词")).arg(page.project.coverPath || qsTr("无外部封面")).arg(page.project.background || qsTr("自动背景")).arg(page.project.title || qsTr("音频元数据标题")) },
-                                { heading: qsTr("样式"), target: 1, body: qsTr("字号 %1% · 行高 %2% · 行间距 %3%\n翻译 %4 · 伴唱 %5").arg(page.cfg.fontScale).arg(page.cfg.lineHeight).arg(page.cfg.lineSpacing).arg(page.cfg.translation ? "开" : "关").arg(page.cfg.backgroundVocal ? "开" : "关"), details: qsTr("翻译字号 %1% · 伴唱字号 %2% · 左右留白 %3%\n翻译间距 %4% · 伴唱间距 %5% · 模糊步长 %6\n内嵌封面 %7 · 调试框 %8").arg(page.cfg.translationFontScale).arg(page.cfg.backgroundFontScale).arg(page.cfg.horizontalPadding).arg(page.cfg.translationGap).arg(page.cfg.backgroundGap).arg(page.cfg.blurStep).arg(page.cfg.embeddedCover ? "开" : "关").arg(page.cfg.debugOverlays ? "开" : "关") },
-                                { heading: qsTr("输出"), target: 2, body: qsTr("%1 × %2 · %3 fps\n%4 · %5\n%6\n%7 · 音频%8").arg(page.cfg.width).arg(page.cfg.height).arg(page.cfg.fps).arg((page.cfg.encoders || [])[page.cfg.encoder] || "").arg((page.cfg.codecs || [])[page.cfg.codec] || "").arg(page.wizard.effectiveOutput || page.project.output || qsTr("未选择路径")).arg(["完整渲染", "范围采样", "随机采样"][page.wizard.mode || 0]).arg((page.wizard.mode === 2 || (!page.wizard.redo && page.wizard.mode)) ? "关" : (page.cfg.includeAudio ? "开" : "关")), details: qsTr("采样起点 %1 ms · 时长 %2\n预览间隔 %3 帧 · NVENC p%4").arg(page.cfg.sampleStart).arg(page.cfg.sampleDuration == null ? qsTr("至结束") : page.cfg.sampleDuration + " ms").arg(page.cfg.previewInterval).arg(Number(page.cfg.nvencPreset) + 1) }
+                                {
+                                    heading: qsTr("Media"), target: 0,
+                                    body: qsTr("Audio: %1\nLyrics: %2\nCover: %3\nBackground: %4\nSong title: %5")
+                                        .arg(page.project.audio || qsTr("None selected"))
+                                        .arg(page.project.lyricsPath || qsTr("Embedded lyrics"))
+                                        .arg(page.project.coverPath || (page.cfg.embeddedCover ? qsTr("Embedded cover") : qsTr("No external cover")))
+                                        .arg(page.project.background || qsTr("Automatic background"))
+                                        .arg(page.project.title || qsTr("Title from audio metadata"))
+                                },
+                                {
+                                    heading: qsTr("Style"), target: 1,
+                                    body: qsTr("Font size: %1% · Line height: %2% · Line spacing: %3%\nTranslation: %4 · Backing vocals: %5")
+                                        .arg(page.cfg.fontScale).arg(page.cfg.lineHeight).arg(page.cfg.lineSpacing)
+                                        .arg(Ui.onOff(page.cfg.translation)).arg(Ui.onOff(page.cfg.backgroundVocal)),
+                                    details: qsTr("Translation font size: %1% · Backing vocal font size: %2% · Side margins: %3%\nTranslation spacing: %4% · Backing vocal spacing: %5% · Blur σ step: %6\nEmbedded cover: %7 · Debug outlines: %8")
+                                        .arg(page.cfg.translationFontScale).arg(page.cfg.backgroundFontScale).arg(page.cfg.horizontalPadding)
+                                        .arg(page.cfg.translationGap).arg(page.cfg.backgroundGap).arg(page.cfg.blurStep)
+                                        .arg(Ui.onOff(page.cfg.embeddedCover)).arg(Ui.onOff(page.cfg.debugOverlays))
+                                },
+                                {
+                                    heading: qsTr("Output"), target: 2,
+                                    body: qsTr("%1 × %2 · %3 fps\n%4 · %5\n%6\n%7 · Audio: %8")
+                                        .arg(page.cfg.width).arg(page.cfg.height).arg(page.cfg.fps)
+                                        .arg(Ui.encoderLabel((page.cfg.encoders || [])[page.cfg.encoder]))
+                                        .arg((page.cfg.codecs || [])[page.cfg.codec] || "")
+                                        .arg(page.wizard.effectiveOutput || page.project.output || qsTr("No path selected"))
+                                        .arg(Ui.modeLabel(page.wizard.mode || 0))
+                                        .arg(Ui.onOff(page.cfg.includeAudio && (page.wizard.mode === 0 || (page.wizard.redo && page.wizard.mode === 1)))),
+                                    details: qsTr("Sample start: %1 ms · Duration: %2\nPreview interval (frames): %3 · NVENC p%4")
+                                        .arg(page.cfg.sampleStart)
+                                        .arg(page.cfg.sampleDuration == null ? qsTr("Until the end") : qsTr("%1 ms").arg(page.cfg.sampleDuration))
+                                        .arg(page.cfg.previewInterval).arg(Number(page.cfg.nvencPreset) + 1)
+                                }
                             ]
                             SectionCard {
                                 required property var modelData
                                 Layout.fillWidth: true
                                 title: modelData.heading
-                                Text { Layout.fillWidth: true; text: modelData.body; wrapMode: Text.WrapAnywhere }
+                                Text { Layout.fillWidth: true; text: modelData.body; textFormat: Text.PlainText; wrapMode: Text.WrapAnywhere }
                                 Expander {
                                     Layout.fillWidth: true
                                     implicitWidth: 0
                                     visible: !!modelData.details
-                                    text: qsTr("详细设置")
-                                    Text { Layout.fillWidth: true; text: modelData.details || ""; wrapMode: Text.WordWrap }
+                                    text: qsTr("Detailed settings")
+                                    Text { Layout.fillWidth: true; text: modelData.details || ""; textFormat: Text.PlainText; wrapMode: Text.WordWrap }
                                 }
-                                Button { text: qsTr("修改"); onClicked: page.navigate(modelData.target) }
+                                Button { text: qsTr("Edit"); onClicked: page.navigate(modelData.target) }
                             }
                         }
                         Repeater {
@@ -486,37 +512,38 @@ Controls.Page {
                                     Layout.fillWidth: true
                                     Text {
                                         Layout.fillWidth: true
-                                        text: modelData.message
+                                        text: Ui.messageText(modelData.message)
+                                        textFormat: Text.PlainText
                                         color: Theme.currentTheme.colors.systemCriticalColor
                                         wrapMode: Text.WordWrap
                                     }
                                     Button {
                                         visible: modelData.canAccept === true
-                                        text: qsTr("使用当前文件")
+                                        text: qsTr("Use current file")
                                         onClicked: Backend.command("acceptAsset:" + modelData.field)
                                     }
                                     Button {
-                                        text: modelData.canAccept !== undefined ? qsTr("重新定位…") : qsTr("修改")
+                                        text: modelData.canAccept !== undefined ? qsTr("Locate file…") : qsTr("Edit")
                                         onClicked: page.navigate(modelData.step)
                                     }
                                 }
                                 Expander {
                                     Layout.fillWidth: true
                                     implicitWidth: 0
-                                    visible: !!modelData.detail
-                                    text: qsTr("错误详情")
-                                    Text { Layout.fillWidth: true; text: modelData.detail || ""; wrapMode: Text.WrapAnywhere }
+                                    visible: !!(modelData.message && modelData.message.detail)
+                                    text: qsTr("Error details")
+                                    Text { Layout.fillWidth: true; text: modelData.message ? modelData.message.detail : ""; textFormat: Text.PlainText; wrapMode: Text.WrapAnywhere }
                                 }
                             }
                         }
                         Text {
                             Layout.fillWidth: true
                             visible: page.wizard.checked && (page.wizard.issues || []).length === 0
-                            text: qsTr("检查通过")
+                            text: qsTr("Checks passed")
                             color: Theme.currentTheme.colors.systemSuccessColor
                             wrapMode: Text.WordWrap
                         }
-                        Button { text: qsTr("检查配置"); onClicked: Backend.command("wizardCheck") }
+                        Button { text: qsTr("Check settings"); onClicked: Backend.command("wizardCheck") }
                     }
                 }
                 MouseArea {
@@ -533,7 +560,7 @@ Controls.Page {
                 Layout.fillWidth: true
                 Button {
                     objectName: "wizardBackButton"
-                    text: page.step === 0 ? qsTr("返回首页") : qsTr("上一步")
+                    text: page.step === 0 ? qsTr("Back to Home") : qsTr("Back")
                     enabled: !page.navigating
                     onClicked: {
                         if (page.step === 0) Backend.command("wizardHome")
@@ -543,7 +570,7 @@ Controls.Page {
                 Item { Layout.fillWidth: true }
                 Button {
                     objectName: "wizardNextButton"
-                    text: page.step === 3 ? qsTr("创建任务") : qsTr("下一步")
+                    text: page.step === 3 ? qsTr("Create task") : qsTr("Next")
                     highlighted: true
                     enabled: !page.navigating
                     onClicked: {
@@ -567,13 +594,14 @@ Controls.Page {
                 Layout.fillWidth: true
                 styleSource: Backend.styleSource
                 renderSource: Backend.renderSource
-                styleError: page.task.styleError || ""
+                styleError: page.task.styleError || null
+                previewNote: page.task.previewNote || null
                 task: page.task
                 mode: 1
             }
             Text {
                 Layout.fillWidth: true
-                text: qsTr("%1 × %2 · %3 fps\n%4 · %5").arg(page.cfg.width || "").arg(page.cfg.height || "").arg(page.cfg.fps || "").arg((page.cfg.encoders || [])[page.cfg.encoder] || "").arg((page.cfg.codecs || [])[page.cfg.codec] || "")
+                text: qsTr("%1 × %2 · %3 fps\n%4 · %5").arg(page.cfg.width || "").arg(page.cfg.height || "").arg(page.cfg.fps || "").arg(Ui.encoderLabel((page.cfg.encoders || [])[page.cfg.encoder])).arg((page.cfg.codecs || [])[page.cfg.codec] || "")
                 wrapMode: Text.WordWrap
                 color: Theme.currentTheme.colors.textSecondaryColor
             }

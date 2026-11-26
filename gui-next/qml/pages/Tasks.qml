@@ -45,7 +45,22 @@ Controls.Page {
                 detail: String(task.detail || "")
             };
         });
-        queue.currentIndex = selectedIndex;
+        const selection = selectedIndex >= 0 ? snapshot[selectedIndex].id : "";
+        if (queue.syncedSelection !== selection) {
+            queue.syncedSelection = selection;
+            queue.forceLayout();
+            queue.currentIndex = selectedIndex;
+            if (selectedIndex >= 0)
+                queue.positionViewAtIndex(selectedIndex, ListView.Contain);
+        } else if (queue.currentIndex !== selectedIndex) {
+            // Qt batches structural changes. Let it shift the current row first.
+            queue.forceLayout();
+            if (queue.currentIndex !== selectedIndex) {
+                const viewportY = queue.contentY;
+                queue.currentIndex = selectedIndex;
+                queue.contentY = viewportY;
+            }
+        }
     }
 
     function rowForId(id) {
@@ -86,7 +101,7 @@ Controls.Page {
                 Layout.fillWidth: true
             }
             Text {
-                text: qsTr("并发上限 %1").arg(page.task.maxConcurrent || 1)
+                text: qsTr("Concurrency limit: %1").arg(page.task.maxConcurrent || 1)
                 color: Theme.currentTheme.colors.textSecondaryColor
             }
         }
@@ -94,9 +109,24 @@ Controls.Page {
             objectName: "taskActionError"
             Layout.fillWidth: true
             visible: !!page.task.error
-            text: page.task.error || ""
+            Text {
+                objectName: "taskActionErrorSummary"
+                width: Math.max(0, parent.parent.width)
+                text: Ui.messageText(page.task.error)
+                textFormat: Text.PlainText
+                wrapMode: Text.WrapAnywhere
+            }
             severity: Severity.Error
             closable: false
+        }
+        Text {
+            objectName: "taskActionErrorDetail"
+            Layout.fillWidth: true
+            visible: text.length > 0
+            text: page.task.error ? page.task.error.detail || "" : ""
+            textFormat: Text.PlainText
+            typography: Typography.Caption
+            wrapMode: Text.WrapAnywhere
         }
         RowLayout {
             Layout.fillWidth: true
@@ -113,21 +143,22 @@ Controls.Page {
                 spacing: 10
 
                 Text {
+                    objectName: "taskCountSummary"
                     Layout.fillWidth: true
                     text: {
-                        var parts = [qsTr("%1 个任务").arg(page.tasks.length)];
+                        var parts = [page.tasks.length === 1 ? qsTr("1 task") : qsTr("%1 tasks").arg(page.tasks.length)];
                         var running = page.stateCount(["starting", "running"]);
                         var paused = page.stateCount(["paused"]);
                         var queued = page.stateCount(["queued"]);
                         var interrupted = page.stateCount(["interrupted"]);
                         if (running)
-                            parts.push(qsTr("%1 运行中").arg(running));
+                            parts.push(qsTr("%1 running").arg(running));
                         if (paused)
-                            parts.push(qsTr("%1 已暂停").arg(paused));
+                            parts.push(qsTr("%1 paused").arg(paused));
                         if (interrupted)
-                            parts.push(qsTr("%1 已中断").arg(interrupted));
+                            parts.push(qsTr("%1 interrupted").arg(interrupted));
                         if (queued)
-                            parts.push(qsTr("%1 排队中").arg(queued));
+                            parts.push(qsTr("%1 queued").arg(queued));
                         return parts.join(" · ");
                     }
                     typography: Typography.Body
@@ -144,10 +175,8 @@ Controls.Page {
                     boundsBehavior: Flickable.StopAtBounds
                     model: taskRows
                     currentIndex: -1
-                    onCurrentIndexChanged: {
-                        if (currentIndex >= 0)
-                            positionViewAtIndex(currentIndex, ListView.Contain);
-                    }
+                    // ListView tracks the current delegate through inserts and removals.
+                    property string syncedSelection: ""
                     onItemClicked: function (index) {
                         if (index >= 0 && index < taskRows.count)
                             page.backend.command("select:" + taskRows.get(index).taskId);
@@ -184,7 +213,7 @@ Controls.Page {
                         highlighted: taskId === String(page.task.selectedId || "")
                         keyboardNavigation: queue.keyboardNavigation && highlighted
                         focusPolicy: Qt.StrongFocus
-                        Accessible.name: title + "，" + Ui.stateLabel(taskState)
+                        Accessible.name: qsTr("%1, %2").arg(Ui.taskTitle(title)).arg(Ui.stateLabel(taskState))
 
                         TapHandler {
                             acceptedButtons: Qt.RightButton
@@ -222,7 +251,8 @@ Controls.Page {
                                 Text {
                                     Layout.fillWidth: true
                                     Layout.alignment: Qt.AlignVCenter
-                                    text: taskCard.title
+                                    text: Ui.taskTitle(taskCard.title)
+                                    textFormat: Text.PlainText
                                     typography: Typography.BodyStrong
                                     elide: Text.ElideRight
                                     maximumLineCount: 1
@@ -258,8 +288,9 @@ Controls.Page {
                             Text {
                                 Layout.fillWidth: true
                                 text: taskCard.isFailed
-                                    ? (taskCard.detail ? taskCard.detail.replace(/[\r\n]+/g, " ").trim() : qsTr("渲染失败"))
+                                    ? (Ui.taskSummary(taskCard.taskState, taskCard.detail) || Ui.stateLabel(taskCard.taskState))
                                     : Ui.stateLabel(taskCard.taskState) + " · " + taskCard.output.split(/[\\/]/).pop()
+                                textFormat: Text.PlainText
                                 typography: Typography.Caption
                                 color: taskCard.isFailed
                                     ? Theme.currentTheme.colors.systemCriticalColor
@@ -274,7 +305,7 @@ Controls.Page {
                                     id: pathTip
                                     objectName: "taskListPathTip"
                                     visible: outputHover.hovered && pathTip.text.length > 0
-                                    text: taskCard.isFailed ? (taskCard.detail || taskCard.output) : taskCard.output
+                                    text: taskCard.isFailed ? Ui.taskSummary(taskCard.taskState, taskCard.detail) : taskCard.output
                                 }
                             }
                         }
@@ -282,7 +313,7 @@ Controls.Page {
                     Text {
                         anchors.centerIn: parent
                         visible: queue.count === 0
-                        text: qsTr("暂无任务")
+                        text: qsTr("No tasks yet")
                         color: Theme.currentTheme.colors.textSecondaryColor
                     }
                 }
@@ -316,13 +347,14 @@ Controls.Page {
                         Layout.fillWidth: true
                         Text {
                             Layout.fillWidth: true
-                            text: page.task.title || (page.task.id ? qsTr("任务 #%1").arg(page.task.id) : "")
+                            text: page.task.id ? Ui.taskTitle(page.task.title) : ""
+                            textFormat: Text.PlainText
                             typography: Typography.Subtitle
                             elide: Text.ElideRight
                         }
                         Button {
                             objectName: "pauseButton"
-                            text: qsTr("暂停")
+                            text: qsTr("Pause")
                             icon.name: "ic_fluent_pause_20_regular"
                             highlighted: true
                             enabled: page.selectedActions.indexOf("pause") >= 0
@@ -331,7 +363,7 @@ Controls.Page {
                         }
                         Button {
                             objectName: "resumeButton"
-                            text: page.state === "interrupted" ? qsTr("恢复渲染") : qsTr("继续")
+                            text: page.state === "interrupted" ? qsTr("Resume rendering") : qsTr("Resume")
                             icon.name: "ic_fluent_play_20_regular"
                             highlighted: true
                             enabled: page.selectedActions.indexOf("resume") >= 0
@@ -340,7 +372,7 @@ Controls.Page {
                         }
                         Button {
                             objectName: "cancelButton"
-                            text: qsTr("取消")
+                            text: qsTr("Cancel")
                             icon.name: "ic_fluent_dismiss_20_regular"
                             enabled: page.selectedActions.indexOf("cancel") >= 0
                             visible: enabled || page.task.pending === "cancel"
@@ -359,9 +391,9 @@ Controls.Page {
                         Text {
                             visible: !!page.task.pending
                             text: ({
-                                    pause: qsTr("正在暂停…"),
-                                    resume: qsTr("正在继续…"),
-                                    cancel: qsTr("正在取消…")
+                                    pause: qsTr("Pausing…"),
+                                    resume: qsTr("Resuming…"),
+                                    cancel: qsTr("Cancelling…")
                                 })[page.task.pending] || ""
                             typography: Typography.Caption
                             color: Theme.currentTheme.colors.textSecondaryColor
@@ -375,7 +407,7 @@ Controls.Page {
                             typography: Typography.Body
                         }
                         Text {
-                            text: qsTr("已用 %1").arg(Ui.formatElapsed(page.task.elapsed))
+                            text: qsTr("Elapsed: %1").arg(Ui.formatElapsed(page.task.elapsed))
                             typography: Typography.Caption
                             color: Theme.currentTheme.colors.textSecondaryColor
                         }
@@ -393,18 +425,10 @@ Controls.Page {
                     Text {
                         Layout.fillWidth: true
                         visible: !!page.task.detail
-                        text: page.task.detail || ""
+                        text: Ui.taskSummary(page.state, page.task.detail)
                         color: page.state === "failed" ? Theme.currentTheme.colors.systemCriticalColor : Theme.currentTheme.colors.textSecondaryColor
                         elide: Text.ElideRight
                         maximumLineCount: 1
-                        HoverHandler {
-                            id: failureHover
-                        }
-                        ToolTip {
-                            objectName: "taskFailureTip"
-                            visible: failureHover.hovered
-                            text: page.task.detail || ""
-                        }
                     }
 
                     ColumnLayout {
@@ -415,6 +439,7 @@ Controls.Page {
                             objectName: "taskOutputFilename"
                             Layout.fillWidth: true
                             text: String(page.task.output || "").split(/[\\/]/).pop()
+                            textFormat: Text.PlainText
                             typography: Typography.Body
                             elide: Text.ElideMiddle
                             maximumLineCount: 1
@@ -436,7 +461,7 @@ Controls.Page {
                                 color: Theme.currentTheme.colors.textSecondaryColor
                             }
                             Text {
-                                text: (page.task.config || {}).encoder || ""
+                                text: Ui.encoderLabel((page.task.config || {}).encoder || "")
                                 typography: Typography.Caption
                                 color: Theme.currentTheme.colors.textSecondaryColor
                             }
@@ -447,14 +472,14 @@ Controls.Page {
                             }
                             Text {
                                 visible: Number(page.task.outputSize) > 0
-                                text: qsTr("文件大小 %1").arg(Ui.formatBytes(page.task.outputSize))
+                                text: qsTr("File size: %1").arg(Ui.formatBytes(page.task.outputSize))
                                 typography: Typography.Caption
                                 color: Theme.currentTheme.colors.textSecondaryColor
                             }
                         }
                         Text {
                             Layout.fillWidth: true
-                            text: qsTr("创建 %1 · 更新 %2").arg(Ui.formatTimestamp(page.task.createdAt)).arg(Ui.formatTimestamp(page.task.updatedAt))
+                            text: qsTr("Created %1 · Updated %2").arg(Ui.formatTimestamp(page.task.createdAt)).arg(Ui.formatTimestamp(page.task.updatedAt))
                             typography: Typography.Caption
                             wrapMode: Text.WordWrap
                             color: Theme.currentTheme.colors.textSecondaryColor
@@ -469,17 +494,17 @@ Controls.Page {
                         task: page.task
                         renderSource: page.backend.renderSource
                         styleSource: page.backend.styleSource
-                        styleError: page.task.styleError || ""
+                        styleError: page.task.styleError || null
                     }
 
                     Expander {
                         Layout.fillWidth: true
                         implicitWidth: 0
-                        text: qsTr("文件与错误详情")
+                        text: qsTr("Files and error details")
                         expanded: false
                         Text {
                             Layout.fillWidth: true
-                            text: qsTr("任务 ID：%1\n输出：%2\n音频：%3").arg(page.task.id || "")
+                            text: qsTr("Task ID: %1\nOutput: %2\nAudio: %3").arg(page.task.id || "")
                                 .arg(page.task.output || "").arg((page.task.config || {}).audio || "")
                                 + (page.task.detail ? "\n" + page.task.detail : "")
                             wrapMode: Text.WrapAnywhere
@@ -492,7 +517,7 @@ Controls.Page {
                         id: taskOptions
                         Layout.fillWidth: true
                         implicitWidth: 0
-                        text: qsTr("渲染配置快照")
+                        text: qsTr("Render configuration")
                         expanded: false
                         Text {
                             Layout.fillWidth: true
@@ -508,7 +533,7 @@ Controls.Page {
                         objectName: "taskLogs"
                         Layout.fillWidth: true
                         implicitWidth: 0
-                        text: qsTr("日志")
+                        text: qsTr("Log")
                         onExpandedChanged: {
                             if (expanded) {
                                 logFlick.followLatest = true;
@@ -537,7 +562,7 @@ Controls.Page {
                                 id: logText
                                 objectName: "selectedTaskLogText"
                                 width: logFlick.width - 12
-                                text: String(page.task.log || qsTr("暂无日志"))
+                                text: String(page.task.log || qsTr("No log entries yet"))
                                 textFormat: Text.PlainText
                                 wrapMode: Text.WrapAnywhere
                                 typography: Typography.Caption
@@ -552,7 +577,7 @@ Controls.Page {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 visible: !page.task.id
-                text: qsTr("选择一个任务查看详情")
+                text: qsTr("Select a task to view its details")
                 color: Theme.currentTheme.colors.textSecondaryColor
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
@@ -610,12 +635,12 @@ Controls.Page {
             enabled: visible
             onTriggered: page.requestAction(operation, taskMenu.targetId)
         }
-        TaskAction { operation: "pause"; text: qsTr("暂停"); icon.name: "ic_fluent_pause_20_regular" }
-        TaskAction { operation: "resume"; text: qsTr("继续"); icon.name: "ic_fluent_play_20_regular" }
-        TaskAction { operation: "cancel"; text: qsTr("取消"); icon.name: "ic_fluent_dismiss_20_regular" }
-        TaskAction { operation: "redo"; text: qsTr("重做"); icon.name: "ic_fluent_arrow_repeat_all_20_regular" }
-        TaskAction { operation: "openOutput"; text: qsTr("打开输出目录"); icon.name: "ic_fluent_folder_open_20_regular" }
-        TaskAction { operation: "delete"; text: qsTr("删除"); icon.name: "ic_fluent_delete_20_regular" }
+        TaskAction { operation: "pause"; text: qsTr("Pause"); icon.name: "ic_fluent_pause_20_regular" }
+        TaskAction { operation: "resume"; text: qsTr("Resume"); icon.name: "ic_fluent_play_20_regular" }
+        TaskAction { operation: "cancel"; text: qsTr("Cancel"); icon.name: "ic_fluent_dismiss_20_regular" }
+        TaskAction { operation: "redo"; text: qsTr("Redo"); icon.name: "ic_fluent_arrow_repeat_all_20_regular" }
+        TaskAction { operation: "openOutput"; text: qsTr("Open output folder"); icon.name: "ic_fluent_folder_open_20_regular" }
+        TaskAction { operation: "delete"; text: qsTr("Delete"); icon.name: "ic_fluent_delete_20_regular" }
     }
 
     Dialog {
@@ -626,7 +651,7 @@ Controls.Page {
         property string operation: ""
         readonly property var targetRow: page.rowForId(targetId)
         readonly property bool allowed: !!targetRow && (targetRow.actions || []).indexOf(operation) >= 0
-        title: deleting ? qsTr("删除任务") : qsTr("取消任务")
+        title: deleting ? qsTr("Delete task") : qsTr("Cancel task")
         modal: true
         closePolicy: Controls.Popup.CloseOnEscape
         onOpened: dismissCancelButton.forceActiveFocus()
@@ -637,9 +662,9 @@ Controls.Page {
         Text {
             Layout.fillWidth: true
             text: (confirmDialog.deleting
-                ? qsTr("确定删除“%1”吗？将删除任务历史、缩略图、检查点、分段视频和临时文件。保留导出的视频和原始素材。如任务仍在运行，请先取消并等待渲染停止。")
-                : qsTr("确定取消“%1”吗？取消后将无法继续渲染，历史记录会保留。"))
-                .arg(confirmDialog.targetRow ? confirmDialog.targetRow.title : "")
+                ? qsTr("Delete “%1”? This removes the task history, thumbnail, checkpoints, video segments, and temporary files. Your exported video and source files are kept. If the task is running, cancel it and wait for rendering to stop first.")
+                : qsTr("Cancel “%1”? Rendering cannot be resumed after cancellation. The task history will be kept."))
+                .arg(confirmDialog.targetRow ? Ui.taskTitle(confirmDialog.targetRow.title) : "")
             textFormat: Text.PlainText
             typography: Typography.Body
             color: Theme.currentTheme.colors.textColor
@@ -666,7 +691,7 @@ Controls.Page {
                 objectName: confirmDialog.deleting ? "dismissDeleteTaskButton" : "dismissCancelTaskButton"
                 Layout.fillWidth: true
                 Layout.preferredWidth: 1
-                text: qsTr("返回")
+                text: qsTr("Go back")
                 focusPolicy: Qt.StrongFocus
                 onClicked: confirmDialog.reject()
                 Keys.onReturnPressed: dismissCancelButton.click()

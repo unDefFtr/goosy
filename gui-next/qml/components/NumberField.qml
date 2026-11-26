@@ -6,6 +6,7 @@ RowLayout {
     id: root
 
     property string label: ""
+    property string accessibleName: label
     property string suffix: ""
     property alias value: spin.value
     property alias from: spin.from
@@ -22,8 +23,7 @@ RowLayout {
         typography: Typography.Body
         text: root.label
         visible: root.label.length > 0
-        elide: Text.ElideRight
-        maximumLineCount: 1
+        wrapMode: Text.WordWrap
     }
 
     SpinBox {
@@ -31,6 +31,7 @@ RowLayout {
         objectName: root.controlObjectName
         Layout.preferredWidth: 132
         editable: true
+        Accessible.name: root.accessibleName
 
         onValueModified: Qt.callLater(function() { root.edited(Math.round(spin.value)) })
     }

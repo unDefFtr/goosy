@@ -3,7 +3,9 @@ use crate::gui_shared::{
     sample_output_path, scan_sibling_assets,
 };
 use goosy_rinui::{FrameUpdate, RgbaFrame, Snapshot, ViewModel};
-use libgoosy::task_manager::{AssetRole, Control, RedoDraft, TaskId, TaskInfo, TaskManager};
+use libgoosy::task_manager::{
+    AssetIssueReason, AssetRole, Control, OutputError, RedoDraft, TaskId, TaskInfo, TaskManager,
+};
 use libgoosy::{EncoderBackend, RenderOptions, VideoCodec, video};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -45,6 +47,41 @@ fn path_to_file_url(path: &Path) -> String {
     encoded
 }
 
+#[derive(serde::Serialize)]
+struct Message {
+    code: &'static str,
+    args: Vec<String>,
+    detail: String,
+}
+
+impl Message {
+    fn new(code: &'static str) -> Self {
+        Self { code, args: Vec::new(), detail: String::new() }
+    }
+
+    fn path(code: &'static str, path: &Path) -> Self {
+        Self { args: vec![path.to_string_lossy().into_owned()], ..Self::new(code) }
+    }
+
+    fn error(code: &'static str, error: anyhow::Error) -> Self {
+        Self { detail: format!("{error:#}"), ..Self::new(code) }
+    }
+
+    fn output_error(error: anyhow::Error, fallback: &'static str) -> Self {
+        let message = match error.downcast_ref::<OutputError>() {
+            Some(OutputError::MissingFileName) => Self::new("outputFileRequired"),
+            Some(OutputError::MissingExtension) => Self::new("outputExtensionRequired"),
+            Some(OutputError::MissingParent) => Self::new("outputDirectoryRequired"),
+            Some(OutputError::ParentNotFound) => Self::new("outputDirectoryUnavailable"),
+            Some(OutputError::PrivateDirectory(path)) => Self::path("outputPrivateDirectory", path),
+            Some(OutputError::AlreadyExists(path)) => Self::path("outputExists", path),
+            Some(OutputError::Reserved(path)) => Self::path("outputReserved", path),
+            None => return Self::error(fallback, error),
+        };
+        Self { detail: format!("{error:#}"), ..message }
+    }
+}
+
 #[derive(Default)]
 struct Assets {
     audio: Option<PathBuf>,
@@ -53,7 +90,7 @@ struct Assets {
     lyrics_index: usize,
     cover_index: usize,
     lyrics_text: String,
-    notice: String,
+    notice: Option<Message>,
 }
 
 impl Assets {
@@ -74,11 +111,11 @@ impl Assets {
         }
     }
 
-    fn labels<'a>(fallback: &'a str, paths: &'a [PathBuf]) -> impl Iterator<Item = &'a str> {
-        std::iter::once(fallback).chain(paths.iter().map(|path| {
+    fn labels(paths: &[PathBuf]) -> impl Iterator<Item = &str> {
+        std::iter::once("").chain(paths.iter().map(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("未知文件名")
+                .unwrap_or_default()
         }))
     }
 }
@@ -141,11 +178,18 @@ struct AudioSelection {
     lyrics: Vec<PathBuf>,
     cover: Vec<PathBuf>,
     title: Option<String>,
-    notice: String,
+    notice: Option<Message>,
 }
 
-type StyleRequest = (u64, u64, StylePreviewScene, libgoosy::LyricsStyle);
-type StyleResult = (u64, Result<RgbaFrame, String>);
+struct StyleRequest {
+    serial: u64,
+    generation: u64,
+    scene: StylePreviewScene<'static>,
+    sample_text: Option<Arc<[String; 5]>>,
+    style: libgoosy::LyricsStyle,
+}
+
+type StyleResult = (u64, Result<RgbaFrame, Message>);
 
 #[derive(Default)]
 struct Wizard {
@@ -195,14 +239,15 @@ pub(crate) struct Model {
     style_serial: u64,
     preview_asset_generation: u64,
     style_dirty: bool,
-    style_error: String,
+    sample_text: Option<Arc<[String; 5]>>,
+    style_error: Option<Message>,
     style: FrameUpdate,
     render: FrameUpdate,
     manager: TaskManager,
     selected_task: Option<TaskId>,
     preview_cache: VecDeque<(TaskId, libgoosy::task_manager::RgbaFrame)>,
     pending_task_thumbnails: Vec<(String, FrameUpdate)>,
-    task_error: String,
+    task_error: Option<Message>,
     last_task_revision: Option<u64>,
     project_dirty: bool,
     wizard: Wizard,
@@ -223,15 +268,15 @@ impl Model {
             let (title, notice) = match video::audio_metadata(&audio) {
                 Ok(metadata) => {
                     let notice = if !lyrics.is_empty() {
-                        "已匹配同名素材".to_owned()
+                        Message::new("assetsMatched")
                     } else if metadata.lyrics.is_some() {
-                        "将使用音频内嵌歌词".to_owned()
+                        Message::new("usingEmbeddedLyrics")
                     } else {
-                        "未找到同名或内嵌歌词，请手动选择".to_owned()
+                        Message::new("noMatchingLyrics")
                     };
-                    (metadata.title, notice)
+                    (metadata.title, Some(notice))
                 }
-                Err(error) => (None, format!("读取音频元数据失败：{error:#}")),
+                Err(error) => (None, Some(Message::error("audioMetadataFailed", error))),
             };
             AudioSelection {
                 serial,
@@ -244,7 +289,8 @@ impl Model {
         let mut cached = None;
         let style_job = LatestJob::new(
             "goosy-style-preview",
-            move |(serial, generation, scene, style): StyleRequest| {
+            move |StyleRequest { serial, generation, scene, sample_text, style }| {
+                let scene = StylePreviewScene { sample_text: sample_text.as_deref(), ..scene };
                 let sources = PreviewAssets {
                     generation,
                     background: scene.background_path.clone(),
@@ -255,14 +301,17 @@ impl Model {
                     cached = Some((sources, load_style_preview_assets(&scene)));
                 }
                 let result = match &cached.as_ref().expect("preview asset cache").1 {
-                    Ok(assets) => {
-                        render_style_preview(style, &scene, assets).map(|frame| RgbaFrame {
+                    Ok(assets) => render_style_preview(style, &scene, assets)
+                        .map(|frame| RgbaFrame {
                             width: frame.width,
                             height: frame.height,
                             pixels: frame.pixels,
                         })
-                    }
-                    Err(error) => Err(error.clone()),
+                        .map_err(|detail| Message { detail, ..Message::new("styleRenderFailed") }),
+                    Err(error) => Err(Message {
+                        detail: error.clone(),
+                        ..Message::new("styleAssetsFailed")
+                    }),
                 };
                 (serial, result)
             },
@@ -283,14 +332,15 @@ impl Model {
             style_serial: 0,
             preview_asset_generation: 0,
             style_dirty: true,
-            style_error: String::new(),
+            sample_text: None,
+            style_error: None,
             style: FrameUpdate::Keep,
             render: FrameUpdate::Keep,
             manager,
             selected_task: None,
             preview_cache: VecDeque::new(),
             pending_task_thumbnails: Vec::new(),
-            task_error: String::new(),
+            task_error: None,
             last_task_revision: None,
             project_dirty: true,
             wizard: Wizard::default(),
@@ -306,8 +356,8 @@ impl Model {
             "background": self.options.background.as_deref().map(label).unwrap_or_default(),
             "output": label(&self.options.output), "title": self.options.title.as_deref().unwrap_or_default(),
             "notice": self.assets.notice, "canStart": !self.matching_assets && self.assets.audio.is_some() && !self.options.output.as_os_str().is_empty(),
-            "lyricsCandidates": Assets::labels("内嵌歌词", &self.assets.lyrics).collect::<Vec<_>>(),
-            "coverCandidates": Assets::labels("无外部封面", &self.assets.cover).collect::<Vec<_>>(),
+            "lyricsCandidates": Assets::labels(&self.assets.lyrics).collect::<Vec<_>>(),
+            "coverCandidates": Assets::labels(&self.assets.cover).collect::<Vec<_>>(),
             "lyricsIndex": self.assets.lyrics_index, "coverIndex": self.assets.cover_index,
             "settings": serde_json::from_str::<Value>(&self.defaults_json()).expect("serialized settings"),
             "wizard": {
@@ -345,9 +395,7 @@ impl Model {
     }
 
     fn task_json(&self, tasks: &mut [TaskInfo]) -> Value {
-        tasks.sort_unstable_by_key(|t| {
-            std::cmp::Reverse((t.updated_at_ms, t.last_activity_seq, t.id))
-        });
+        tasks.sort_unstable_by_key(|t| std::cmp::Reverse(t.list_order_seq));
         let task_value = |task: &TaskInfo| {
             json!({
                 "id": task.id.to_string(), "state": task.state.name(),
@@ -362,14 +410,14 @@ impl Model {
                 "lastActivitySeq": task.last_activity_seq, "outputSize": task.output_size,
                 "thumbnail": self.task_thumbnail_url(task),
                 "output": task.options.output.to_string_lossy(),
-                "title": task.options.title.as_deref().unwrap_or("未命名任务"),
+                "title": task.options.title.as_deref().unwrap_or_default(),
                 "config": {
                     "audio": task.options.song.to_string_lossy(),
                     "lyrics": task.options.lyrics.as_ref().map(|path| path.to_string_lossy()),
                     "cover": task.options.cover.as_ref().map(|path| path.to_string_lossy()),
                     "background": task.options.background.as_ref().map(|path| path.to_string_lossy()),
                     "width": task.options.width, "height": task.options.height, "fps": task.options.fps,
-                    "encoder": task.options.encoder.label(), "codec": task.options.codec.label(),
+                    "encoder": task.options.encoder.cli_value(), "codec": task.options.codec.label(),
                     "sampleStart": task.options.sample_start_ms,
                     "sampleDuration": task.options.sample_duration_ms,
                 },
@@ -385,7 +433,13 @@ impl Model {
                 value["stage"] = json!(task.stage);
                 value["previewFrame"] = task.preview_frame.into();
                 value["savedPreview"] = json!(task.thumbnail.as_deref().map(path_to_file_url));
-                value["previewNote"] = json!(task.preview_note);
+                value["previewNote"] = if let Some(detail) = &task.thumbnail_error {
+                    json!({"code": "thumbnailSaveFailed", "args": [], "detail": detail})
+                } else if task.options.encoder.is_zero_copy() && task.preview_frame == 0 && task.thumbnail.is_none() {
+                    json!(Message::new("zeroCopyPreview"))
+                } else {
+                    Value::Null
+                };
                 value["log"] = json!(task.log);
             }
             rows.push(row);
@@ -398,8 +452,8 @@ impl Model {
             .unwrap_or_default()
             .into();
         value["maxConcurrent"] = self.manager.max_concurrent().into();
-        value["error"] = self.task_error.clone().into();
-        value["styleError"] = self.style_error.clone().into();
+        value["error"] = json!(self.task_error);
+        value["styleError"] = json!(self.style_error);
         value
     }
 
@@ -412,7 +466,7 @@ impl Model {
         self.options.title = Some(stem.to_owned());
         self.assets = Assets {
             audio: Some(path.clone()),
-            notice: "正在匹配同名素材…".into(),
+            notice: Some(Message::new("matchingAssets")),
             ..Assets::default()
         };
         self.title_edited = false;
@@ -422,7 +476,7 @@ impl Model {
         self.matching_assets = self.audio_job.request((self.audio_serial, path));
         self.style_dirty = true;
         if !self.matching_assets {
-            self.assets.notice = "素材读取线程已退出".into();
+            self.assets.notice = Some(Message::new("assetWorkerStopped"));
         }
     }
 
@@ -471,13 +525,17 @@ impl Model {
                 embedded_cover_audio: embedded,
                 render_translation: self.options.render_translation,
                 render_background_vocal: self.options.render_background_vocal,
+                sample_text: None,
             };
             self.style_serial += 1;
-            if !self
-                .style_job
-                .request((self.style_serial, self.preview_asset_generation, scene, self.options.lyrics_style))
-            {
-                self.style_error = "样式预览线程已退出".into();
+            if !self.style_job.request(StyleRequest {
+                serial: self.style_serial,
+                generation: self.preview_asset_generation,
+                scene,
+                sample_text: self.sample_text.clone(),
+                style: self.options.lyrics_style,
+            }) {
+                self.style_error = Some(Message::new("styleWorkerStopped"));
                 self.last_task_revision = None;
             }
         }
@@ -489,14 +547,13 @@ impl Model {
             match result {
                 Ok(image) => {
                     self.style = FrameUpdate::Replace(image);
-                    if !self.style_error.is_empty() {
-                        self.style_error.clear();
+                    if self.style_error.take().is_some() {
                         self.last_task_revision = None;
                     }
                 }
                 Err(error) => {
                     self.style = FrameUpdate::Clear;
-                    self.style_error = error;
+                    self.style_error = Some(error);
                     self.last_task_revision = None;
                 }
             }
@@ -575,8 +632,16 @@ impl Model {
         let field = asset_field(role);
         self.wizard.issues.retain(|issue| issue["field"] != field || issue.get("canAccept").is_none());
         if let Some(issue) = session.draft.inspect(role) {
-            self.wizard.issues.push(json!({"step": 0, "field": field, "message": issue.message,
-                "canAccept": issue.can_accept}));
+            let can_accept = issue.can_accept();
+            let message = match issue.reason {
+                AssetIssueReason::Unreadable(error) => Message {
+                    detail: format!("{error:#}"),
+                    ..Message::path("assetUnreadable", &issue.path)
+                },
+                AssetIssueReason::MissingFingerprint => Message::path("assetFingerprintMissing", &issue.path),
+                AssetIssueReason::ContentChanged => Message::path("assetContentChanged", &issue.path),
+            };
+            self.wizard.issues.push(json!({"step": 0, "field": field, "message": message, "canAccept": can_accept}));
         }
         self.project_dirty = true;
     }
@@ -629,58 +694,42 @@ impl Model {
         }
         let mut issues = std::mem::take(&mut self.wizard.issues);
         let mut sample_range = None;
-        let mut issue = |step, field: &str, message: String| {
-            if step >= before_step {
-                return;
+        let mut issue = |step, field: &str, message: Message| {
+            if step < before_step {
+                issues.push(json!({"step": step, "field": field, "message": message}));
             }
-            let brief = match field {
-                "audio" if message.starts_with("无法") => "无法读取音频，请重新选择。",
-                "lyrics" if message.starts_with("无法") => "无法读取歌词，请选择有效的歌词文件。",
-                "cover" | "background" if message.starts_with("无法") => {
-                    "无法读取图片，请重新选择。"
-                }
-                "encoder" => "编码器不支持此格式，请更换格式。",
-                "output" if message.contains("已存在") || message.contains("已被") => {
-                    "输出路径已占用，请另选文件名。"
-                }
-                "output" if message.contains("目录不存在") => "输出目录不存在，请重新选择。",
-                "output" if message.contains("缺少文件名") => "请选择输出文件。",
-                _ => message.as_str(),
-            };
-            issues.push(json!({"step": step, "field": field, "message": brief,
-                "detail": if brief == message { "" } else { message.as_str() }}));
         };
         if self.matching_assets {
-            issue(0, "audio", "素材读取中，请稍后检查。".into());
+            issue(0, "audio", Message::new("assetsBusy"));
         }
         match self.assets.audio.as_ref() {
-            None => issue(0, "audio", "请选择音频文件".into()),
+            None => issue(0, "audio", Message::new("audioRequired")),
             Some(audio) => match video::audio_metadata(audio) {
-                Err(error) => issue(0, "audio", format!("无法读取音频：{error:#}")),
+                Err(error) => issue(0, "audio", Message::error("audioReadFailed", error)),
                 Ok(metadata) => {
                     let lyrics = if let Some(path) =
                         Assets::selected(&self.assets.lyrics, self.assets.lyrics_index)
                     {
                         libgoosy::read_lyrics_file(path, self.options.format)
+                            .map_err(|error| Message::error("lyricsReadFailed", error))
+                    } else if let Some(text) = metadata.lyrics.as_deref() {
+                        libgoosy::parse_lyrics(text, self.options.format)
+                            .map_err(|error| Message::error("lyricsReadFailed", error))
                     } else {
-                        metadata
-                            .lyrics
-                            .as_deref()
-                            .ok_or_else(|| anyhow::anyhow!("音频没有内嵌歌词，请选择歌词文件"))
-                            .and_then(|text| libgoosy::parse_lyrics(text, self.options.format))
+                        Err(Message::new("embeddedLyricsMissing"))
                     };
                     match lyrics {
-                        Err(error) => issue(0, "lyrics", format!("无法读取歌词：{error:#}")),
+                        Err(message) => issue(0, "lyrics", message),
                         Ok(lines) => {
                             if lines.is_empty() {
-                                issue(0, "lyrics", "歌词为空，请选择其他文件。".into());
+                                issue(0, "lyrics", Message::new("emptyLyrics"));
                             }
                             if self.wizard.mode == 2 {
                                 sample_range = self.wizard.sample_range.or_else(|| {
                                     random_sample_range(&lines, &self.options.excluded_lines)
                                 });
                                 if sample_range.is_none() {
-                                    issue(0, "lyrics", "无可采样歌词，请更换歌词文件。".into());
+                                    issue(0, "lyrics", Message::new("noSampleRange"));
                                 }
                             }
                             if self.wizard.mode == 1 {
@@ -692,12 +741,8 @@ impl Model {
                                 let last_end = lines.iter().map(|line| line.end_ms).max().unwrap_or(0);
                                 let duration = libgoosy::render_duration_ms(no_audio, metadata.duration_seconds, last_end);
                                 if start >= duration {
-                                    let message = if no_audio {
-                                        "起点超出歌词时长，请减小采样起点。"
-                                    } else {
-                                        "起点超出音频时长，请减小采样起点。"
-                                    };
-                                    issue(2, "sample", message.into());
+                                    let code = if no_audio { "samplePastLyricsEnd" } else { "samplePastAudioEnd" };
+                                    issue(2, "sample", Message::new(code));
                                 }
                             }
                         }
@@ -714,7 +759,7 @@ impl Model {
         ] {
             if let Some(path) = path {
                 if let Err(error) = libgoosy::image_asset::ImageAsset::from_path(path) {
-                    issue(0, field, format!("无法读取图片：{error:#}"));
+                    issue(0, field, Message::error("imageReadFailed", error));
                 }
             }
         }
@@ -724,19 +769,21 @@ impl Model {
             self.options.codec
         };
         if let Err(error) = self.options.encoder.validate_codec(codec) {
-            issue(2, "encoder", format!("{error:#}"));
+            issue(2, "encoder", Message::error("unsupportedCodec", error));
         }
         if self.options.width % 2 != 0 || self.options.height % 2 != 0 {
-            issue(2, "dimensions", "宽度和高度须为偶数，请调整尺寸。".into());
+            issue(2, "dimensions", Message::new("oddDimensions"));
         }
         let output = self.effective_output(sample_range);
         match output {
             Some(output) => {
-                if let Err(error) = self.manager.check_output(&output) {
-                    issue(2, "output", format!("{error:#}"));
+                if output.as_os_str().is_empty() {
+                    issue(2, "output", Message::new("outputFileRequired"));
+                } else if let Err(error) = self.manager.check_output(&output) {
+                    issue(2, "output", Message::output_error(error, "outputCheckFailed"));
                 }
             }
-            None => issue(2, "output", "请选择有效的输出路径".into()),
+            None => issue(2, "output", Message::new("outputFileRequired")),
         }
         self.wizard.issues = issues;
         self.wizard.checked = true;
@@ -765,7 +812,7 @@ impl Model {
         if action == "sample" && self.redo.is_none() {
             let start = u64::from(self.sample_start);
             let Some(output) = sample_output_path(&options.output, start) else {
-                self.fail("无法生成采样输出文件名".into());
+                self.fail(Message::new("sampleOutputFailed"));
                 return;
             };
             options.output = output;
@@ -774,33 +821,34 @@ impl Model {
             options.no_audio = true;
         }
         if action == "randomSample" {
-            let result = (|| -> anyhow::Result<()> {
+            let result = (|| -> Result<(), Message> {
                 let (start, end) = if let Some(range) = self.wizard.sample_range {
                     range
                 } else {
                     let lines = if let Some(lyrics) = &options.lyrics {
-                        libgoosy::read_lyrics_file(lyrics, options.format)?
+                        libgoosy::read_lyrics_file(lyrics, options.format)
+                            .map_err(|error| Message::error("lyricsReadFailed", error))?
                     } else {
-                        let metadata = video::audio_metadata(&options.song)?;
-                        let text = metadata
-                            .lyrics
-                            .ok_or_else(|| anyhow::anyhow!("没有可用于采样的歌词"))?;
-                        libgoosy::parse_lyrics(&text, options.format)?
+                        let metadata = video::audio_metadata(&options.song)
+                            .map_err(|error| Message::error("audioReadFailed", error))?;
+                        let text = metadata.lyrics.ok_or_else(|| Message::new("embeddedLyricsMissing"))?;
+                        libgoosy::parse_lyrics(&text, options.format)
+                            .map_err(|error| Message::error("lyricsReadFailed", error))?
                     };
                     random_sample_range(&lines, &options.excluded_lines)
-                        .ok_or_else(|| anyhow::anyhow!("没有可用于采样的歌词"))?
+                        .ok_or_else(|| Message::new("noSampleRange"))?
                 };
                 if self.redo.is_none() {
                     options.output = sample_output_path(&options.output, start)
-                        .ok_or_else(|| anyhow::anyhow!("无法生成采样输出文件名"))?;
+                        .ok_or_else(|| Message::new("sampleOutputFailed"))?;
                 }
                 options.sample_start_ms = Some(start);
                 options.sample_duration_ms = Some(end - start);
                 options.no_audio = true;
                 Ok(())
             })();
-            if let Err(error) = result {
-                self.fail(format!("准备随机采样失败：{error:#}"));
+            if let Err(message) = result {
+                self.fail(message);
                 return;
             }
         }
@@ -815,26 +863,27 @@ impl Model {
             Ok(id) => {
                 self.restore_ordinary_draft();
                 self.selected_task = Some(id);
-                self.task_error.clear();
+                self.task_error = None;
                 self.wizard.created_id = Some(id);
                 self.wizard.active = false;
                 self.project_dirty = true;
             }
             Err(error) => {
-                self.fail(format!("创建任务失败：{error:#}"));
+                let message = Message::output_error(error, "taskCreateFailed");
                 if self.redo.is_some() {
                     self.validate_draft(3);
-                    if self.wizard.issues.is_empty() { self.fail(self.task_error.clone()); }
                 }
+                self.fail(message);
             }
         }
     }
 
-    fn fail(&mut self, message: String) {
-        self.task_error = message;
+    fn fail(&mut self, message: Message) {
+        if self.wizard.issues.is_empty() {
+            self.wizard.issues.push(json!({"step": 2, "field": "output", "message": message}));
+        }
+        self.task_error = Some(message);
         self.last_task_revision = None;
-        self.wizard.issues = vec![json!({"step": 2, "field": "output",
-            "message": "创建任务失败", "detail": self.task_error})];
         self.project_dirty = true;
     }
 
@@ -886,6 +935,13 @@ impl Model {
 }
 
 impl ViewModel for Model {
+    fn set_preview_text(&mut self, text: [String; 5]) {
+        if self.sample_text.as_deref() != Some(&text) {
+            self.sample_text = Some(Arc::new(text));
+            self.style_dirty = true;
+        }
+    }
+
     fn defaults_json(&self) -> String {
         let style = self.options.lyrics_style;
         let percent = |value: f32| (value * 100.0).round() as u32;
@@ -902,7 +958,7 @@ impl ViewModel for Model {
             "encoder": EncoderBackend::ALL.iter().position(|encoder| *encoder == self.options.encoder).unwrap_or(0),
             "codec": VideoCodec::ALL.iter().position(|codec| *codec == self.options.codec).unwrap_or(0),
             "nvencPreset": self.options.nvenc_preset.strip_prefix('p').and_then(|value| value.parse::<u32>().ok()).unwrap_or(5).saturating_sub(1),
-            "encoders": EncoderBackend::ALL.iter().map(|encoder| encoder.label()).collect::<Vec<_>>(),
+            "encoders": EncoderBackend::ALL.iter().map(|encoder| encoder.cli_value()).collect::<Vec<_>>(),
             "codecs": VideoCodec::ALL.iter().map(|codec| codec.label()).collect::<Vec<_>>(),
             "zeroCopyEncoder": EncoderBackend::ALL.iter().position(|encoder| encoder.is_zero_copy()).map_or(-1, |index| index as i32),
             "sampleStart": if self.redo.is_some() { self.options.sample_start_ms.unwrap_or(0) } else { u64::from(self.sample_start) },
@@ -973,8 +1029,8 @@ impl ViewModel for Model {
         let value = value.max(0) as u32;
         if key == "maxConcurrent" {
             match self.manager.set_max_concurrent(value as usize) {
-                Ok(()) => self.task_error.clear(),
-                Err(error) => self.task_error = format!("并发设置失败：{error:#}"),
+                Ok(()) => self.task_error = None,
+                Err(error) => self.task_error = Some(Message::error("concurrencyFailed", error)),
             }
             self.last_task_revision = None;
             return;
@@ -1111,7 +1167,7 @@ impl ViewModel for Model {
             let Some(role) = AssetRole::ALL.into_iter().find(|&role| asset_field(role) == field) else { return };
             let Some(session) = self.redo.as_mut() else { return };
             if let Err(error) = session.draft.accept(role) {
-                self.task_error = format!("无法采用当前素材：{error:#}");
+                self.task_error = Some(Message::error("assetAcceptFailed", error));
                 self.last_task_revision = None;
             }
             self.validate_draft(3);
@@ -1126,8 +1182,8 @@ impl ViewModel for Model {
         let Ok(id) = id.parse::<TaskId>() else { return };
         if action == "redo" {
             match self.begin_redo(id) {
-                Ok(()) => self.task_error.clear(),
-                Err(error) => self.task_error = format!("无法重做任务：{error:#}"),
+                Ok(()) => self.task_error = None,
+                Err(error) => self.task_error = Some(Message::error("taskRedoFailed", error)),
             }
             self.last_task_revision = None;
             return;
@@ -1142,14 +1198,21 @@ impl ViewModel for Model {
             }
         } else {
             let result = match action {
-                "pause" => self.manager.command(id, Control::Pause),
-                "resume" => self.manager.command(id, Control::Resume),
-                "cancel" => self.manager.command(id, Control::Cancel),
-                "openOutput" => self.manager.output_directory(id).and_then(|dir| {
-                    anyhow::ensure!(goosy_rinui::open_directory(&path_to_file_url(&dir)),
-                        "系统文件管理器无法打开目录：{}", dir.display());
-                    Ok(())
-                }),
+                "pause" => self.manager.command(id, Control::Pause)
+                    .map_err(|error| Message::error("taskPauseFailed", error)),
+                "resume" => self.manager.command(id, Control::Resume)
+                    .map_err(|error| Message::error("taskResumeFailed", error)),
+                "cancel" => self.manager.command(id, Control::Cancel)
+                    .map_err(|error| Message::error("taskCancelFailed", error)),
+                "openOutput" => self.manager.output_directory(id)
+                    .map_err(|error| Message::error("outputDirectoryLookupFailed", error))
+                    .and_then(|dir| {
+                        if goosy_rinui::open_directory(&path_to_file_url(&dir)) {
+                            Ok(())
+                        } else {
+                            Err(Message::path("outputDirectoryOpenFailed", &dir))
+                        }
+                    }),
                 "delete" => self.manager.delete(id).map(|()| {
                     self.preview_cache.retain(|(cached, _)| *cached != id);
                     self.pending_task_thumbnails.push((id.to_string(), FrameUpdate::Clear));
@@ -1157,13 +1220,10 @@ impl ViewModel for Model {
                         self.selected_task = None;
                         self.render = FrameUpdate::Clear;
                     }
-                }),
+                }).map_err(|error| Message::error("taskDeleteFailed", error)),
                 _ => return,
             };
-            match result {
-                Ok(()) => self.task_error.clear(),
-                Err(error) => self.task_error = format!("任务操作失败：{error:#}"),
-            }
+            self.task_error = result.err();
             self.last_task_revision = None;
         }
     }
@@ -1217,18 +1277,21 @@ mod tests {
 
     // A controlled protocol stream lets the UI sample live progress before the process exits.
     fn protocol_worker(dir: &Path, events: &[&str]) -> PathBuf {
-        let (name, header, hold) = if cfg!(windows) {
-            ("worker.cmd", "@echo off\r\n", "set /p command=\r\n")
-        } else {
-            ("worker.sh", "#!/bin/sh\n", "read command\n")
-        };
-        let mut script = String::from(header);
+        let mut script = String::new();
         for event in events {
             script.push_str("echo ");
             script.push_str(event);
-            script.push_str(if cfg!(windows) { "\r\n" } else { "\n" });
+            script.push('\n');
         }
-        script.push_str(hold);
+        scripted_worker(dir, &script)
+    }
+
+    fn scripted_worker(dir: &Path, body: &str) -> PathBuf {
+        let (name, script) = if cfg!(windows) {
+            ("worker.cmd", format!("@echo off\n{body}set /p command=\n").replace('\n', "\r\n"))
+        } else {
+            ("worker.sh", format!("#!/bin/sh\n{body}read command\n"))
+        };
         let path = dir.join(name);
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
@@ -1238,6 +1301,19 @@ mod tests {
         }
         path
     }
+    #[test]
+    fn changing_preview_text_only_invalidates_the_style_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut model = isolated_model(dir.path(), dir.path().join("unused-worker"));
+        let text = ["Previous", "Current", "译文", "Backing", "Next"].map(str::to_owned);
+        model.style_dirty = false;
+        model.set_preview_text(text.clone());
+        assert!(std::mem::take(&mut model.style_dirty));
+        model.set_preview_text(text);
+        assert!(!model.style_dirty);
+        assert_eq!(model.preview_asset_generation, 0);
+    }
+
 
     #[test]
     fn relinking_moved_audio_preserves_the_other_history_fields() {
@@ -1253,7 +1329,11 @@ mod tests {
         let moved = dir.path().join("relocated.wav");
         std::fs::rename(&song, &moved).unwrap();
         model.command(&format!("redo:{id}"));
-        assert!(model.wizard.issues.iter().any(|i| i["field"] == "audio" && i["canAccept"] == false));
+        let issue = model.wizard.issues.iter().find(|i| i["message"]["code"] == "assetUnreadable").unwrap();
+        assert_eq!(issue["field"], "audio");
+        assert_eq!(issue["canAccept"], false);
+        assert_eq!(issue["message"]["args"], json!([song]));
+        assert!(!issue["message"]["detail"].as_str().unwrap().is_empty());
         let output = model.options.output.clone();
         model.select_asset("audio", Some(moved.clone()));
         model.command("wizardCheck");
@@ -1290,9 +1370,9 @@ mod tests {
         assert_eq!(captured.sample_duration_ms, Some(500));
         assert!(!captured.no_audio);
 
-        for (no_audio, start, name, message) in [
-            (true, 5_000, "silent.mp4", "起点超出歌词时长，请减小采样起点。"),
-            (false, 8_000, "at-end.mp4", "起点超出音频时长，请减小采样起点。"),
+        for (no_audio, start, name, code) in [
+            (true, 5_000, "silent.mp4", "samplePastLyricsEnd"),
+            (false, 8_000, "at-end.mp4", "samplePastAudioEnd"),
         ] {
             options.output = dir.path().join(name);
             options.no_audio = no_audio;
@@ -1301,7 +1381,7 @@ mod tests {
             model.command(&format!("redo:{id}"));
             model.command("wizardCreate");
             assert!(model.wizard.created_id.is_none());
-            assert!(model.wizard.issues.iter().any(|i| i["field"] == "sample" && i["message"] == message));
+            assert!(model.wizard.issues.iter().any(|i| i["field"] == "sample" && i["message"]["code"] == code));
         }
     }
 
@@ -1335,7 +1415,8 @@ mod tests {
         assert_eq!(project["settings"]["previewInterval"], 37);
         assert_eq!(project["settings"]["sampleDuration"], 301);
         assert_eq!(project["lyricsIndex"], 1);
-        assert!(model.wizard.issues.iter().any(|i| i["field"] == "lyrics" && i["canAccept"] == true));
+        let issue = model.wizard.issues.iter().find(|i| i["field"] == "lyrics" && i["canAccept"] == true).unwrap();
+        assert_eq!(issue["message"], json!({"code": "assetContentChanged", "args": [lyrics], "detail": ""}));
         model.command("acceptAsset:lyrics");
         assert!(!model.wizard.issues.iter().any(|i| i.get("canAccept").is_some()));
         let output = dir.path().join("chosen.mp4");
@@ -1377,9 +1458,12 @@ mod tests {
         let view = snapshot(&model);
         assert_eq!(view["selectedId"], selected.to_string());
         assert_eq!(view["tasks"].as_array().unwrap().len(), 1);
-        assert_eq!(view["error"], "");
+        assert!(view["error"].is_null());
+        assert_eq!(view["title"], "");
         model.command(&format!("openOutput:{other}"));
-        assert!(!snapshot(&model)["error"].as_str().unwrap().is_empty());
+        let error = &snapshot(&model)["error"];
+        assert_eq!(error["code"], "outputDirectoryLookupFailed");
+        assert!(!error["detail"].as_str().unwrap().is_empty());
         model.command(&format!("delete:{selected}"));
         let empty = snapshot(&model);
         assert_eq!(empty["selectedId"], "");
@@ -1394,13 +1478,9 @@ mod tests {
         model.command("wizardBegin");
         model.set_number("wizardStep", 3);
         assert_eq!(model.wizard.step, 0);
-        assert!(
-            model
-                .wizard
-                .issues
-                .iter()
-                .any(|issue| issue["field"] == "audio")
-        );
+        assert!(model.wizard.issues.contains(&json!({
+            "step": 0, "field": "audio", "message": {"code": "audioRequired", "args": [], "detail": ""}
+        })));
         model.command("wizardNext");
         assert_eq!(model.wizard.step, 0);
         assert!(
@@ -1408,7 +1488,7 @@ mod tests {
                 .wizard
                 .issues
                 .iter()
-                .any(|issue| issue["field"] == "audio")
+                .any(|issue| issue["message"]["code"] == "audioRequired")
         );
 
         let song = write_song(dir.path());
@@ -1434,6 +1514,7 @@ mod tests {
             "jump lands on earliest invalid prerequisite"
         );
         assert!(model.wizard.issues.iter().all(|issue| issue["step"] == 2));
+        assert!(model.wizard.issues.iter().any(|issue| issue["message"]["code"] == "outputExists"));
         model.command("wizardBack");
         assert_eq!(model.wizard.step, 1);
         model.options.output = dir.path().join("available.mp4");
@@ -1532,7 +1613,51 @@ mod tests {
     }
 
     #[test]
-    fn recent_tasks_sorted_by_activity_capped_at_twenty_with_thumbnails() {
+    fn list_order_survives_interleaved_worker_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let read_command = if cfg!(windows) { "set /p command=" } else { "read command" };
+        // Each worker emits a burst on resume. A one-pixel frame goes through the real preview reader.
+        let write_frame = if cfg!(windows) {
+            "copy /b /y \"%~dp0pixel.rgba\" \"%~8\\10.rgba\" >nul"
+        } else {
+            "cp \"$(dirname \"$0\")/pixel.rgba\" \"$8/10.rgba\""
+        };
+        std::fs::write(dir.path().join("pixel.rgba"), [255_u8; 4]).unwrap();
+        let body = format!("echo GOOSY_PROGRESS 1 100 0.1\n{read_command}\necho GOOSY_CONTROL paused\n\
+            {read_command}\necho GOOSY_CONTROL resumed\necho GOOSY_PROGRESS 5 100 1.0\n\
+            echo GOOSY_PROGRESS 10 100 2.0\n{write_frame}\necho GOOSY_PREVIEW 10 1 1\n\
+            echo rendering >&2\n");
+        let mut model = isolated_model(dir.path(), scripted_worker(dir.path(), &body));
+        model.manager.set_max_concurrent(2).unwrap();
+        let song = write_song(dir.path());
+        let ids = ["old.mp4", "new.mp4"].map(|name| {
+            model.manager.enqueue(RenderOptions::new(&song, dir.path().join(name)), 1).unwrap()
+        });
+        let wait_for = |model: &Model, ready: &dyn Fn(&Value) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let json = snapshot(model);
+                assert_eq!(json["tasks"][0]["id"], ids[1].to_string());
+                assert_eq!(json["tasks"][1]["id"], ids[0].to_string());
+                assert_eq!(json["recentTasks"], json["tasks"]);
+                if ready(&json) { break; }
+                assert!(std::time::Instant::now() < deadline, "worker stalled: {json}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        wait_for(&model, &|v| v["tasks"].as_array().unwrap().iter().all(|t| t["state"] == "running"));
+        for id in ids {
+            model.command(&format!("select:{id}"));
+            model.manager.command(id, Control::Pause).unwrap();
+            wait_for(&model, &|v| v["state"] == "paused");
+            model.manager.command(id, Control::Resume).unwrap();
+            wait_for(&model, &|v| v["state"] == "running" && v["done"] == 10 && v["fps"] == 5.0
+                && v["previewFrame"] == 10 && v["log"].as_str().unwrap().contains("rendering"));
+        }
+    }
+
+    #[test]
+    fn list_order_is_newest_first_with_twenty_recent_thumbnails() {
         let dir = tempfile::tempdir().unwrap();
         let cover_path = dir.path().join("封 面#.ppm");
         std::fs::write(&cover_path, b"P6\n1 1\n255\n\xff\x80\x00").unwrap();
@@ -1547,7 +1672,7 @@ mod tests {
                 dir.path().join(format!("out-{index}.mp4")),
             );
             options.title = Some(format!("Task {index}"));
-            if index == 2 {
+            if index == 7 {
                 options.cover = Some(cover_path.clone());
             }
             ids.push(model.manager.enqueue(options, 1).unwrap());
@@ -1560,8 +1685,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        // Cancel older queued task 2: its activity seq becomes the newest!
-        model.command(&format!("cancel:{}", ids[2]));
+        // Cancelling an older task must leave the twenty newest tasks on Home.
+        model.command(&format!("cancel:{}", ids[7]));
         // Add cached preview for task 3 to verify image://goosy/task/<id>/... thumbnail URL.
         model.preview_cache.push_back((
             ids[3],
@@ -1580,24 +1705,19 @@ mod tests {
         let all = json["tasks"].as_array().unwrap();
         assert_eq!(all.len(), ids.len());
         assert_eq!(recent, &all[..MAX_RECENT_TASKS]);
-        assert_eq!(
-            recent[0]["id"].as_str(),
-            Some(ids[2].to_string().as_str()),
-            "most recently updated task must appear first in recentTasks"
-        );
+        for (row, id) in all.iter().zip(ids.iter().rev()) {
+            assert_eq!(row["id"], id.to_string());
+        }
+        let cancelled = &all[ids.len() - 1 - 7];
+        assert_eq!(cancelled["state"], "cancelled");
         assert!(
-            recent[0]["thumbnail"]
+            cancelled["thumbnail"]
                 .as_str()
                 .unwrap_or("")
                 .starts_with("file:///"),
             "task with cover image file must expose file URL thumbnail"
         );
-        assert!(recent[0]["thumbnail"].as_str().unwrap().ends_with("%E5%B0%81%20%E9%9D%A2%23.ppm"));
-        let keys = all.iter().map(|item| (
-            item["updatedAt"].as_u64().unwrap(), item["lastActivitySeq"].as_u64().unwrap(),
-            item["id"].as_str().unwrap(),
-        )).collect::<Vec<_>>();
-        assert!(keys.windows(2).all(|pair| pair[0] > pair[1]));
+        assert!(cancelled["thumbnail"].as_str().unwrap().ends_with("%E5%B0%81%20%E9%9D%A2%23.ppm"));
 
         // Task 3 has a cached preview frame -> check in full tasks array.
         let task3 = json["tasks"]
@@ -1643,6 +1763,7 @@ mod tests {
         assert_eq!(task["createdAt"], original["createdAt"]);
         assert_eq!(task["outputSize"], 0);
         assert_eq!(task["options"]["title"], expected["title"]);
+        assert_eq!(task["config"]["encoder"], reopened.manager.tasks()[0].options.encoder.cli_value());
         assert_eq!(task["options"]["lyrics_style"], expected["lyrics_style"]);
     }
 }

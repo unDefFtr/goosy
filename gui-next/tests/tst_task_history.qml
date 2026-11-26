@@ -8,8 +8,8 @@ TestCase {
     ListModel { id: rows }
 
     function sync(ids) {
-        Ui.reconcileTaskRows(rows, ids, function(id, index) {
-            return { taskId: id, rank: index }
+        Ui.reconcileTaskRows(rows, ids.map(id => ({ id: id })), function(task, index) {
+            return { taskId: task.id, rank: index }
         })
     }
 
@@ -36,6 +36,19 @@ TestCase {
         var afternoon = new Date(2026, 0, 5, 16, 3, 9)
         compare(Ui.formatTimestamp(afternoon.getTime()), "2026-01-05 16:03:09")
         compare(Ui.formatTimestamp(0), "—")
+    }
+
+    function test_historyPresentation() {
+        compare(Ui.taskTitle("Night 夜航"), "Night 夜航")
+        compare(Ui.taskTitle(""), qsTranslate("GoosyUi", "Untitled task"))
+        compare(Ui.stateLabel("paused"), qsTranslate("GoosyUi", "Paused"))
+        compare(Ui.stateLabel("interrupted"), qsTranslate("GoosyUi", "Interrupted"))
+        compare(Ui.stateLabel("failed"), qsTranslate("GoosyUi", "Failed"))
+        compare(Ui.stateLabel("done"), Ui.stateLabel("completed"))
+        compare(Ui.taskSummary("cancelled", "任务已由用户取消"), qsTranslate("GoosyUi", "Cancelled by the user"))
+        compare(Ui.taskSummary("failed", "decoder: <invalid stream>"), qsTranslate("GoosyUi", "View error details"))
+        compare(Ui.taskSummary("interrupted", "decoder: <invalid stream>"), qsTranslate("GoosyUi", "View task details"))
+        compare(Ui.taskSummary("queued", ""), "")
     }
 
     function test_durableAndLiveProgress() {

@@ -1,4 +1,4 @@
-use libgoosy::task_manager::{AssetRole, Control, TaskId, TaskManager, TaskState};
+use libgoosy::task_manager::{AssetIssueReason, AssetRole, Control, OutputError, TaskId, TaskManager, TaskState};
 use libgoosy::workspace::Workspace;
 use libgoosy::{EncoderBackend, LyricFormat, RenderOptions};
 use rusqlite::Connection;
@@ -171,36 +171,43 @@ fn failed_task_checks_each_relinked_or_accepted_input_and_reserves_a_new_output(
     assert!(redo.submit(&manager).is_err()); // Even if the failed task never produced its output.
     redo.options.output = available;
     fs::write(&redo.options.output, "arrived after the wizard opened").unwrap();
-    assert!(redo.submit(&manager).is_err());
+    let error = redo.submit(&manager).unwrap_err();
+    assert_eq!(error.downcast_ref::<OutputError>(), Some(&OutputError::AlreadyExists(redo.options.output.clone())));
     assert_eq!(fs::read(&redo.options.output).unwrap(), b"arrived after the wizard opened");
     redo.options.output = dir.canonicalize().unwrap().join("alternate.mp4");
 
     let moved = dir.join("moved-audio");
     fs::rename(&options.song, &moved).unwrap();
-    assert!(!redo.inspect(AssetRole::Audio).unwrap().can_accept);
+    let issue = redo.inspect(AssetRole::Audio).unwrap();
+    assert_eq!(issue.path, options.song);
+    assert!(!issue.can_accept());
+    assert!(matches!(issue.reason, AssetIssueReason::Unreadable(_)));
     assert!(redo.accept(AssetRole::Audio).is_err());
     assert!(redo.submit(&manager).is_err());
     redo.options.song = moved;
     assert!(redo.inspect(AssetRole::Audio).is_none());
     // Each role checks its own fingerprint, even if an alternative is another original input.
     redo.options.cover = Some(background.clone());
-    assert!(redo.inspect(AssetRole::Cover).unwrap().can_accept);
+    assert!(redo.inspect(AssetRole::Cover).unwrap().can_accept());
     assert!(redo.inspect(AssetRole::Background).is_none());
     redo.options.cover = Some(cover);
     assert!(redo.accept(AssetRole::Cover).is_err());
     assert!(redo.inspect(AssetRole::Cover).is_none());
     fs::write(&lyrics, "other").unwrap(); // Same byte count, different hash.
-    assert!(redo.inspect(AssetRole::Lyrics).unwrap().can_accept);
+    let issue = redo.inspect(AssetRole::Lyrics).unwrap();
+    assert_eq!(issue.path, lyrics);
+    assert!(issue.can_accept());
+    assert!(matches!(issue.reason, AssetIssueReason::ContentChanged));
     assert!(redo.submit(&manager).is_err());
     fs::write(&lyrics, "third").unwrap();
     assert!(redo.accept(AssetRole::Lyrics).is_err());
-    assert!(redo.inspect(AssetRole::Lyrics).unwrap().can_accept);
+    assert!(redo.inspect(AssetRole::Lyrics).unwrap().can_accept());
     redo.accept(AssetRole::Lyrics).unwrap();
     assert!(redo.inspect(AssetRole::Lyrics).is_none());
     fs::write(&lyrics, "changed again").unwrap();
     assert!(redo.submit(&manager).is_err());
     assert_eq!(manager.tasks().len(), 1);
-    assert!(redo.inspect(AssetRole::Lyrics).unwrap().can_accept);
+    assert!(redo.inspect(AssetRole::Lyrics).unwrap().can_accept());
     redo.accept(AssetRole::Lyrics).unwrap();
     let id = redo.submit(&manager).unwrap();
     assert_ne!(source, id);
@@ -224,7 +231,10 @@ fn cancelled_and_missing_provenance_require_explicit_approval_for_unknown_conten
     fs::write(&options.song, "recovered source").unwrap();
     let mut unknown = first.redo_draft(missing).unwrap();
     assert_eq!(unknown.preview_interval, 13);
-    assert!(unknown.inspect(AssetRole::Audio).unwrap().can_accept);
+    let issue = unknown.inspect(AssetRole::Audio).unwrap();
+    assert_eq!(issue.path, options.song);
+    assert!(issue.can_accept());
+    assert!(matches!(issue.reason, AssetIssueReason::MissingFingerprint));
     assert!(unknown.submit(&first).is_err());
     unknown.accept(AssetRole::Audio).unwrap();
     let id = unknown.submit(&first).unwrap();
@@ -251,7 +261,7 @@ fn cancelled_and_missing_provenance_require_explicit_approval_for_unknown_conten
     fs::write(work.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
     let reopened = manager(&root, &executable);
     let mut redo = reopened.redo_draft(id).unwrap();
-    assert!(redo.inspect(AssetRole::Audio).unwrap().can_accept);
+    assert!(redo.inspect(AssetRole::Audio).unwrap().can_accept());
     assert!(redo.submit(&reopened).is_err());
     redo.accept(AssetRole::Audio).unwrap();
     assert_ne!(redo.submit(&reopened).unwrap(), id);

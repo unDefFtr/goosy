@@ -24,7 +24,7 @@ Controls.AbstractButton {
     readonly property bool showProgress: (root.isActiveState || root.taskState === "interrupted") && root.total > 0
     readonly property string outputSpec: Ui.formatOutputSpec(root.outputWidth, root.outputHeight, root.outputFps)
     readonly property string statusText: root.showProgress
-        ? (Ui.stateLabel(root.taskState) + " " + Ui.progressPercent(root.done, root.total))
+        ? qsTr("%1 %2").arg(Ui.stateLabel(root.taskState)).arg(Ui.progressPercent(root.done, root.total))
         : Ui.stateLabel(root.taskState)
 
     focusPolicy: Qt.StrongFocus
@@ -35,7 +35,7 @@ Controls.AbstractButton {
     bottomPadding: 10
 
     Accessible.role: Accessible.ListItem
-    Accessible.name: (root.title || qsTr("未命名任务")) + "，" + root.statusText
+    Accessible.name: qsTr("%1, %2").arg(Ui.taskTitle(root.title)).arg(root.statusText)
     Accessible.description: [root.codec, root.outputSpec].filter(function(item) { return item.length > 0 }).join(" · ")
 
     implicitWidth: Math.max(contentItem.implicitWidth + leftPadding + rightPadding, 200)
@@ -56,7 +56,7 @@ Controls.AbstractButton {
 
     ToolTip {
         visible: root.hovered && root.taskState === "failed" && root.detail.length > 0
-        text: root.detail
+        text: Ui.taskSummary(root.taskState, root.detail)
     }
 
     background: Rectangle {
@@ -149,7 +149,8 @@ Controls.AbstractButton {
                     Layout.fillWidth: true
                     Layout.minimumWidth: 0
                     Layout.alignment: Qt.AlignVCenter
-                    text: root.title || qsTr("未命名任务")
+                    text: Ui.taskTitle(root.title)
+                    textFormat: Text.PlainText
                     typography: Typography.BodyStrong
                     color: Theme.currentTheme.colors.textColor
                     elide: Text.ElideRight

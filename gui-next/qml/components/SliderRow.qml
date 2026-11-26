@@ -28,8 +28,7 @@ ColumnLayout {
             Layout.fillWidth: true
             typography: Typography.Body
             text: root.label
-            elide: Text.ElideRight
-            maximumLineCount: 1
+            wrapMode: Text.WordWrap
         }
 
         Text {
@@ -47,6 +46,7 @@ ColumnLayout {
         to: root.to
         stepSize: root.stepSize
         value: root.value
+        Accessible.name: root.label
 
         onMoved: {
             if (root.value !== slider.value) {

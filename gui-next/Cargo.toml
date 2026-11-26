@@ -8,6 +8,7 @@ publish = false
 cxx = "1"
 cxx-qt = "0.10"
 rinui-host = "=0.1.0-alpha.2"
+serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 cxx-qt-build = "0.10"

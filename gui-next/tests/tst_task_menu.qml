@@ -14,6 +14,11 @@ TestCase {
     readonly property string target: "9258716b-3253-41a3-89a8-369d12b07432"
     readonly property var operations: ["pause", "resume", "cancel", "redo", "openOutput", "delete"]
     property var page
+    readonly property var operationLabels: ({
+        pause: qsTranslate("Tasks", "Pause"), resume: qsTranslate("Tasks", "Resume"),
+        cancel: qsTranslate("Tasks", "Cancel"), redo: qsTranslate("Tasks", "Redo"),
+        openOutput: qsTranslate("Tasks", "Open output folder"), delete: qsTranslate("Tasks", "Delete")
+    })
     property var list
     property var menu
 
@@ -35,12 +40,18 @@ TestCase {
         return { id: id, title: id, state: state, actions: actions }
     }
 
-    function publish(rows, error) {
-        const selection = rows.find(r => r.id === selected) || {}
+    function publish(rows, error, selectedId) {
+        const selection = rows.find(r => r.id === (selectedId || selected)) || {}
         backendFixture.taskJson = JSON.stringify(Object.assign({}, selection, {
-            selectedId: selection.id || "", tasks: rows, error: error || ""
+            selectedId: selection.id || "", tasks: rows, error: error || null
         }))
         list.forceLayout()
+    }
+
+    SignalSpy {
+        id: rowMoves
+        target: suite.list ? suite.list.model : null
+        signalName: "rowsMoved"
     }
 
     function selectedRow() {
@@ -100,7 +111,10 @@ TestCase {
     function test_stateVisibility(data) {
         setTarget(data.tag, data.actions)
         openTarget()
-        for (const op of operations) compare(actionItem(op).visible, data.actions.includes(op), op)
+        for (const op of operations) {
+            compare(actionItem(op).visible, data.actions.includes(op), op)
+            compare(actionItem(op).text, operationLabels[op], op)
+        }
         compare(menu.count, operations.length)
     }
 
@@ -110,6 +124,60 @@ TestCase {
         mouseClick(list.itemAtIndex(1))
         compare(menu.visible, false)
         compare(backendFixture.commands, ["select:" + target])
+    }
+
+    function test_scrolledHistorySurvivesRefresh() {
+        const rows = []
+        for (let i = 0; i < 48; ++i)
+            rows.push(row(i === 3 ? selected : "task-" + i, "queued", ["cancel"]))
+        publish(rows)
+        tryCompare(list.updateAnimation, "running", false)
+        list.positionViewAtIndex(24, ListView.Beginning)
+        list.contentY += 7
+        const viewed = list.itemAtIndex(24)
+        const viewedRow = rows[24]
+        verify(viewed)
+        const offset = viewed.mapToItem(list, 0, 0).y
+        verify(offset < 0 && offset > -viewed.height)
+        verify(rowMoves.valid)
+        rowMoves.clear()
+
+        function checkViewport() {
+            const selectedIndex = rows.findIndex(r => r.id === selected)
+            compare(list.currentIndex, selectedIndex)
+            compare(list.currentItem.taskId, selected)
+            compare(list.currentItem.highlighted, true)
+            compare(list.itemAtIndex(rows.indexOf(viewedRow)), viewed)
+            fuzzyCompare(viewed.mapToItem(list, 0, 0).y, offset, 1)
+            compare(rowMoves.count, 0)
+        }
+
+        viewedRow.state = "running"
+        viewedRow.done = 23
+        viewedRow.total = 90
+        rows[3].state = "paused"
+        publish(rows)
+        checkViewport()
+        compare(viewed.taskState, "running")
+        compare(viewed.done, 23)
+        compare(page.state, "paused")
+
+        rows.unshift(row("new-task", "queued", ["cancel"]))
+        publish(rows)
+        checkViewport()
+        rows.splice(1, 2)
+        publish(rows)
+        checkViewport()
+
+        // Removing the selection can select its successor at the same numeric index.
+        const index = list.currentIndex
+        rows.splice(index, 1)
+        publish(rows, null, rows[index].id)
+        compare(list.currentIndex, index)
+        compare(list.currentItem.taskId, rows[index].id)
+        compare(list.currentItem.highlighted, true)
+        const y = list.currentItem.mapToItem(list, 0, 0).y
+        verify(y >= -1 && y + list.currentItem.height <= list.height + 1)
     }
 
     function test_liveActionsFollowUuid() {
@@ -183,11 +251,25 @@ TestCase {
     }
 
     function test_errorFeedback() {
-        const reason = "Output directory does not exist"
-        publish([selectedRow()], reason)
+        const reason = "open <missing> directory"
+        publish([selectedRow()], { code: "outputDirectoryLookupFailed", args: [], detail: reason })
         const error = findChild(page, "taskActionError")
         verify(error.visible)
-        compare(error.text, reason)
+        compare(findChild(error, "taskActionErrorSummary").text, qsTranslate("GoosyUi", "Could not locate the output directory"))
+        const detail = findChild(page, "taskActionErrorDetail")
+        verify(detail.visible)
+        compare(detail.textFormat, Text.PlainText)
+        compare(detail.text, reason)
+    }
+
+    function test_taskCounts() {
+        const summary = findChild(page, "taskCountSummary")
+        publish([])
+        compare(summary.text, qsTranslate("Tasks", "%1 tasks").arg(0))
+        publish([selectedRow()])
+        compare(summary.text, qsTranslate("Tasks", "1 task"))
+        setTarget("interrupted", ["resume"])
+        compare(summary.text, qsTranslate("Tasks", "%1 tasks").arg(2) + " · " + qsTranslate("Tasks", "%1 interrupted").arg(1))
     }
 
     function test_popupAtWindowEdge_data() {
@@ -215,9 +297,9 @@ TestCase {
             page.y += (data.bottom ? data.h - 12 : 12) - center.y
             openTarget()
             verify(menu.width > 0 && menu.height > 0)
-            const longest = actionItem("openOutput")
-            verify(menu.width >= longest.implicitWidth, "The longest action must fit")
-            verify(menu.width <= Math.ceil(longest.implicitWidth + menu.leftPadding + menu.rightPadding),
+            const widest = Math.max(...actions.map(op => actionItem(op).implicitWidth))
+            verify(menu.width >= widest, "The longest action must fit")
+            verify(menu.width <= Math.ceil(widest + menu.leftPadding + menu.rightPadding),
                    "The popup should fit its actions without unused horizontal space")
             const frame = menu.background
             const topRow = actionItem(actions[0]).background
